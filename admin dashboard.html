@@ -1,0 +1,473 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Admin Dashboard</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<style>
+    html, body { display: block !important; height: auto !important; min-height: 100vh; margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; }
+    #topbar { position: fixed; top: 0; left: 0; right: 0; display: flex !important; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
+    #topbar a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
+    #topbar a:hover { text-decoration: underline; }
+    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
+    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
+    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
+    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
+    #nav-dropdown.open { display: flex; }
+    @media (max-width: 600px) {
+        #topbar-right > a { display: none; }
+        #nav-hamburger { display: inline-block; }
+    }
+    #content { max-width: 700px; width: 100%; margin: 0 auto; padding: 70px 20px 60px; box-sizing: border-box; }
+    h1 { margin-bottom: 4px; }
+    .panel { border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
+    .panel h2 { margin: 0 0 16px; font-size: 1em; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.6; style="color:rgba(255, 255, 255, 0.8);"; }
+    label { display: block; font-size: 0.85em; opacity: 0.7; margin-bottom: 4px; margin-top: 12px; }
+    input[type=text], textarea, select {
+        width: 100%; box-sizing: border-box; background: black; color: white;
+        border: 2px solid white; border-radius: 8px; padding: 8px 10px;
+        font-family: inherit; font-size: inherit;
+    }
+    input[type=text]:focus, textarea:focus, select:focus { border-color: rgb(0,191,255); outline: none; }
+    .action-row { display: flex; gap: 10px; margin-top: 16px; }
+    #result { margin-top: 12px; font-size: 0.9em; min-height: 1.2em; }
+    #result.ok { color: rgb(80,255,160); }
+    #result.err { color: rgb(255,80,80); }
+    #ip-result { margin-top: 12px; font-size: 0.9em; min-height: 1.2em; }
+    #ip-result.ok { color: rgb(80,255,160); }
+    #ip-result.err { color: rgb(255,80,80); }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+    th { text-align: left; opacity: 0.5; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.15); }
+    td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); vertical-align: middle; }
+    tr:last-child td { border-bottom: none; }
+</style>
+</head>
+<body>
+<div id="topbar">
+    <strong>Admin Dashboard</strong>
+    <div id="topbar-right" style="position:relative;display:flex;align-items:center;">
+        <a href="/feed">Feed</a>
+        <a href="/edit">Dashboard</a>
+        <a href="/logout">Logout</a>
+        <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
+        <nav id="nav-dropdown">
+            <a href="/feed">Feed</a>
+            <a href="/edit">Dashboard</a>
+            <a href="/logout">Logout</a>
+        </nav>
+    </div>
+</div>
+<div id="content">
+    <h1>Admin Dashboard</h1>
+    <p style="opacity:0.5;margin-top:4px;">Logged in as <strong>${escapeHTML(req.session.userUsername)}</strong></p>
+
+    <div class="panel">
+        <h2>Ban / Unban User</h2>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="target-username" placeholder="e.g. testuser" autocomplete="off">
+        <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="ban-reason" placeholder="e.g. Spamming" maxlength="500">
+        <label>Action</label>
+        <select id="action">
+            <option value="ban">Ban</option>
+            <option value="unban">Unban</option>
+        </select>
+        <div class="action-row">
+            <button class="button" id="submit-btn" onclick="submitAction()" style="width:140px;">Apply</button>
+        </div>
+        <div id="result"></div>
+    </div>
+
+    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+        <h2 style="color:rgba(255, 255, 255, 0.8);">IP Ban / Unban</h2>
+        <label>IP Address</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="target-ip" placeholder="e.g. 192.168.1.1" autocomplete="off">
+        <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="ip-ban-reason" placeholder="e.g. Ban evasion" maxlength="500">
+        <label>Action</label>
+        <select id="ip-action">
+            <option value="ipban">IP Ban</option>
+            <option value="unipban">IP Unban</option>
+        </select>
+        <div class="action-row">
+            <button class="button" onclick="submitIPAction()" style="width:140px;">Apply</button>
+        </div>
+        <div id="ip-result"></div>
+    </div>
+
+    <div class="panel" style="rgba(255,255,255,0.2);">
+        <h2 style="color:rgba(255, 255, 255, 0.8);">Banned IPs</h2>
+        <table>
+            <thead><tr><th>IP Address</th><th>Reason</th><th>Banned By</th><th></th></tr></thead>
+            <tbody id="ip-ban-table">
+                ${ipBanRows || '<tr><td colspan="4" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No IP bans.</td></tr>'}
+            </tbody>
+        </table>
+    </div>
+
+    <div class="panel" style="border-color:rgba(255,255,255,0.2;">
+        <h2 style="color:rgb(255, 255, 255, 0.8);">Delete Account</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Does not remove the account from the database. Resets the avatar to the default, sets the display name to "Account Deleted", clears the bio, bans the account, and deletes all of its posts. The username is kept.</p>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="delete-username" placeholder="e.g. testuser" autocomplete="off">
+        <div class="action-row">
+            <button class="button" onclick="submitDeleteAccount()" style="width:160px;">Delete Account</button>
+        </div>
+        <div id="delete-result"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Edit User Profile</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">View and fix up anyone's avatar, nickname, or bio - useful for removing an inappropriate pfp or bio without deleting the account.</p>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-username" placeholder="e.g. testuser" autocomplete="off">
+        <div class="action-row">
+            <button class="button" onclick="loadProfile()" style="width:140px;">Load</button>
+        </div>
+        <div id="profile-avatar-preview" style="margin:10px 0;display:flex;align-items:center;gap:12px;"></div>
+        <label>Nickname</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-nickname" placeholder="(none)" maxlength="32">
+        <label>Bio</label>
+        <textarea id="profile-bio" maxlength="1000" style="width:100%;min-height:80px;border-radius:12px;padding:8px;box-sizing:border-box;"></textarea>
+        <div class="action-row">
+            <button class="button" onclick="saveProfileText()" style="width:140px;">Save Text</button>
+        </div>
+        <label style="margin-top:14px;">Replace Avatar</label>
+        <input type="file" id="profile-avatar-file" accept="image/*">
+        <div class="action-row">
+            <button class="button" onclick="uploadProfileAvatar()" style="width:160px;">Upload Avatar</button>
+            <button class="button" onclick="resetProfileAvatar()" style="width:160px;">Reset to Default</button>
+        </div>
+        <div id="profile-result"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Manage Badges</h2>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="badge-username" placeholder="e.g. testuser" autocomplete="off">
+        <label style="margin-top:14px;">Badges</label>
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;">
+            ${req.isOwner ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-headadmin" style="width:auto;"> Head Admin</label>` : ''}
+            ${req.isHeadAdmin ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-admin" style="width:auto;"> Admin</label>` : ''}
+            <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-supporter" style="width:auto;"> Supporter</label>
+            <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-developer" style="width:auto;"> Developer</label>
+            ${req.isOwner ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-owner" style="width:auto;"> Owner</label>` : ''}
+        </div>
+        ${!req.isOwner ? `<p style="opacity:0.4;font-size:0.78em;margin-top:6px;">Only Owners and Head Admins can grant or revoke the Admin badge.</p>` : ''}
+        <p style="opacity:0.4;font-size:0.8em;margin-top:8px;">Load a user's current badges first, tick/untick what you want, then save.</p>
+        <div class="action-row">
+            <button class="button" onclick="loadBadges()" style="width:140px;">Load</button>
+            <button class="button" onclick="saveBadges()" style="width:140px;">Save</button>
+        </div>
+        <div id="badge-result"></div>
+    </div>
+
+    <div class="panel">
+        <h2>All Users</h2>
+        <table>
+            <thead><tr><th>Username</th><th>Badges</th><th>Ban Reason</th><th>Last IP</th></tr></thead>
+            <tbody id="user-table">
+                ${userRows || '<tr><td colspan="4" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No users found.</td></tr>'}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    document.querySelectorAll('.button').forEach(btn => {
+        btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
+    });
+
+    function renderProfileAvatarPreview(avatarUrl, username) {
+        const el = document.getElementById('profile-avatar-preview');
+        if (avatarUrl) {
+            el.innerHTML = '<img src="' + avatarUrl + '" alt="avatar" style="width:56px;height:56px;border-radius:50%;object-fit:cover;border:1px solid rgba(255,255,255,0.2);">' +
+                '<span style="opacity:0.5;font-size:0.8em;">Current avatar for @' + username + '</span>';
+        } else {
+            el.innerHTML = '<span style="opacity:0.4;font-size:0.8em;">No avatar set.</span>';
+        }
+    }
+
+    async function loadProfile() {
+        const username = document.getElementById('profile-username').value.trim();
+        const resultEl = document.getElementById('profile-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        resultEl.className = ''; resultEl.textContent = 'Loading...';
+        try {
+            const res = await fetch('/admin/profile/' + encodeURIComponent(username));
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            document.getElementById('profile-nickname').value = data.Nickname || '';
+            document.getElementById('profile-bio').value = data.bio || '';
+            renderProfileAvatarPreview(data.avatar_url, data.username);
+            resultEl.className = 'ok'; resultEl.textContent = 'Loaded profile for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function saveProfileText() {
+        const username = document.getElementById('profile-username').value.trim();
+        const resultEl = document.getElementById('profile-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        const nickname = document.getElementById('profile-nickname').value.trim();
+        const bio = document.getElementById('profile-bio').value;
+        resultEl.className = ''; resultEl.textContent = 'Saving...';
+        try {
+            const res = await fetch('/admin/profile/' + encodeURIComponent(username) + '/text', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ nickname, bio })
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'ok'; resultEl.textContent = 'Profile text updated for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function uploadProfileAvatar() {
+        const username = document.getElementById('profile-username').value.trim();
+        const resultEl = document.getElementById('profile-result');
+        const fileInput = document.getElementById('profile-avatar-file');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        if (!fileInput.files[0]) { resultEl.className = 'err'; resultEl.textContent = 'Choose an image file first.'; return; }
+        const formData = new FormData();
+        formData.append('avatar', fileInput.files[0]);
+        resultEl.className = ''; resultEl.textContent = 'Uploading...';
+        try {
+            const res = await fetch('/admin/profile/' + encodeURIComponent(username) + '/avatar', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            renderProfileAvatarPreview(data.avatar_url, username);
+            fileInput.value = '';
+            resultEl.className = 'ok'; resultEl.textContent = 'Avatar updated for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function resetProfileAvatar() {
+        const username = document.getElementById('profile-username').value.trim();
+        const resultEl = document.getElementById('profile-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        if (!confirm('Reset @' + username + '\\'s avatar to the default image?')) return;
+        resultEl.className = ''; resultEl.textContent = 'Resetting...';
+        try {
+            const res = await fetch('/admin/profile/' + encodeURIComponent(username) + '/reset-avatar', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            renderProfileAvatarPreview(data.avatar_url, username);
+            resultEl.className = 'ok'; resultEl.textContent = 'Avatar reset for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function loadBadges() {
+        const username = document.getElementById('badge-username').value.trim();
+        const resultEl = document.getElementById('badge-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        resultEl.className = ''; resultEl.textContent = 'Loading...';
+        try {
+            const res = await fetch('/admin/badges/' + encodeURIComponent(username));
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            document.getElementById('badge-admin') && (document.getElementById('badge-admin').checked = !!data.IsAdmin);
+            document.getElementById('badge-headadmin') && (document.getElementById('badge-headadmin').checked = !!data.IsHeadAdmin);
+            document.getElementById('badge-supporter').checked = !!data.IsSupporter;
+            document.getElementById('badge-developer').checked = !!data.IsDeveloper;
+            const ownerBox = document.getElementById('badge-owner');
+            if (ownerBox) ownerBox.checked = !!data.IsOwner;
+            resultEl.className = 'ok'; resultEl.textContent = 'Loaded badges for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function saveBadges() {
+        const username = document.getElementById('badge-username').value.trim();
+        const resultEl = document.getElementById('badge-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        const ownerBox = document.getElementById('badge-owner');
+        const adminBox = document.getElementById('badge-admin');
+        const headadminBox = document.getElementById('badge-headadmin');
+        const body = {
+            IsSupporter: document.getElementById('badge-supporter').checked,
+            IsDeveloper: document.getElementById('badge-developer').checked
+        };
+        if (adminBox) body.IsAdmin = adminBox.checked;
+        if (ownerBox) body.IsHeadAdmin = headadminBox.checked;
+        if (ownerBox) body.IsOwner = ownerBox.checked;
+        resultEl.className = ''; resultEl.textContent = 'Saving...';
+        try {
+            const res = await fetch('/admin/badges/' + encodeURIComponent(username), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'ok'; resultEl.textContent = 'Badges updated for @' + username + '.';
+            setTimeout(() => location.reload(), 1000);
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+
+    async function submitAction() {
+        const username = document.getElementById('target-username').value.trim();
+        const reason = document.getElementById('ban-reason').value.trim();
+        const action = document.getElementById('action').value;
+        const resultEl = document.getElementById('result');
+
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Username is required.'; return; }
+        if (action === 'ban' && !reason) { resultEl.className = 'err'; resultEl.textContent = 'A reason is required to ban.'; return; }
+
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+
+        try {
+            const res = await fetch('/admin/' + action + '/' + encodeURIComponent(username), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: action === 'ban' ? JSON.stringify({ reason }) : '{}'
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = action === 'ban'
+                    ? '@' + username + ' has been banned.'
+                    : '@' + username + ' has been unbanned.';
+                document.getElementById('target-username').value = '';
+                document.getElementById('ban-reason').value = '';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function submitDeleteAccount() {
+        const username = document.getElementById('delete-username').value.trim();
+        const resultEl = document.getElementById('delete-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Username is required.'; return; }
+        if (!confirm('This will reset @' + username + '\\'s avatar, name, and bio, ban the account, and delete all of its posts. The account stays in the database and the username is kept. Continue?')) return;
+
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/delete-account/' + encodeURIComponent(username), { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = '@' + username + ' has been deleted.';
+                document.getElementById('delete-username').value = '';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function submitIPAction() {
+        const ip = document.getElementById('target-ip').value.trim();
+        const reason = document.getElementById('ip-ban-reason').value.trim();
+        const action = document.getElementById('ip-action').value;
+        const resultEl = document.getElementById('ip-result');
+
+        if (!ip) { resultEl.className = 'err'; resultEl.textContent = 'IP address is required.'; return; }
+        if (action === 'ipban' && !reason) { resultEl.className = 'err'; resultEl.textContent = 'A reason is required to IP ban.'; return; }
+
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+
+        try {
+            const endpoint = action === 'ipban' ? '/admin/ipban' : '/admin/unipban';
+            const res = await fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip, reason })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = action === 'ipban'
+                    ? ip + ' has been IP banned.'
+                    : ip + ' has been IP unbanned.';
+                document.getElementById('target-ip').value = '';
+                document.getElementById('ip-ban-reason').value = '';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
+    function prefillIPBan(ip) {
+        document.getElementById('target-ip').value = ip;
+        document.getElementById('ip-action').value = 'ipban';
+        document.getElementById('target-ip').focus();
+        document.getElementById('target-ip').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    async function unIPBan(ip) {
+        const resultEl = document.getElementById('ip-result');
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/unipban', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ip })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = ip + ' has been IP unbanned.';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
+    document.getElementById('target-username').addEventListener('keydown', e => { if (e.key === 'Enter') submitAction(); });
+    document.getElementById('ban-reason').addEventListener('keydown', e => { if (e.key === 'Enter') submitAction(); });
+    document.getElementById('target-ip').addEventListener('keydown', e => { if (e.key === 'Enter') submitIPAction(); });
+    document.getElementById('ip-ban-reason').addEventListener('keydown', e => { if (e.key === 'Enter') submitIPAction(); });
+
+    function toggleNav() {
+        const dropdown = document.getElementById('nav-dropdown');
+        const btn = document.getElementById('nav-hamburger');
+        dropdown.classList.toggle('open');
+        btn.textContent = dropdown.classList.contains('open') ? '✕' : '☰';
+    }
+    document.addEventListener('click', function(e) {
+        const dropdown = document.getElementById('nav-dropdown');
+        const btn = document.getElementById('nav-hamburger');
+        if (dropdown && btn && !dropdown.contains(e.target) && e.target !== btn) {
+            dropdown.classList.remove('open');
+            btn.textContent = '☰';
+        }
+    }); 
+</script>
+
+</body>
+</html>

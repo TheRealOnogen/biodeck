@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Dashboard</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<style>
+    body { margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    .dashboard-box { color: white; width: 500px; padding: 30px; text-align: center; }
+    .dash-field { margin: 12px 0; text-align: left; }
+    .dash-field label { display: block; margin-bottom: 4px; font-size: 0.9em; opacity: 0.7; }
+    .dash-textarea { width: 100%; box-sizing: border-box; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; resize: vertical; min-height: 80px; }
+    .dash-links { margin-top: 20px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+    <div class="box dashboard-box">
+        <h1>Dashboard</h1>
+        <p style="opacity:0.6;">@${req.session.userUsername}</p>
+        <div class="dash-field" style="text-align:center;">
+            <label>Profile Picture</label>
+            <div style="display:flex;justify-content:center;margin-bottom:10px;">
+                ${renderAvatarHTML(avatarPath, req.session.userUsername, 84)}
+            </div>
+            <form action="/edit/avatar" method="POST" enctype="multipart/form-data" style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+                <input type="file" id="avatar-input" name="avatar" accept="image/*" style="display:none;">
+                <label for="avatar-input" class="button" style="padding:10px;width:160px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;">Choose Image</label>
+                <span id="avatar-file-name" style="font-size:0.78em;opacity:0.65;">No file chosen</span>
+                <button class="button" type="submit" style="padding:10px;width:160px;">Upload</button>
+            </form>
+        </div>
+        <form action="/edit/nickname" method="POST">
+            <div class="dash-field">
+                <label>Nickname <span style="opacity:0.4;">(shown instead of your username - spaces allowed. Your @username stays the same and is the only way people can ping you)</span></label>
+                <input class="dash-textarea" style="min-height:unset;" type="text" name="nickname" id="nickname-input" placeholder="e.g. Cool Guy" maxlength="32" value="${escapeHTML(nickname)}">
+            </div>
+            <button class="button" type="submit" style="padding:10px;width: auto;margin-top:8px;">Save Nickname</button>
+        </form>
+        <form action="/edit/bio" method="POST">
+            <div class="dash-field">
+                <label>Bio</label>
+                <textarea class="dash-textarea" name="bio" id="bio-textarea" placeholder="Tell people about yourself..." maxlength="1000">${bio}</textarea>
+            </div>
+            <button class="button" type="submit" style="padding:10px;width:120px;margin-top:8px;">Save Bio</button>
+        </form>
+        <div class="dash-links">
+            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/feed';">Feed</button>
+            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/messages';">Messages</button>
+            <button class="button notif-nav-link" style="padding:10px;width: auto;" onclick="window.location.href='/notifications';">Notifications</button>
+            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/followers';">Followers</button>
+            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
+        </div>
+    </div>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
+        });
+
+        document.getElementById('avatar-input').addEventListener('change', function () {
+            document.getElementById('avatar-file-name').textContent = this.files.length ? this.files[0].name : 'No file chosen';
+        });
+
+        const bioEl = document.getElementById('bio-textarea');
+        const bioCounter = document.createElement('div');
+        bioCounter.style.cssText = 'font-size:0.75em;opacity:0.5;text-align:right;margin-top:4px;';
+        bioCounter.textContent = bioEl.value.length + ' / 1000';
+        bioEl.parentNode.insertBefore(bioCounter, bioEl.nextSibling);
+        bioEl.addEventListener('input', function () {
+            const len = this.value.length;
+            bioCounter.textContent = len + ' / 1000';
+            bioCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            bioCounter.style.opacity = len > 900 ? '1' : '0.5';
+        });
+
+        if (new URLSearchParams(window.location.search).get('nicknameerror')) {
+            const t = document.createElement('div');
+            t.textContent = 'Nickname too long - 32 character limit.';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+            window.history.replaceState(null, '', '/edit');
+        }
+
+        if (new URLSearchParams(window.location.search).get('bioerror')) {
+            const t = document.createElement('div');
+            t.textContent = 'Bio too long - 1,000 character limit.';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+            window.history.replaceState(null, '', '/edit');
+        }
+
+        if (new URLSearchParams(window.location.search).get('avatarerror')) {
+            const t = document.createElement('div');
+            t.textContent = 'Could not upload profile picture - please use an image file under 8MB.';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+            window.history.replaceState(null, '', '/edit');
+        }
+    </script>
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+
+</body>
+</html>

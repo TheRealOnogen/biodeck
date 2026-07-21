@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Followers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<style>
+    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; }
+    #followers-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
+    #followers-topbar-left { font-size: 0.95em; }
+    #followers-topbar-right { position: relative; display: flex; align-items: center; }
+    #followers-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
+    #followers-topbar-right a:hover { text-decoration: underline; }
+    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
+    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
+    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
+    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
+    #nav-dropdown.open { display: flex; }
+    @media (max-width: 600px) {
+        #followers-topbar-right > a { display: none; }
+        #nav-hamburger { display: inline-block; }
+    }
+    #followers-list { max-width: 600px; width: 100%; margin: 80px auto 40px; padding: 0 20px; box-sizing: border-box; }
+</style>
+</head>
+<body>
+    <div id="followers-topbar">
+        <div id="followers-topbar-left">Logged in as <strong>${me}</strong></div>
+        <div id="followers-topbar-right">
+            <a href="/feed">Feed</a>
+            <a href="/edit">Dashboard</a>
+            <a href="/notifications" class="notif-nav-link">Notifications</a>
+            <a href="/logout">Logout</a>
+            <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
+            <nav id="nav-dropdown">
+                <a href="/feed">Feed</a>
+                <a href="/edit">Dashboard</a>
+                <a href="/notifications" class="notif-nav-link">Notifications</a>
+                <a href="/logout">Logout</a>
+            </nav>
+        </div>
+    </div>
+    <div id="followers-list">
+        <h2>Your Followers <span style="opacity:0.5;font-size:0.7em;">(${(followers || []).length})</span></h2>
+        ${followersHTML || '<p style="opacity:0.4;">No followers yet.</p>'}
+    </div>
+    <script>
+        function toggleNav() {
+            const dropdown = document.getElementById('nav-dropdown');
+            const btn = document.getElementById('nav-hamburger');
+            dropdown.classList.toggle('open');
+            btn.textContent = dropdown.classList.contains('open') ? '✕' : '☰';
+        }
+        document.addEventListener('click', function(e) {
+            const dropdown = document.getElementById('nav-dropdown');
+            const btn = document.getElementById('nav-hamburger');
+            if (dropdown && btn && !dropdown.contains(e.target) && e.target !== btn) {
+                dropdown.classList.remove('open');
+                btn.textContent = '☰';
+            }
+        });
+    </script>
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+
+</body>
+</html>

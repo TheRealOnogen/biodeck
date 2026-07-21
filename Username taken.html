@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Username Taken</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="box" style="color: white; height: 170px; width: 500px;">
+        <h1>Username Taken</h1>
+        <h3>That username is already in use.</h3>
+        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>
+    </div>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => {
+                btn.classList.add('clicked');
+                setTimeout(() => btn.classList.remove('clicked'), 150);
+            });
+        });
+    </script>
+
+</body>
+</html>

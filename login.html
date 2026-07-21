@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <form action="/login" method="POST">
+    <div class="box" style="color: white; height: auto; width: min(500px, 80vw);">
+        <h1>Welcome to Biodeck</h1>
+        <label for="username">Username</label><br>
+        <input type="text" id="username" name="username"><br><br>
+        <label for="password">Password</label><br>
+        <input type="password" id="password" name="password"><br><br>
+        <button type="submit" class="button">Login</button><br><br>
+        <button type="button" class="button" onclick="alert('Not implemented yet')" style="width: 180px">Forgot Password</button>
+        <button type="button" class="button" onclick="window.location.href='register'" style="width: 180px">Don't have an account</button>
+    </div>
+    </form>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => {
+                btn.classList.add('clicked');
+                setTimeout(() => btn.classList.remove('clicked'), 150);
+            });
+        });
+    </script>
+
+</body>
+</html>

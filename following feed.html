@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Following Feed</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="styles.css">
+<style>
+    body { margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
+    #feed-wrapper { display: flex; flex-direction: column; height: 100vh; width: 100vw; box-sizing: border-box; border-radius: 0; border: none; }
+    #feed-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; gap: 12px; }
+    #feed-topbar-left { font-size: 0.95em; white-space: nowrap; }
+    #feed-topbar-right a { color: rgb(0,191,255); margin-left: 15px; text-decoration: none; white-space: nowrap; }
+    #feed-topbar-right a:hover { text-decoration: underline; }
+    #feed-topbar-right a.active { color: white; font-weight: bold; pointer-events: none; }
+    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; }
+    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
+    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
+    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
+    #nav-dropdown a.active { color: white; font-weight: bold; pointer-events: none; }
+    #nav-dropdown.open { display: flex; }
+    @media (max-width: 1200px) {
+        #feed-topbar-right > a { display: none; }
+        #nav-hamburger { display: inline-block; }
+    }
+    #posts { flex: 1; overflow-y: auto; padding: 70px 20px 130px 20px; text-align: center; }
+    #post-form-container { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
+    #reply-indicator { font-size: 0.85em; opacity: 0.7; display: none; margin-bottom: 6px; text-align: center; }
+    #post-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
+    #post-form-row textarea { text-align: left; flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
+    #file-name-display { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
+    .post { max-width: 600px; margin: 0 auto; text-align: left; }
+    .post-actions { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
+    .post-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: 0.2s; }
+    .post-action-btn:hover { background-color: white; color: black; }
+    .post-action-btn.clicked { background-color: black !important; color: white !important; }
+</style>
+</head>
+<body>
+    <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
+        <div id="feed-topbar">
+            <div id="feed-topbar-left">Logged in as <strong>${sessionUsername}</strong></div>
+            <div id="feed-topbar-right" style="position:relative;display:flex;align-items:center;">
+                <a href="/v86">v86</a>
+                <a href="/editor">HTML Editor</a>
+                <a href="/edit">Dashboard</a>
+                <a href="/notifications" class="notif-nav-link">Notifications</a>
+                <a href="/friends">Friends</a>
+                <a href="/feed">All Posts</a>
+                <a href="/following-feed" class="active">Following Feed</a>
+                ${req.isAdmin ? `<a href="/admin/dashboard">Admin Dashboard</a>` : ''}
+                <a href="/logout">Logout</a>
+                <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
+                <nav id="nav-dropdown">
+                    <a href="/v86">v86</a>
+                    <a href="/editor">HTML Editor</a>
+                    <a href="/edit">Dashboard</a>
+                    <a href="/notifications" class="notif-nav-link">Notifications</a>
+                    <a href="/friends">Friends</a>
+                    <a href="/feed">All Posts</a>
+                    <a href="/following-feed" class="active">Following Feed</a>
+                    ${req.isAdmin ? `<a href="/admin/dashboard">Admin Dashboard</a>` : ''}
+                    <a href="/logout">Logout</a>
+                </nav>
+            </div>
+        </div>
+
+        <div id="posts" style="color: white;">
+            ${postsHTML || `<p id="no-posts-msg" style="opacity:0.5;margin-top:40px;">No posts yet from people you follow.</p>`}
+            <div id="load-more-sentinel" style="height:1px;"></div>
+            <div id="load-more-spinner" style="display:none;text-align:center;opacity:0.5;padding:16px 0;">Loading…</div>
+        </div>
+
+        <div id="post-form-container">
+            <div id="reply-indicator">> Replying to <span id="reply-to-name"></span> - <a href="#" onclick="clearReply();return false;" style="color:rgb(0,191,255);">Cancel</a></div>
+            <form action="/feed/post" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="reply_to" id="reply-to-input" value="">
+                <div id="post-form-row">
+                    <textarea name="content" id="post-content" placeholder="What's on your mind?" maxlength="1000"></textarea>
+                    <input type="file" name="attachments" id="attachment" multiple style="display:none;">
+                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
+                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Post</button>
+                </div>
+                <div id="file-name-display">No file chosen</div>
+                <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        document.querySelectorAll('.post-time').forEach(el => {
+            const ts = el.getAttribute('data-ts');
+            if (ts) el.textContent = new Date(ts).toLocaleString();
+        });
+
+        document.getElementById('attachment').addEventListener('change', function () {
+            const n = this.files.length;
+            document.getElementById('file-name-display').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 5)';
+        });
+
+        const postContent = document.getElementById('post-content');
+        const postCounter = document.getElementById('post-char-counter');
+        postContent.addEventListener('input', function () {
+            const len = this.value.length;
+            postCounter.textContent = len + ' / 1000';
+            postCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            postCounter.style.opacity = len > 900 ? '1' : '0.5';
+        });
+
+        if (new URLSearchParams(window.location.search).get('posterror')) {
+            const t = document.createElement('div');
+            t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+            window.history.replaceState(null, '', '/following-feed');
+        }
+
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
+        });
+
+        function deletePost(id) {
+            fetch('/feed/delete/' + id, { method: 'POST' }).then(r => {
+                if (r.ok) {
+                    const el = document.getElementById('post-' + id);
+                    if (el) {
+                        const br = el.nextElementSibling;
+                        if (br && br.tagName === 'BR') br.remove();
+                        el.remove();
+                    }
+                }
+            });
+        }
+        function pinPost(id) {
+            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+        }
+        function unpinPost(id) {
+            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+        }
+
+        let lastPostId = (() => {
+            const posts = document.querySelectorAll('.post[id^="post-"]');
+            let max = ${newestPostId};
+            posts.forEach(el => { const n = parseInt(el.id.replace('post-', '')); if (n > max) max = n; });
+            return max;
+        })();
+
+        function pollFeed() {
+            fetch('/following-feed/poll?after=' + lastPostId)
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !data.html) return;
+                    lastPostId = data.lastId;
+                    const postsEl = document.getElementById('posts');
+                    const noPostsMsg = postsEl.querySelector('#no-posts-msg');
+                    if (noPostsMsg) noPostsMsg.remove();
+                    const temp = document.createElement('div');
+                    temp.innerHTML = data.html;
+                    while (temp.firstChild) postsEl.insertBefore(temp.firstChild, postsEl.firstChild);
+                    postsEl.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                        if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString();
+                    });
+                })
+                .catch(() => {});
+        }
+
+        function pollDeletions() {
+            const visibleIds = [];
+            document.querySelectorAll('.post[id^="post-"]').forEach(el => {
+                visibleIds.push(parseInt(el.id.replace('post-', '')));
+            });
+            if (!visibleIds.length) return;
+            fetch('/feed/exists?' + visibleIds.map(id => 'id=' + id).join('&'))
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data) return;
+                    visibleIds.forEach(id => {
+                        if (!data.existing.includes(id)) {
+                            const el = document.getElementById('post-' + id);
+                            if (el) {
+                                const br = el.nextElementSibling;
+                                if (br && br.tagName === 'BR') br.remove();
+                                el.remove();
+                            }
+                        }
+                    });
+                    fillViewport();
+                })
+                .catch(() => {});
+        }
+
+        function pollReplyCounts() {
+            const btns = document.querySelectorAll('.reply-count-btn[data-post-id]');
+            if (!btns.length) return;
+            const ids = Array.from(btns).map(b => b.getAttribute('data-post-id'));
+            fetch('/feed/reply-counts?' + ids.map(id => 'id=' + id).join('&'))
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !data.counts) return;
+                    btns.forEach(btn => {
+                        const id = btn.getAttribute('data-post-id');
+                        if (id in data.counts) btn.textContent = data.counts[id] + ' Replies';
+                    });
+                })
+                .catch(() => {});
+        }
+
+        setInterval(pollFeed, 4000);
+        setInterval(pollDeletions, 5000);
+        setInterval(pollReplyCounts, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); } });
+
+        let oldestPostId = ${oldestPostId};
+        let hasMore = ${hasMoreInitial ? 'true' : 'false'};
+        let loadingOlder = false;
+
+        function fetchOlderPosts() {
+            if (!hasMore || loadingOlder || oldestPostId === 0) return Promise.resolve(false);
+            loadingOlder = true;
+            return fetch('/following-feed/older?before=' + oldestPostId)
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data) { loadingOlder = false; return false; }
+                    hasMore = data.hasMore;
+                    if (data.html) {
+                        const postsEl = document.getElementById('posts');
+                        const sentinel = document.getElementById('load-more-sentinel');
+                        const temp = document.createElement('div');
+                        temp.innerHTML = data.html;
+                        while (temp.firstChild) postsEl.insertBefore(temp.firstChild, sentinel);
+                        postsEl.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                            if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString();
+                        });
+                        oldestPostId = data.oldestId;
+                    }
+                    loadingOlder = false;
+                    return hasMore;
+                })
+                .catch(() => { loadingOlder = false; return false; });
+        }
+
+        function loadOlderPosts() {
+            if (!hasMore || loadingOlder || oldestPostId === 0) return;
+            document.getElementById('load-more-spinner').style.display = 'block';
+            fetchOlderPosts().then(() => {
+                document.getElementById('load-more-spinner').style.display = 'none';
+            });
+        }
+
+        function fillViewport() {
+            if (!hasMore || loadingOlder || oldestPostId === 0) return;
+            if (scrollContainer.scrollHeight > scrollContainer.clientHeight + 150) return;
+            fetchOlderPosts().then(() => { fillViewport(); });
+        }
+
+        const scrollContainer = document.getElementById('posts');
+        scrollContainer.addEventListener('scroll', () => {
+            const nearBottom = scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight < 150;
+            if (nearBottom) loadOlderPosts();
+        });
+        fillViewport();
+
+        function clearReply() {
+            document.getElementById('reply-to-input').value = '';
+            document.getElementById('reply-indicator').style.display = 'none';
+        }
+
+        function toggleNav() {
+            const nav = document.getElementById('nav-dropdown');
+            const btn = document.getElementById('nav-hamburger');
+            nav.classList.toggle('open');
+            btn.textContent = nav.classList.contains('open') ? '✕' : '☰';
+        }
+        document.addEventListener('click', function(e) {
+            const btn = document.getElementById('nav-hamburger');
+            const nav = document.getElementById('nav-dropdown');
+            if (nav && !nav.contains(e.target) && e.target !== btn) {
+                nav.classList.remove('open');
+                btn.textContent = '☰';
+            }
+        });
+    </script>
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+
+</body>
+</html>

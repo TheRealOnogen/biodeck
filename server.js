@@ -907,90 +907,25 @@ app.get('/api/check-ban-status', (req, res) => {
 
 app.get('/register', (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Register</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <form action="/register" method="POST">
-    <div class="box" style="color: white; height: auto; width: min(500px, 80vw);">
-        <h1>Welcome to Biodeck</h1>
-        <label for="username">Username</label><br>
-        <input type="text" id="username" name="username"><br><br>
-        <label for="password">Password</label><br>
-        <input type="password" id="password" name="password"><br><br>
-        <button type="submit" class="button">Register</button>
-    </div>
-    </form>
-    <script>
-        document.querySelectorAll('.button').forEach(btn => {
-            btn.addEventListener('mousedown', () => {
-                btn.classList.add('clicked');
-                setTimeout(() => btn.classList.remove('clicked'), 150);
-            });
-        });
-    </script>
-
-</body>
-</html>`);
+    res.sendFile(path.join(__dirname, 'register.html'));
 })
 
 app.get('/', (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
-    res.send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Login</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <form action="/login" method="POST">
-    <div class="box" style="color: white; height: auto; width: min(500px, 80vw);">
-        <h1>Welcome to Biodeck</h1>
-        <label for="username">Username</label><br>
-        <input type="text" id="username" name="username"><br><br>
-        <label for="password">Password</label><br>
-        <input type="password" id="password" name="password"><br><br>
-        <button type="submit" class="button">Login</button><br><br>
-        <button type="button" class="button" onclick="alert('Not implemented yet')" style="width: 180px">Forgot Password</button>
-        <button type="button" class="button" onclick="window.location.href='register'" style="width: 180px">Don't have an account</button>
-    </div>
-    </form>
-    <script>
-        document.querySelectorAll('.button').forEach(btn => {
-            btn.addEventListener('mousedown', () => {
-                btn.classList.add('clicked');
-                setTimeout(() => btn.classList.remove('clicked'), 150);
-            });
-        });
-    </script>
-
-</body>
-</html>`);
+    res.sendFile(path.join(__dirname, 'login.html'));
 });
 
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
 
     if (!username || !password) {
-        return res.send(`<!DOCTYPE html><html lang="en"><head><link rel="icon" type="image/x-icon" href="/Biodeck.png"><meta charset="UTF-8"><title>Error</title><link rel="stylesheet" href="/styles.css"></head><body><div class="box" style="color:white;height:170px;width:500px;"><h1>Invalid Input</h1><h3>Username and password are required.</h3><button class="button" onclick="window.location.href='/register';">Go back</button></div>
-</body></html>`);
+        return res.sendFile(path.join(__dirname, 'register_error_missing_fields.html'));
     }
     if (username.length < 3 || username.length > 32) {
-        return res.send(`<!DOCTYPE html><html lang="en"><head><link rel="icon" type="image/x-icon" href="/Biodeck.png"><meta charset="UTF-8"><title>Error</title><link rel="stylesheet" href="/styles.css"></head><body><div class="box" style="color:white;height:170px;width:500px;"><h1>Invalid Username</h1><h3>Username must be 3–32 characters.</h3><button class="button" onclick="window.location.href='/register';">Go back</button></div>
-</body></html>`);
+        return res.sendFile(path.join(__dirname, 'register_error_invalid_length.html'));
     }
     if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
-        return res.send(`<!DOCTYPE html><html lang="en"><head><link rel="icon" type="image/x-icon" href="/Biodeck.png"><meta charset="UTF-8"><title>Error</title><link rel="stylesheet" href="/styles.css"></head><body><div class="box" style="color:white;height:170px;width:500px;"><h1>Invalid Username</h1><h3>Username may only contain letters, numbers, underscores, hyphens, and dots.</h3><button class="button" onclick="window.location.href='/register';">Go back</button></div>
-</body></html>`);
+        return res.sendFile(path.join(__dirname, 'register_error_invalid_chars.html'));
     }
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
@@ -998,32 +933,7 @@ app.post('/register', async (req, res) => {
         db.run(`INSERT INTO User_Data (username, password, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?)`, [username, hashedPassword, 1, "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins", 'public/Default.svg'], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
-                return res.send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Username Taken</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Username Taken</h1>
-        <h3>That username is already in use.</h3>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>
-    </div>
-    <script>
-        document.querySelectorAll('.button').forEach(btn => {
-            btn.addEventListener('mousedown', () => {
-                btn.classList.add('clicked');
-                setTimeout(() => btn.classList.remove('clicked'), 150);
-            });
-        });
-    </script>
-
-</body>
-</html>`);
+                return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
             }
             const newUserId = this.lastID;
 
@@ -1105,24 +1015,7 @@ app.post('/register', async (req, res) => {
         });
     } catch (err) {
         console.error("Register error:", err);
-        return res.status(500).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Internal Error</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Error 500</h1>
-        <h3>Reason: Internal server error.</h3>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-    <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0c94730be2f5a97',t:'MTc4MTYwNzI4Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"ba3a8d39731345049cc926d2a2edf763","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
-
-</body>`);
+        return res.status(500).sendFile(path.join(__dirname, 'register_error_internal.html'));
     }
 });
 
@@ -1132,44 +1025,11 @@ app.post('/login', (req, res) => {
     db.get(`SELECT * FROM User_Data WHERE username = ?`, [username], async (err, user) => {
         if (err) {
             console.error("Database Login Error:", err.message);
-            return res.status(500).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Internal Error</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Internal Error</h1>
-        <h3>Reason: An error occurred during login.</h3>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-
-</body>
-</html>`);
+            return res.status(500).sendFile(path.join(__dirname, 'login_error_internal.html'));
         }
 
         if (!user) {
-            return res.status(401).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Incorrect credentials</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Incorrect username or password.</h1>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-
-</body>
-</html>`);
+            return res.status(401).sendFile(path.join(__dirname, 'login_error_invalid_credentials.html'));
         }
 
         try {
@@ -1239,44 +1099,11 @@ app.post('/login', (req, res) => {
                 db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [loginIP, user.id], () => {});
                 return res.redirect('/feed');
             } else {
-                return res.status(401).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Incorrect credentials</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Incorrect username or password.</h1>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-
-</body>
-</html>`);
+                return res.status(401).sendFile(path.join(__dirname, 'login_error_invalid_credentials.html'));
             }
         } catch (error) {
             console.error(error);
-            return res.status(500).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Internal Error</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Internal Error</h1>
-        <h3>Reason: Internal server error during authentication.</h3>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-
-</body>
-</html>`);
+            return res.status(500).sendFile(path.join(__dirname, 'login_error_auth_exception.html'));
         }
     });
 });
@@ -3948,22 +3775,7 @@ function requireAdmin(req, res, next) {
     if (!req.session.userId) return res.redirect('/');
     db.get(`SELECT IsOwner, IsAdmin, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         if (err || !user || (!user.IsOwner && !user.IsAdmin && !user.IsHeadAdmin)) {
-            return res.status(403).send(`<!DOCTYPE html>
-<html lang="en">
-    <head>
-        <link rel="icon" type="image/x-icon" href="/Biodeck.png"><meta charset="UTF-8">
-        <title>Access Denied</title>
-        <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-        <link rel="stylesheet" href="styles.css">
-    </head>
-    <body>
-        <div class="box" style="color:white;height:200px;width:500px;">
-            <h1>Access Denied</h1>
-            <h3>You don't have permission to view this page.</h3>
-            <button style="width: auto;"class="button" onclick="window.location.href='/feed';">Go to Feed</button>
-        </div>
-</body>
-</html>`);
+            return res.status(403).sendFile(path.join(__dirname, 'admin_access_denied.html'));
         }
         req.isOwner = !!user.IsOwner;
         req.isHeadAdmin = !!(user.IsHeadAdmin || user.IsOwner);
@@ -5058,24 +4870,7 @@ app.get('/groups/:id', (req, res) => {
     db.get(`SELECT * FROM Group_Chats WHERE id = ?`, [groupId], (err, group) => {
         if (err || !group) return res.status(404).send('Group not found');
         db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (err2, memberRow) => {
-            if (!memberRow) return res.status(403).send(`<!DOCTYPE html>
-<html lang="en">
-<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Internal Error</title>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
-</head>
-<body>
-    <div class="box" style="color: white; height: 170px; width: 500px;">
-        <h1>Error 403</h1>
-        <h3>Reason: You are not a part of this group.</h3>
-        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
-    </div>
-    <script>(function(){function c(){var b=a.contentDocument||a.contentWindow.document;if(b){var d=b.createElement('script');d.innerHTML="window.__CF$cv$params={r:'a0c94730be2f5a97',t:'MTc4MTYwNzI4Mw=='};var a=document.createElement('script');a.src='/cdn-cgi/challenge-platform/scripts/jsd/main.js';document.getElementsByTagName('head')[0].appendChild(a);";b.getElementsByTagName('head')[0].appendChild(d)}}if(document.body){var a=document.createElement('iframe');a.height=1;a.width=1;a.style.position='absolute';a.style.top=0;a.style.left=0;a.style.border='none';a.style.visibility='hidden';document.body.appendChild(a);if('loading'!==document.readyState)c();else if(window.addEventListener)document.addEventListener('DOMContentLoaded',c);else{var e=document.onreadystatechange||function(){};document.onreadystatechange=function(b){e(b);'loading'!==document.readyState&&(document.onreadystatechange=e,c())}}}})();</script><script defer src="https://static.cloudflareinsights.com/beacon.min.js/v833ccba57c9e4d2798f2e76cebdd09a11778172276447" integrity="sha512-57MDmcccJXYtNnH+ZiBwzC4jb2rvgVCEokYN+L/nLlmO8rfYT/gIpW2A569iJ/3b+0UEasghjuZH/ma3wIs/EQ==" data-cf-beacon='{"version":"2024.11.0","token":"ba3a8d39731345049cc926d2a2edf763","r":1,"server_timing":{"name":{"cfCacheStatus":true,"cfEdge":true,"cfExtPri":true,"cfL4":true,"cfOrigin":true,"cfSpeedBrain":true},"location_startswith":null}}' crossorigin="anonymous"></script>
-
-</body>`);
+            if (!memberRow) return res.status(403).sendFile(path.join(__dirname, 'group_access_denied.html'));
             db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ? ORDER BY joined_at ASC`, [groupId], (err3, members) => {
                 db.all(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE group_id = ? ORDER BY created_at ASC`, [groupId], (err4, msgs) => {
                     const msgMap = {};

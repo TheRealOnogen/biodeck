@@ -99,6 +99,10 @@ gcBus.setMaxListeners(0);
 // Keyed by userId so the server can push to a specific user without any client polling.
 const userBus = new EventEmitter();
 userBus.setMaxListeners(0);
+// Tracks currently-open /api/user-events/stream connections along with the
+// IP they connected from, so an IP ban can be pushed only to sessions
+// actually on that IP - not broadcast to every connected user.
+const userEventConnections = new Set();
 
 function sseSend(res, event, data) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -458,6 +462,39 @@ function sendSystemDM(toUsername, content) {
         });
 }
 
+// Registration gate, toggleable from the admin dashboard.
+// ON (default, matches legacy behavior): new accounts are created with
+// IsBanned = 1 and admins get pinged (Activations group chat post + DMs) so
+// someone can manually activate the account.
+// OFF: registration is fully open - accounts are created active (IsBanned =
+// 0) immediately, with no pings sent at all.
+// Cached in memory (defaulting to true, i.e. current behavior) and backed by
+// the Settings table so the choice survives restarts.
+let registrationGateEnabled = true;
+function loadRegistrationGateSetting() {
+    db.get(`SELECT value FROM Settings WHERE key = 'registration_gate_enabled'`, (err, row) => {
+        if (!err && row) registrationGateEnabled = row.value === '1';
+    });
+}
+function setRegistrationGateEnabled(enabled, cb) {
+    const value = enabled ? '1' : '0';
+    db.run(`INSERT INTO Settings (key, value) VALUES ('registration_gate_enabled', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [value], (err) => {
+        if (!err) registrationGateEnabled = enabled;
+        cb(err);
+    });
+}
+
+// Writes one row to the audit trail. actor is who performed the action
+// ('System' for self-service events like registration); target is the
+// affected username, if any. Fire-and-forget - a logging failure shouldn't
+// break the action it's logging.
+function logAudit(action, actor, target, details) {
+    db.run(`INSERT INTO Audit_Log (action, actor, target, details) VALUES (?, ?, ?, ?)`,
+        [action, actor || 'System', target || null, details || null],
+        (err) => { if (err) console.error('Audit log insert error:', err.message); });
+}
+
 // Extra usernames to DM on every new registration, on top of the user with
 // id 1. Local text file, single line, comma-separated, e.g.: Onogen,rtx
 // Missing file just means "no extra targets" - not an error.
@@ -718,6 +755,25 @@ const db = new sqlite3.Database('./data.db', (err) => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN files_json TEXT DEFAULT NULL`, () => {});
+            // Generic key/value store for small admin-configurable settings
+            // (e.g. the registration gate toggle below).
+            db.run(`CREATE TABLE IF NOT EXISTS Settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )`, () => { loadRegistrationGateSetting(); });
+            // Audit trail for admin-facing/account-lifecycle events (account
+            // created/banned/unbanned/deleted, registration gate toggled, etc).
+            // actor is who performed the action ('System' for self-service
+            // events like registration), target is the affected username (if
+            // any).
+            db.run(`CREATE TABLE IF NOT EXISTS Audit_Log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                action TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                target TEXT DEFAULT NULL,
+                details TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -861,6 +917,7 @@ app.use(checkBan);
 app.get('/api/user-events/stream', (req, res) => {
     if (!req.session || !req.session.userId) return res.status(401).end();
     const userId = req.session.userId;
+    const ip = getClientIP(req);
 
     res.writeHead(200, {
         'Content-Type': 'text/event-stream',
@@ -873,11 +930,15 @@ app.get('/api/user-events/stream', (req, res) => {
     const onEvent = (payload) => sseSend(res, payload.event, payload);
     userBus.on(`user:${userId}`, onEvent);
 
+    const conn = { userId, ip, res };
+    userEventConnections.add(conn);
+
     const keepAlive = setInterval(() => res.write(': ping\n\n'), 20000);
 
     req.on('close', () => {
         clearInterval(keepAlive);
         userBus.removeListener(`user:${userId}`, onEvent);
+        userEventConnections.delete(conn);
     });
 });
 
@@ -929,51 +990,62 @@ app.post('/register', async (req, res) => {
     }
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
+        const gateEnabled = registrationGateEnabled;
+        const initialIsBanned = gateEnabled ? 1 : 0;
+        const initialBanReason = gateEnabled
+            ? "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins"
+            : null;
 
-        db.run(`INSERT INTO User_Data (username, password, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?)`, [username, hashedPassword, 1, "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins", 'public/Default.svg'], function(err) {
+        db.run(`INSERT INTO User_Data (username, password, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?)`, [username, hashedPassword, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
             }
             const newUserId = this.lastID;
+            logAudit('account_created', username, username, gateEnabled ? 'registration gate ON - created pending activation' : 'registration gate OFF - created active');
 
-            // Post a notice in the reserved "Activations" group chat (id 1) so
-            // admins/mods watching it see new signups awaiting activation, and
-            // ping the user with id 1 (typically the owner/head admin).
-            db.get(`SELECT username FROM User_Data WHERE id = 1`, (errPing, pingUser) => {
-                const pingSuffix = pingUser ? ` @${pingUser.username}` : '';
-                const gcContent = `${username} is waiting for activation${pingSuffix}`;
-                db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content) VALUES (1, 'System', ?)`,
-                    [gcContent], function (errGC) {
-                        if (errGC) { console.error('Activation notice insert error:', errGC.message); return; }
-                        const gcMsgId = this.lastID;
-                        db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
-                            if (errRow || !row) return;
-                            db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = 1`, (errMem, memberRows) => {
-                                const members = (memberRows || []).map(r => r.username);
-                                broadcastGCMessage(1, 'System', row, null, members);
+            // Activation gating pings only fire while the registration gate is
+            // enabled. While it's off, registration is open and nobody gets
+            // pinged.
+            if (gateEnabled) {
+                // Post a notice in the reserved "Activations" group chat (id 1) so
+                // admins/mods watching it see new signups awaiting activation, and
+                // ping the user with id 1 (typically the owner/head admin).
+                db.get(`SELECT username FROM User_Data WHERE id = 1`, (errPing, pingUser) => {
+                    const pingSuffix = pingUser ? ` @${pingUser.username}` : '';
+                    const gcContent = `${username} is waiting for activation${pingSuffix}`;
+                    db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content) VALUES (1, 'System', ?)`,
+                        [gcContent], function (errGC) {
+                            if (errGC) { console.error('Activation notice insert error:', errGC.message); return; }
+                            const gcMsgId = this.lastID;
+                            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
+                                if (errRow || !row) return;
+                                db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = 1`, (errMem, memberRows) => {
+                                    const members = (memberRows || []).map(r => r.username);
+                                    broadcastGCMessage(1, 'System', row, null, members);
+                                });
                             });
+                            if (pingUser) {
+                                processMentions(gcContent, 'System', { type: 'mention_gc', post_id: 1, message_id: gcMsgId });
+                            }
                         });
-                        if (pingUser) {
-                            processMentions(gcContent, 'System', { type: 'mention_gc', post_id: 1, message_id: gcMsgId });
-                        }
-                    });
 
-                // DM the same notice to user id 1 plus anyone listed in the
-                // local activation-pings.txt file, once each, skipping
-                // whoever doesn't actually have an account.
-                const dmContent = `${username} is waiting for activation`;
-                const candidateUsernames = new Set(getActivationPingUsernames());
-                if (pingUser) candidateUsernames.add(pingUser.username);
-                if (candidateUsernames.size) {
-                    const usernameList = [...candidateUsernames];
-                    const placeholders = usernameList.map(() => '?').join(',');
-                    db.all(`SELECT username FROM User_Data WHERE username IN (${placeholders})`, usernameList, (errDM, rows) => {
-                        if (errDM || !rows) return;
-                        rows.forEach(r => sendSystemDM(r.username, dmContent));
-                    });
-                }
-            });
+                    // DM the same notice to user id 1 plus anyone listed in the
+                    // local activation-pings.txt file, once each, skipping
+                    // whoever doesn't actually have an account.
+                    const dmContent = `${username} is waiting for activation`;
+                    const candidateUsernames = new Set(getActivationPingUsernames());
+                    if (pingUser) candidateUsernames.add(pingUser.username);
+                    if (candidateUsernames.size) {
+                        const usernameList = [...candidateUsernames];
+                        const placeholders = usernameList.map(() => '?').join(',');
+                        db.all(`SELECT username FROM User_Data WHERE username IN (${placeholders})`, usernameList, (errDM, rows) => {
+                            if (errDM || !rows) return;
+                            rows.forEach(r => sendSystemDM(r.username, dmContent));
+                        });
+                    }
+                });
+            }
 
             db.get(`SELECT IsBanned, BanReason FROM User_Data WHERE id = ?`, [newUserId], (err2, newUser) => {
                 if (err2 || !newUser) return res.redirect('/');
@@ -3783,6 +3855,14 @@ function requireAdmin(req, res, next) {
     });
 }
 
+// Stricter gate for routes that only Owners/Head Admins should be able to
+// hit (e.g. toggling registration). Must run after requireAdmin, which is
+// what actually populates req.isHeadAdmin.
+function requireHeadAdmin(req, res, next) {
+    if (!req.isHeadAdmin) return res.status(403).json({ error: 'Head Admin or Owner only.' });
+    next();
+}
+
 app.get('/admin/dashboard', requireAdmin, (req, res) => {
     db.all(`SELECT username, Nickname, IsBanned, BanReason, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
         if (err) return res.status(500).send('DB error');
@@ -3815,6 +3895,34 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.banned_by || '')}</td>
                 <td><button class="button" style="font-size:0.75em;padding:2px 8px;" onclick="unIPBan('${escapeHTML(b.ip)}')">Unban</button></td>
             </tr>`).join('');
+
+        db.all(`SELECT action, actor, target, details, created_at FROM Audit_Log ORDER BY id DESC LIMIT 150`, [], (err3, auditEntries) => {
+            const ACTION_LABELS = {
+                account_created: 'Account Created',
+                account_banned: 'Account Banned',
+                account_unbanned: 'Account Unbanned',
+                account_deleted: 'Account Deleted',
+                registration_gate_enabled: 'Registration Gate ON',
+                registration_gate_disabled: 'Registration Gate OFF',
+                ip_banned: 'IP Banned',
+                ip_unbanned: 'IP Unbanned'
+            };
+            const IP_ACTIONS = new Set(['ip_banned', 'ip_unbanned']);
+            const auditRows = (auditEntries || []).map(a => {
+                let targetDisplay = '<span style="opacity:0.3;">-</span>';
+                if (a.target) {
+                    targetDisplay = IP_ACTIONS.has(a.action)
+                        ? `<span style="font-family:monospace;">${escapeHTML(a.target)}</span>`
+                        : '@' + escapeHTML(a.target);
+                }
+                return `<tr>
+                <td style="font-size:0.78em;opacity:0.5;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.created_at || '')}</td>
+                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(ACTION_LABELS[a.action] || a.action)}</td>
+                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.actor || '')}</td>
+                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${targetDisplay}</td>
+                <td style="font-size:0.8em;opacity:0.7;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.details || '')}</td>
+            </tr>`;
+            }).join('');
 
         res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -3880,6 +3988,18 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 <div id="content">
     <h1>Admin Dashboard</h1>
     <p style="opacity:0.5;margin-top:4px;">Logged in as <strong>${escapeHTML(req.session.userUsername)}</strong></p>
+
+    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+        <h2>Registration Gate</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, new signups are created banned pending activation and admins get pinged (Activations group chat + DM) to manually activate them. When <strong>OFF</strong>, registration is fully open - new accounts are created active immediately, with no pings.</p>
+        <p style="margin-top:10px;">Status: <span id="reg-gate-status">${registrationGateEnabled ? '<span style="color:rgb(80,255,160);font-weight:700;">ON</span>' : '<span style="color:rgb(255,80,80);font-weight:700;">OFF</span>'}</span></p>
+        ${req.isHeadAdmin ? `
+        <div class="action-row">
+            <button class="button" onclick="toggleRegistrationGate(true)" style="width:100px;">Turn ON</button>
+            <button class="button" onclick="toggleRegistrationGate(false)" style="width:100px;">Turn OFF</button>
+        </div>
+        <div id="reg-gate-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
+    </div>
 
     <div class="panel">
         <h2>Ban / Unban User</h2>
@@ -3993,12 +4113,42 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             </tbody>
         </table>
     </div>
+
+    <div class="panel">
+        <h2>Audit Log</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Most recent 150 events - account creations, bans/unbans, deletions, and registration gate changes.</p>
+        <table>
+            <thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Target</th><th>Details</th></tr></thead>
+            <tbody id="audit-table">
+                ${auditRows || '<tr><td colspan="5" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No audit events yet.</td></tr>'}
+            </tbody>
+        </table>
+    </div>
 </div>
 
 <script>
     document.querySelectorAll('.button').forEach(btn => {
         btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
     });
+
+    async function toggleRegistrationGate(enable) {
+        const result = document.getElementById('reg-gate-result');
+        result.className = ''; result.textContent = 'Updating...';
+        try {
+            const r = await fetch('/admin/registration-gate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enable })
+            });
+            const d = await r.json();
+            if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
+            document.getElementById('reg-gate-status').innerHTML = d.enabled
+                ? '<span style="color:rgb(80,255,160);font-weight:700;">ON</span>'
+                : '<span style="color:rgb(255,80,80);font-weight:700;">OFF</span>';
+            result.className = 'ok'; result.textContent = 'Saved.';
+            setTimeout(() => { result.textContent = ''; }, 1500);
+        } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
+    }
 
     function renderProfileAvatarPreview(avatarUrl, username) {
         const el = document.getElementById('profile-avatar-preview');
@@ -4299,6 +4449,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 </body>
 </html>`);
         });
+        });
     });
 });
 
@@ -4309,6 +4460,7 @@ app.post('/admin/ban/:username', requireAdmin, (req, res) => {
     db.run(`UPDATE User_Data SET IsBanned = 1, BanReason = ? WHERE username = ?`, [reason, target], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
+        logAudit('account_banned', req.session.userUsername, target, reason);
         // Push ban event to any open SSE streams for this user
         db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err2, row) => {
             if (!err2 && row) {
@@ -4324,7 +4476,24 @@ app.post('/admin/unban/:username', requireAdmin, (req, res) => {
     db.run(`UPDATE User_Data SET IsBanned = 0, BanReason = NULL WHERE username = ?`, [target], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
+        logAudit('account_unbanned', req.session.userUsername, target, null);
         res.json({ ok: true, banned: false, username: target });
+    });
+});
+
+// Registration gate: ON = new signups are created banned pending manual
+// activation and admins get pinged. OFF = registration is open, accounts
+// are created active immediately, no pings sent.
+app.get('/admin/registration-gate', requireAdmin, (req, res) => {
+    res.json({ enabled: registrationGateEnabled });
+});
+
+app.post('/admin/registration-gate', requireAdmin, requireHeadAdmin, (req, res) => {
+    const enabled = !!req.body.enabled;
+    setRegistrationGateEnabled(enabled, (err) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        logAudit(enabled ? 'registration_gate_enabled' : 'registration_gate_disabled', req.session.userUsername, null, null);
+        res.json({ ok: true, enabled: registrationGateEnabled });
     });
 });
 
@@ -4408,6 +4577,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
                         userBus.emit(`user:${row.id}`, { event: 'deleted', type: 'deleted', reason });
                     }
                 });
+                logAudit('account_deleted', req.session.userUsername, target, reason);
                 res.json({ ok: true, deleted: true, username: target });
             });
         }
@@ -4425,13 +4595,12 @@ app.post('/admin/ipban', requireAdmin, (req, res) => {
         [ip, cleanReason, bannedBy],
         function(err) {
             if (err) return res.status(500).json({ error: 'db error' });
-            // Notify any users currently connected from this IP via their SSE streams.
-            // We can't know which userIds are on this IP server-side without tracking it,
-            // so we broadcast to all listeners on userBus and let the stream endpoint
-            // handle delivery - only users actually connected receive it.
-            userBus.eventNames().forEach(channel => {
-                if (channel.startsWith('user:')) {
-                    userBus.emit(channel, { event: 'banned', type: 'ip', reason: cleanReason });
+            logAudit('ip_banned', bannedBy, ip, cleanReason);
+            // Notify only users currently connected from this exact IP - not
+            // everyone with an open stream.
+            userEventConnections.forEach(conn => {
+                if (conn.ip === ip) {
+                    sseSend(conn.res, 'banned', { event: 'banned', type: 'ip', reason: cleanReason });
                 }
             });
             res.json({ ok: true, ip, reason: cleanReason });
@@ -4445,6 +4614,7 @@ app.post('/admin/unipban', requireAdmin, (req, res) => {
     db.run(`DELETE FROM IP_Bans WHERE ip = ?`, [ip], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'ip not found in ban list' });
+        logAudit('ip_unbanned', req.session.userUsername, ip, null);
         res.json({ ok: true, ip });
     });
 });

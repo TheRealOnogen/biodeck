@@ -1,0 +1,6 @@
+data*
+sessions/
+node_modules/
+.session-secret
+public/uploads/
+public/v86/images

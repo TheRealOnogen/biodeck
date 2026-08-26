@@ -910,7 +910,33 @@ function checkBan(req, res, next) {
     if (!req.session.userId) return next();
 
     db.get(`SELECT IsBanned, BanReason, IsDeleted, DeleteReason, IsAdmin, IsOwner, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
-        if (err || !user) return next();
+        if (err) return next();
+        // No row at all means the account was permanently deleted (hard
+        // delete removes the row entirely, unlike the soft delete which
+        // keeps it with IsDeleted = 1). Treat it the same way as a soft
+        // delete for any session that's still logged in elsewhere.
+        if (!user) {
+            req.session.destroy(() => {
+                res.clearCookie('connect.sid');
+                return res.send(`<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Account Deleted</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+        <h1>Your account has been deleted</h1><br>
+        <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
+    </div>
+</body>
+</html>`);
+            });
+            return;
+        }
         req.isAdmin = !!(user.IsAdmin || user.IsOwner || user.IsHeadAdmin);
         req.isHeadAdmin = !!(user.IsHeadAdmin || user.IsOwner);
         if (user.IsDeleted == 1) {
@@ -1072,6 +1098,79 @@ function sendVerifyEmail(toEmail, username, verifyLink) {
         to: toEmail,
         subject, text, html
     }).catch(err => console.error('Failed to send verification email:', err.message));
+}
+
+// ----- Account moderation emails (ban / unban / delete / permanent delete) -----
+function sendAccountBannedEmail(toEmail, username, reason) {
+    const subject = 'Your Biodeck account has been banned';
+    const cleanReason = reason || 'No reason provided';
+    const text = `Hi ${username},\n\nYour Biodeck account has been banned.\n\nReason: ${cleanReason}\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has been banned.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[account banned] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send account banned email:', err.message));
+}
+
+function sendAccountUnbannedEmail(toEmail, username) {
+    const subject = 'Your Biodeck account has been unbanned';
+    const text = `Hi ${username},\n\nYour Biodeck account has been unbanned. You can log back in whenever you're ready.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has been unbanned. You can log back in whenever you're ready.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[account unbanned] SMTP not configured - would have emailed ${toEmail}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send account unbanned email:', err.message));
+}
+
+// Sent for the soft delete (admin resets the profile and marks IsDeleted, but
+// the row and username are kept).
+function sendAccountDeletedEmail(toEmail, username, reason) {
+    const subject = 'Your Biodeck account has been deleted';
+    const cleanReason = reason || 'No reason provided';
+    const text = `Hi ${username},\n\nYour Biodeck account has been deleted by an administrator. Your posts have been removed and your profile has been reset.\n\nReason: ${cleanReason}\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has been deleted by an administrator. Your posts have been removed and your profile has been reset.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[account deleted] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send account deleted email:', err.message));
+}
+
+// Sent for the hard delete - covers both the admin "Delete From Database"
+// action and a user deleting their own account, since the outcome (account
+// and all its data permanently gone) is the same either way.
+function sendAccountPermanentlyDeletedEmail(toEmail, username, reason) {
+    const subject = 'Your Biodeck account has been permanently deleted';
+    const cleanReason = reason || 'No reason provided';
+    const text = `Hi ${username},\n\nYour Biodeck account and all of its data (posts, messages, group chats, follows, friends, and notifications) have been permanently deleted. This cannot be undone.\n\nReason: ${cleanReason}\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account and all of its data (posts, messages, group chats, follows, friends, and notifications) have been permanently deleted. This cannot be undone.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[account permanently deleted] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send account permanently deleted email:', err.message));
 }
 
 // Invalidates any outstanding verification links for the user, creates a new
@@ -1804,6 +1903,21 @@ app.get('/edit', (req, res) => {
             <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/followers';">Followers</button>
             <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
         </div>
+        <hr style="border-color:rgba(255,80,80,0.3);margin:26px 0 14px;">
+        <div class="dash-field" style="text-align:center;">
+            <h3 style="color:rgb(255, 0, 0);margin-bottom:4px;">Danger Zone</h3>
+            <p style="opacity:0.6;font-size:0.82em;">Deleting your account is <strong>permanent</strong>. It removes your posts, DMs, group chat messages and memberships, follows, friends, friend requests, and notifications from the database. There is no way to undo this or recover your data afterward.</p>
+            <button class="button" type="button" onclick="openDeleteAccountBox()" style="padding:10px;width:auto;">Delete My Account</button>
+            <div id="delete-account-box" style="display:none;margin-top:14px;text-align:left;">
+                <label>Enter your password to confirm</label>
+                <input class="dash-textarea" style="min-height:unset;" type="password" id="delete-account-password" placeholder="Current password" autocomplete="current-password">
+                <div style="display:flex;gap:8px;margin-top:8px;justify-content:center;">
+                    <button class="button" type="button" onclick="confirmDeleteAccount()" style="padding:10px;width:auto;">Permanently Delete Everything</button>
+                    <button class="button" type="button" onclick="closeDeleteAccountBox()" style="padding:10px;width:auto;">Cancel</button>
+                </div>
+                <div id="delete-account-result" style="margin-top:8px;font-size:0.85em;text-align:center;"></div>
+            </div>
+        </div>
     </div>
     <script>
         document.querySelectorAll('.button').forEach(btn => {
@@ -1896,6 +2010,36 @@ app.get('/edit', (req, res) => {
             document.getElementById('email-change-result').textContent = '';
         }
 
+        function openDeleteAccountBox() {
+            document.getElementById('delete-account-box').style.display = 'block';
+        }
+
+        function closeDeleteAccountBox() {
+            document.getElementById('delete-account-box').style.display = 'none';
+            document.getElementById('delete-account-password').value = '';
+            document.getElementById('delete-account-result').textContent = '';
+        }
+
+        async function confirmDeleteAccount() {
+            const password = document.getElementById('delete-account-password').value;
+            const resultEl = document.getElementById('delete-account-result');
+            if (!password) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter your password to confirm.'; return; }
+            if (!confirm('This will PERMANENTLY delete your account and all of your data. This cannot be undone. Continue?')) return;
+
+            resultEl.style.color = ''; resultEl.textContent = 'Deleting...';
+            try {
+                const r = await fetch('/account/delete-self', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+                const d = await r.json();
+                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not delete account.'; return; }
+                resultEl.style.color = 'rgb(0,191,255)'; resultEl.textContent = 'Account deleted. Redirecting...';
+                setTimeout(() => window.location.href = '/', 1200);
+            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+        }
+
         if (new URLSearchParams(window.location.search).get('avatarerror')) {
             const t = document.createElement('div');
             t.textContent = 'Could not upload profile picture - please use an image file under 8MB.';
@@ -1909,6 +2053,38 @@ ${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
 
 </body>
 </html>`);
+    });
+});
+
+// Self-service, permanent account deletion. Requires the user's current
+// password as confirmation, then wipes the account and everything tied to
+// it via the same hardDeleteAccount() helper the admin hard-delete route
+// uses (defined further down, alongside the admin routes).
+app.post('/account/delete-self', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'not logged in' });
+    const password = (req.body && req.body.password) || '';
+    if (!password) return res.status(400).json({ error: 'password is required' });
+    const userId = req.session.userId;
+    const username = req.session.userUsername;
+    db.get(`SELECT password FROM User_Data WHERE id = ?`, [userId], async (err, user) => {
+        if (err || !user) return res.status(500).json({ error: 'db error' });
+        let match = false;
+        try {
+            match = await bcrypt.compare(password, user.password);
+        } catch (e) {
+            return res.status(500).json({ error: 'auth error' });
+        }
+        if (!match) return res.status(401).json({ error: 'incorrect password' });
+        hardDeleteAccount(username, 'You deleted your own account', (err2) => {
+            if (err2) {
+                console.error('Self-delete error:', err2.message);
+                return res.status(500).json({ error: 'db error' });
+            }
+            logAudit('account_self_deleted', username, username, 'user deleted their own account');
+            req.session.destroy(() => {
+                res.json({ ok: true, deleted: true });
+            });
+        });
     });
 });
 
@@ -4750,6 +4926,19 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             <button class="button" onclick="submitDeleteAccount()" style="width:160px;">Delete Account</button>
         </div>
         <div id="delete-result"></div>
+        ${req.isHeadAdmin ? `
+        <hr style="border-color:rgba(255,80,80,0.3);margin:18px 0;">
+        <h3 style="color:rgb(255, 0, 0);margin-bottom:4px;">Delete From Database</h3>
+        <p style="opacity:0.6;font-size:0.8em;margin-top:-2px;">Permanently erases the account and everything tied to it - posts, DMs, group chat messages/memberships, follows, friends, friend requests, and notifications. This cannot be undone and the username becomes available again. Head Admin / Owner only.</p>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="hard-delete-username" placeholder="e.g. testuser" autocomplete="off">
+        <label>Reason <span style="opacity:0.4;">(required)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="hard-delete-reason" placeholder="e.g. GDPR erasure request" maxlength="500">
+        <div class="action-row">
+            <button class="button" onclick="submitHardDeleteAccount()" style="width:200px;">Delete From Database</button>
+        </div>
+        <div id="hard-delete-result"></div>
+        ` : ''}
     </div>
 
     <div class="panel">
@@ -5077,6 +5266,39 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         }
     }
 
+    async function submitHardDeleteAccount() {
+        const username = document.getElementById('hard-delete-username').value.trim();
+        const reason = document.getElementById('hard-delete-reason').value.trim();
+        const resultEl = document.getElementById('hard-delete-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Username is required.'; return; }
+        if (!reason) { resultEl.className = 'err'; resultEl.textContent = 'A reason is required to delete an account.'; return; }
+        if (!confirm('This PERMANENTLY deletes @' + username + ' and everything tied to it (posts, DMs, group chat messages/memberships, follows, friends, friend requests, notifications) from the database. This CANNOT be undone. Continue?')) return;
+        if (!confirm('Are you absolutely sure? Press OK to permanently erase @' + username + '.')) return;
+
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/delete-account-permanent/' + encodeURIComponent(username), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = '@' + username + ' has been permanently deleted from the database.';
+                document.getElementById('hard-delete-username').value = '';
+                document.getElementById('hard-delete-reason').value = '';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
     async function submitIPAction() {
         const ip = document.getElementById('target-ip').value.trim();
         const reason = document.getElementById('ip-ban-reason').value.trim();
@@ -5181,10 +5403,11 @@ app.post('/admin/ban/:username', requireAdmin, (req, res) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
         logAudit('account_banned', req.session.userUsername, target, reason);
-        // Push ban event to any open SSE streams for this user
-        db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err2, row) => {
+        // Push ban event to any open SSE streams for this user, and email them
+        db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err2, row) => {
             if (!err2 && row) {
                 userBus.emit(`user:${row.id}`, { event: 'banned', type: 'account', reason });
+                if (row.email) sendAccountBannedEmail(row.email, target, reason);
             }
         });
         res.json({ ok: true, banned: true, username: target });
@@ -5197,6 +5420,9 @@ app.post('/admin/unban/:username', requireAdmin, (req, res) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
         logAudit('account_unbanned', req.session.userUsername, target, null);
+        db.get(`SELECT email FROM User_Data WHERE username = ?`, [target], (err2, row) => {
+            if (!err2 && row && row.email) sendAccountUnbannedEmail(row.email, target);
+        });
         res.json({ ok: true, banned: false, username: target });
     });
 });
@@ -5315,10 +5541,11 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
             if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
             db.run(`DELETE FROM Posts WHERE username = ?`, [target], (err2) => {
                 if (err2) return res.status(500).json({ error: 'db error deleting posts' });
-                // Push a deleted event to any open SSE streams for this user
-                db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err3, row) => {
+                // Push a deleted event to any open SSE streams for this user, and email them
+                db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err3, row) => {
                     if (!err3 && row) {
                         userBus.emit(`user:${row.id}`, { event: 'deleted', type: 'deleted', reason });
+                        if (row.email) sendAccountDeletedEmail(row.email, target, reason);
                     }
                 });
                 logAudit('account_deleted', req.session.userUsername, target, reason);
@@ -5326,6 +5553,66 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
             });
         }
     );
+});
+
+// Permanently removes a user and every row tied to their username/id across
+// the schema. Unlike the soft-delete above, there's no row left behind and
+// the username becomes available again. Used by both the admin hard-delete
+// route and self-service account deletion from the dashboard.
+function hardDeleteAccount(username, reason, callback) {
+    db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [username], (err, row) => {
+        if (err) return callback(err);
+        if (!row) return callback(new Error('user not found'));
+        const userId = row.id;
+        const email = row.email;
+        db.serialize(() => {
+            db.run(`DELETE FROM Messages WHERE from_user = ? OR to_user = ?`, [username, username]);
+            db.run(`DELETE FROM Password_Resets WHERE user_id = ?`, [userId]);
+            db.run(`DELETE FROM Email_Changes WHERE user_id = ?`, [userId]);
+            db.run(`DELETE FROM Email_Verifications WHERE user_id = ?`, [userId]);
+            db.run(`DELETE FROM Posts WHERE username = ?`, [username]);
+            db.run(`DELETE FROM Follows WHERE follower_username = ? OR following_username = ?`, [username, username]);
+            db.run(`DELETE FROM Friend_Requests WHERE from_user = ? OR to_user = ?`, [username, username]);
+            db.run(`DELETE FROM Friends WHERE user_a = ? OR user_b = ?`, [username, username]);
+            db.run(`DELETE FROM Notifications WHERE username = ? OR actor_username = ?`, [username, username]);
+            db.run(`DELETE FROM Group_Chat_Members WHERE username = ?`, [username]);
+            db.run(`DELETE FROM Group_Chat_Messages WHERE from_user = ?`, [username]);
+            db.run(`DELETE FROM User_Data WHERE username = ?`, [username], function (err2) {
+                if (err2) return callback(err2);
+                if (this.changes === 0) return callback(new Error('user not found'));
+                // Push a 'deleted' event to any open tabs for this user, same as
+                // the soft delete above, so an active session sees the "Account
+                // Deleted" screen immediately instead of waiting for its next
+                // navigation (which the checkBan middleware would also catch).
+                const cleanReason = reason || 'Account deleted';
+                userBus.emit(`user:${userId}`, { event: 'deleted', type: 'deleted', reason: cleanReason });
+                // Email captured before the row was deleted, since the address
+                // is gone from the DB by the time we get here.
+                if (email) sendAccountPermanentlyDeletedEmail(email, username, cleanReason);
+                callback(null);
+            });
+        });
+    });
+}
+
+// Permanently deletes an account and all associated data from the database.
+// This CANNOT be undone (unlike /admin/delete-account above, which keeps a
+// hollowed-out row so the username stays reserved). Restricted to Head
+// Admins/Owner given the blast radius.
+app.post('/admin/delete-account-permanent/:username', requireAdmin, requireHeadAdmin, (req, res) => {
+    const target = req.params.username;
+    if (target === req.session.userUsername) return res.status(400).json({ error: 'cannot delete your own account here - use the dashboard' });
+    const reason = ((req.body && req.body.reason) || '').trim().substring(0, 500);
+    if (!reason) return res.status(400).json({ error: 'a reason is required to delete an account' });
+    hardDeleteAccount(target, reason, (err) => {
+        if (err) {
+            if (err.message === 'user not found') return res.status(404).json({ error: 'user not found' });
+            console.error('Hard delete error:', err.message);
+            return res.status(500).json({ error: 'db error' });
+        }
+        logAudit('account_permanently_deleted', req.session.userUsername, target, reason);
+        res.json({ ok: true, deleted: true, permanent: true, username: target });
+    });
 });
 
 app.post('/admin/ipban', requireAdmin, (req, res) => {

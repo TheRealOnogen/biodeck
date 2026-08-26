@@ -681,10 +681,14 @@ const db = new sqlite3.Database('./data.db', (err) => {
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeleted INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN DeleteReason TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN email TEXT DEFAULT NULL`, () => {});
-            // SQLite treats every NULL as distinct for UNIQUE purposes, so this
-            // still allows any number of existing accounts with no email yet
-            // while preventing two accounts from sharing one email going forward.
-            db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_data_email ON User_Data(email)`);
+            db.run(`ALTER TABLE User_Data ADD COLUMN email_verified INTEGER DEFAULT 0`, () => {});
+            // Multiple accounts are now allowed to share the same email address,
+            // so this is a plain (non-unique) index, kept only for lookup speed.
+            // If an older database still has the unique index from before, drop
+            // it first so shared emails aren't rejected.
+            db.run(`DROP INDEX IF EXISTS idx_user_data_email`, () => {
+                db.run(`CREATE INDEX IF NOT EXISTS idx_user_data_email ON User_Data(email)`);
+            });
             // Password reset tokens. Only the sha256 hash of the token is stored,
             // so a database leak alone can't be used to reset anyone's password.
             db.run(`CREATE TABLE IF NOT EXISTS Password_Resets (
@@ -711,6 +715,21 @@ const db = new sqlite3.Database('./data.db', (err) => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_email_changes_user ON Email_Changes(user_id)`);
+            // Email verification links. token_hash is a sha256 of the raw token
+            // that goes out in the emailed link, same pattern as Password_Resets.
+            // `email` freezes which address the token is good for, so if the
+            // account's email changes after a link is sent, the old link can't
+            // silently verify the new address.
+            db.run(`CREATE TABLE IF NOT EXISTS Email_Verifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                email TEXT NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_email_verifications_user ON Email_Verifications(user_id)`);
             db.run(`CREATE TABLE IF NOT EXISTS Posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -1025,6 +1044,53 @@ function sendEmailChangeCodeEmail(toEmail, username, code, newEmail) {
     }).catch(err => console.error('Failed to send email change code:', err.message));
 }
 
+// ----- Email verification links -----
+const EMAIL_VERIFY_TOKEN_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const EMAIL_VERIFY_RESEND_COOLDOWN_MS = 60 * 1000; // 1 minute, tracked in-memory below
+
+// Returns { raw, hash }, same pattern as generateResetToken().
+function generateEmailVerifyToken() {
+    const raw = crypto.randomBytes(32).toString('hex');
+    const hash = crypto.createHash('sha256').update(raw).digest('hex');
+    return { raw, hash };
+}
+function hashEmailVerifyToken(raw) {
+    return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+function sendVerifyEmail(toEmail, username, verifyLink) {
+    const subject = 'Verify your Biodeck email address';
+    const text = `Hi ${username},\n\nPlease confirm this is your email address by clicking the link below. This link expires in 24 hours and can only be used once.\n\n${verifyLink}\n\nIf you didn't create a Biodeck account, you can safely ignore this email.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Please confirm this is your email address by clicking the link below. This link expires in 24 hours and can only be used once.</p><p><a href="${verifyLink}">${verifyLink}</a></p><p>If you didn't create a Biodeck account, you can safely ignore this email.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[email verify] SMTP not configured - link for ${toEmail}: ${verifyLink}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send verification email:', err.message));
+}
+
+// Invalidates any outstanding verification links for the user, creates a new
+// one for `email`, and sends it. Callers should have already set
+// email_verified = 0 on the account before calling this.
+function issueEmailVerification(userId, username, email, callback) {
+    db.run(`UPDATE Email_Verifications SET used = 1 WHERE user_id = ? AND used = 0`, [userId], () => {
+        const { raw, hash } = generateEmailVerifyToken();
+        const expiresAt = new Date(Date.now() + EMAIL_VERIFY_TOKEN_TTL_MS).toISOString();
+        db.run(`INSERT INTO Email_Verifications (user_id, token_hash, email, expires_at) VALUES (?, ?, ?, ?)`,
+            [userId, hash, email, expiresAt], (err) => {
+                if (err) { console.error('Email verification insert error:', err.message); if (callback) callback(err); return; }
+                const verifyLink = `${APP_BASE_URL}/account/verify-email?token=${raw}`;
+                sendVerifyEmail(email, username, verifyLink);
+                if (callback) callback(null);
+            });
+    });
+}
+
 // Renders the same box/button chrome used elsewhere (ban/deleted screens, etc.)
 function renderMessagePage(title, heading, bodyHTML) {
     return `<!DOCTYPE html>
@@ -1053,8 +1119,34 @@ function renderMessagePage(title, heading, bodyHTML) {
 </html>`;
 }
 
+// Blocks any fully-logged-in session whose email hasn't been verified yet,
+// bouncing it to the verify-email hold page. Mirrors checkBan's approach of
+// gating every request rather than just the login route, so an account can't
+// dodge verification by jumping straight to a bookmarked page.
+function checkEmailVerified(req, res, next) {
+    if (!req.session.userId) return next();
+    // Let the verification flow itself, and logging out, stay reachable.
+    if (req.path === '/account/verify-email' || req.path.startsWith('/account/verify-email-required') || req.path === '/logout') {
+        return next();
+    }
+    db.get(`SELECT email, email_verified FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+        if (err || !user) return next();
+        if (user.email && !user.email_verified) {
+            const userId = req.session.userId;
+            const username = req.session.userUsername;
+            req.session.pendingVerifyUserId = userId;
+            req.session.pendingVerifyUsername = username;
+            delete req.session.userId;
+            delete req.session.userUsername;
+            return res.redirect('/account/verify-email-required');
+        }
+        next();
+    });
+}
+
 app.use(checkIPBan);
 app.use(checkBan);
+app.use(checkEmailVerified);
 
 // SSE stream for per-user server-push events (ban notifications, etc.)
 // Only reachable by non-banned users because checkIPBan/checkBan run first.
@@ -1151,14 +1243,9 @@ app.post('/register', async (req, res) => {
             ? "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins"
             : null;
 
-        db.run(`INSERT INTO User_Data (username, password, email, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
+        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, 0, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
-                if (err.message && err.message.includes('.email')) {
-                    return res.status(400).send(renderMessagePage('Email Taken', 'That email is already linked to an account',
-                        `<h3>Try logging in instead, or use a different email.</h3><br><br>
-                        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
-                }
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
             }
             const newUserId = this.lastID;
@@ -1238,11 +1325,15 @@ app.post('/register', async (req, res) => {
 </body>
 </html>`);
                 }
-                req.session.userId = newUserId;
-                req.session.userUsername = username;
                 const registerIP = getClientIP(req);
                 db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [registerIP, newUserId], () => {});
-                return res.redirect('/feed');
+                // New accounts start with email_verified = 0, so hold them in
+                // the same "pending" session state used elsewhere until they
+                // confirm the address, instead of granting a full session.
+                req.session.pendingVerifyUserId = newUserId;
+                req.session.pendingVerifyUsername = username;
+                issueEmailVerification(newUserId, username, email, () => {});
+                return res.redirect('/account/verify-email-required');
             });
         });
     } catch (err) {
@@ -1333,6 +1424,14 @@ app.post('/login', (req, res) => {
                     req.session.pendingEmailUsername = user.username;
                     return res.redirect('/account/add-email');
                 }
+                if (!user.email_verified) {
+                    // Email present but not confirmed yet. Hold them in the same
+                    // kind of "pending" session state until they verify it (or
+                    // switch to a different address and verify that instead).
+                    req.session.pendingVerifyUserId = user.id;
+                    req.session.pendingVerifyUsername = user.username;
+                    return res.redirect('/account/verify-email-required');
+                }
                 req.session.userId = user.id;
                 req.session.userUsername = user.username;
                 const loginIP = getClientIP(req);
@@ -1372,13 +1471,8 @@ app.post('/account/add-email', (req, res) => {
             <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
     }
 
-    db.run(`UPDATE User_Data SET email = ? WHERE id = ?`, [email, userId], function(err) {
+    db.run(`UPDATE User_Data SET email = ?, email_verified = 0 WHERE id = ?`, [email, userId], function(err) {
         if (err) {
-            if (err.message && err.message.includes('.email')) {
-                return res.status(400).send(renderMessagePage('Email Taken', 'That email is already linked to another account',
-                    `<h3>Try a different email.</h3><br><br>
-                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
-            }
             console.error('Add email error:', err.message);
             return res.status(500).send(renderMessagePage('Error', 'Something went wrong',
                 `<h3>Please try again.</h3><br><br>
@@ -1387,44 +1481,164 @@ app.post('/account/add-email', (req, res) => {
         const username = req.session.pendingEmailUsername;
         delete req.session.pendingEmailUserId;
         delete req.session.pendingEmailUsername;
-        req.session.userId = userId;
-        req.session.userUsername = username;
         const loginIP = getClientIP(req);
         db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [loginIP, userId], () => {});
         logAudit('email_added', username, username, 'added email on login (pre-existing account)');
-        return res.redirect('/feed');
+        // The address hasn't been confirmed yet, so route into the same
+        // verification hold used everywhere else instead of logging in.
+        req.session.pendingVerifyUserId = userId;
+        req.session.pendingVerifyUsername = username;
+        issueEmailVerification(userId, username, email, () => {});
+        return res.redirect('/account/verify-email-required');
+    });
+});
+
+// ----- Verify email (forced, blocks the app until confirmed) -----
+// Small in-memory cooldown so the resend button can't be used to spam an
+// address. Keyed by user id; fine to lose on restart.
+const lastVerifyResendAt = new Map();
+
+app.get('/account/verify-email-required', (req, res) => {
+    if (!req.session.pendingVerifyUserId) return res.redirect('/');
+    const userId = req.session.pendingVerifyUserId;
+    const username = escapeHTML(req.session.pendingVerifyUsername || '');
+
+    db.get(`SELECT email FROM User_Data WHERE id = ?`, [userId], (err, user) => {
+        const email = (user && user.email) ? user.email : '';
+        res.send(renderMessagePage('Verify Email', 'Confirm your email',
+            `<h3>We sent a verification link to <strong>${escapeHTML(email)}</strong>. Click it to finish logging in as <strong>${username}</strong>.</h3><br>
+            <form method="POST" action="/account/verify-email-required/resend" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+                <button type="submit" class="button" style="width: 220px;">Resend verification email</button>
+            </form><br>
+            <p style="opacity:0.7;">Used the wrong address, or don't have access to it anymore?</p>
+            <form method="POST" action="/account/verify-email-required/change" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+                <input type="text" name="email" placeholder="New email address" required style="width: 260px;">
+                <button type="submit" class="button" style="width: 220px;">Use a different email</button>
+            </form><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/logout';">Log out</button>`));
+    });
+});
+
+app.post('/account/verify-email-required/resend', (req, res) => {
+    if (!req.session.pendingVerifyUserId) return res.redirect('/');
+    const userId = req.session.pendingVerifyUserId;
+    const username = req.session.pendingVerifyUsername;
+
+    const lastSent = lastVerifyResendAt.get(userId) || 0;
+    if (Date.now() - lastSent < EMAIL_VERIFY_RESEND_COOLDOWN_MS) {
+        return res.status(429).send(renderMessagePage('Slow Down', 'Please wait a moment',
+            `<h3>A verification email was just sent. Give it a minute before requesting another.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
+    }
+
+    db.get(`SELECT email FROM User_Data WHERE id = ?`, [userId], (err, user) => {
+        if (err || !user || !user.email) return res.redirect('/account/verify-email-required');
+        lastVerifyResendAt.set(userId, Date.now());
+        issueEmailVerification(userId, username, user.email, () => {});
+        logAudit('email_verification_resent', username, username, null);
+        return res.redirect('/account/verify-email-required');
+    });
+});
+
+app.post('/account/verify-email-required/change', (req, res) => {
+    if (!req.session.pendingVerifyUserId) return res.redirect('/');
+    const userId = req.session.pendingVerifyUserId;
+    const username = req.session.pendingVerifyUsername;
+    const email = (req.body.email || '').trim().toLowerCase();
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+        return res.status(400).send(renderMessagePage('Invalid Email', 'That doesn\'t look like a valid email',
+            `<h3>Please double check the email address and try again.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
+    }
+
+    // Accounts are allowed to share an email address, so there's no
+    // uniqueness check here - just swap it in and send a fresh link.
+    db.run(`UPDATE User_Data SET email = ?, email_verified = 0 WHERE id = ?`, [email, userId], (err) => {
+        if (err) {
+            console.error('Change pending email error:', err.message);
+            return res.status(500).send(renderMessagePage('Error', 'Something went wrong',
+                `<h3>Please try again.</h3><br><br>
+                <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
+        }
+        lastVerifyResendAt.set(userId, Date.now());
+        issueEmailVerification(userId, username, email, () => {});
+        logAudit('email_changed', username, username, `to ${email} (while unverified)`);
+        return res.redirect('/account/verify-email-required');
+    });
+});
+
+app.get('/account/verify-email', (req, res) => {
+    const token = req.query.token || '';
+    if (!token) return res.redirect('/');
+    const tokenHash = hashEmailVerifyToken(token);
+
+    db.get(`SELECT * FROM Email_Verifications WHERE token_hash = ?`, [tokenHash], (err, verifyRow) => {
+        if (err || !verifyRow || verifyRow.used || new Date(verifyRow.expires_at) < new Date()) {
+            return res.status(400).send(renderMessagePage('Link Expired', 'This verification link is no longer valid',
+                `<h3>It may have expired or already been used. Log in to request a new one.</h3><br><br>
+                <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to login</button>`));
+        }
+        db.get(`SELECT * FROM User_Data WHERE id = ?`, [verifyRow.user_id], (err2, user) => {
+            if (err2 || !user) return res.redirect('/');
+            // If the account's email changed after this link was sent, the
+            // link is stale even though it hasn't technically expired yet.
+            if (!user.email || user.email.toLowerCase() !== verifyRow.email.toLowerCase()) {
+                return res.status(400).send(renderMessagePage('Link Expired', 'This verification link is no longer valid',
+                    `<h3>The email on this account has changed since this link was sent. Log in to request a new one.</h3><br><br>
+                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to login</button>`));
+            }
+            db.run(`UPDATE User_Data SET email_verified = 1 WHERE id = ?`, [user.id], (err3) => {
+                if (err3) {
+                    console.error('Email verify update error:', err3.message);
+                    return res.status(500).send(renderMessagePage('Error', 'Something went wrong', `<h3>Please try again.</h3>`));
+                }
+                db.run(`UPDATE Email_Verifications SET used = 1 WHERE id = ?`, [verifyRow.id], () => {});
+                logAudit('email_verified', user.username, user.username, null);
+
+                // Clear any pending hold and log the user in fully, whether they
+                // arrived here from registration/login or just clicked the link
+                // while the account already had a full session.
+                if (req.session.pendingVerifyUserId === user.id) {
+                    delete req.session.pendingVerifyUserId;
+                    delete req.session.pendingVerifyUsername;
+                }
+                req.session.userId = user.id;
+                req.session.userUsername = user.username;
+                return res.send(renderMessagePage('Email Verified', 'You\'re all set',
+                    `<h3>Your email has been verified.</h3><br><br>
+                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/feed';">Continue</button>`));
+            });
+        });
     });
 });
 
 // ----- Forgot / reset password -----
 app.get('/forgot-password', (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
+    // Only username is accepted here, not email - since the same email can
+    // now be linked to more than one account, an email lookup could return
+    // several matches and there'd be no safe way to know which one to reset.
     res.send(renderMessagePage('Forgot Password', 'Reset your password',
-        `<h3>Enter your username or email and we'll send a reset link to the email linked to that account.</h3><br>
+        `<h3>Enter your username and we'll send a reset link to the email linked to that account.</h3><br>
         <form method="POST" action="/forgot-password" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
-            <input type="text" name="identifier" placeholder="Username or email" required style="width: 260px;">
+            <input type="text" name="username" placeholder="Username" required style="width: 260px;">
             <button type="submit" class="button" style="width: 180px;">Send reset link</button>
         </form><br>
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`));
 });
 
 app.post('/forgot-password', (req, res) => {
-    const identifier = (req.body.identifier || '').trim();
+    const username = (req.body.username || '').trim();
     // Always show the same response either way, so this endpoint can't be used
-    // to probe which usernames/emails have accounts.
+    // to probe which usernames have accounts.
     const done = () => res.send(renderMessagePage('Forgot Password', 'Check your email',
-        `<h3>If an account is linked to that username or email, we've sent a password reset link to its email address. The link expires in 1 hour.</h3><br><br>
+        `<h3>If that username has an account, we've sent a password reset link to its email address. The link expires in 1 hour.</h3><br><br>
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`));
 
-    if (!identifier) return done();
+    if (!username) return done();
 
-    const isEmail = EMAIL_REGEX.test(identifier);
-    const query = isEmail
-        ? `SELECT * FROM User_Data WHERE email = ? COLLATE NOCASE`
-        : `SELECT * FROM User_Data WHERE username = ? COLLATE NOCASE`;
-    const param = isEmail ? identifier.toLowerCase() : identifier;
-
-    db.get(query, [param], (err, user) => {
+    db.get(`SELECT * FROM User_Data WHERE username = ? COLLATE NOCASE`, [username], (err, user) => {
         if (err || !user || !user.email || user.IsDeleted) return done();
 
         const { raw, hash } = generateResetToken();
@@ -1434,7 +1648,7 @@ app.post('/forgot-password', (req, res) => {
                 if (err2) { console.error('Password reset insert error:', err2.message); return done(); }
                 const resetLink = `${APP_BASE_URL}/reset-password?token=${raw}`;
                 sendPasswordResetEmail(user.email, user.username, resetLink);
-                logAudit('password_reset_requested', user.username, user.username, `via ${isEmail ? 'email' : 'username'}`);
+                logAudit('password_reset_requested', user.username, user.username, 'via username');
                 return done();
             });
     });

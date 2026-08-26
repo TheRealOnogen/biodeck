@@ -1,3 +1,4 @@
+require('dotenv').config({ path: 'vars.env' });
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const session = require('express-session');
@@ -6,6 +7,9 @@ const path = require('path');
 const bcrypt = require('bcrypt');
 const multer = require('multer');
 const fs = require('fs');
+const crypto = require('crypto');
+let nodemailer;
+try { nodemailer = require('nodemailer'); } catch (e) { nodemailer = null; }
 const app = express();
 const PORT = 3000;
 
@@ -676,6 +680,22 @@ const db = new sqlite3.Database('./data.db', (err) => {
             db.run(`ALTER TABLE User_Data ADD COLUMN Nickname TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeleted INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN DeleteReason TEXT DEFAULT NULL`, () => {});
+            db.run(`ALTER TABLE User_Data ADD COLUMN email TEXT DEFAULT NULL`, () => {});
+            // SQLite treats every NULL as distinct for UNIQUE purposes, so this
+            // still allows any number of existing accounts with no email yet
+            // while preventing two accounts from sharing one email going forward.
+            db.run(`CREATE UNIQUE INDEX IF NOT EXISTS idx_user_data_email ON User_Data(email)`);
+            // Password reset tokens. Only the sha256 hash of the token is stored,
+            // so a database leak alone can't be used to reset anyone's password.
+            db.run(`CREATE TABLE IF NOT EXISTS Password_Resets (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_password_resets_user ON Password_Resets(user_id)`);
             db.run(`CREATE TABLE IF NOT EXISTS Posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -909,6 +929,85 @@ function checkBan(req, res, next) {
     });
 }
 
+// ----- Password reset email -----
+// Configure via environment variables:
+//   SMTP_HOST, SMTP_PORT (default 587), SMTP_SECURE ('true'/'false'), SMTP_USER, SMTP_PASS, SMTP_FROM
+//   APP_BASE_URL - the public URL of this app, e.g. https://biodeck.example.com
+// If SMTP isn't configured, reset links are logged to the console instead of
+// emailed, so this still works out of the box in dev.
+const APP_BASE_URL = (process.env.APP_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+let mailTransporter = null;
+if (nodemailer && process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+    mailTransporter = nodemailer.createTransport({
+        host: process.env.SMTP_HOST,
+        port: parseInt(process.env.SMTP_PORT || '587', 10),
+        secure: process.env.SMTP_SECURE === 'true',
+        auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    });
+} else if (!nodemailer) {
+    console.warn('nodemailer is not installed (run `npm install nodemailer`) - password reset emails will be logged to the console instead of sent.');
+} else {
+    console.warn('SMTP not configured (set SMTP_HOST, SMTP_USER, SMTP_PASS) - password reset emails will be logged to the console instead of sent.');
+}
+
+function sendPasswordResetEmail(toEmail, username, resetLink) {
+    const subject = 'Reset your Biodeck password';
+    const text = `Hi ${username},\n\nA password reset was requested for your Biodeck account. If this was you, click the link below to choose a new password. This link expires in 1 hour and can only be used once.\n\n${resetLink}\n\nIf you didn't request this, you can safely ignore this email - your password will not change.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>A password reset was requested for your Biodeck account. If this was you, click the link below to choose a new password. This link expires in 1 hour and can only be used once.</p><p><a href="${resetLink}">${resetLink}</a></p><p>If you didn't request this, you can safely ignore this email - your password will not change.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[password reset] SMTP not configured - link for ${toEmail}: ${resetLink}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send password reset email:', err.message));
+}
+
+// Returns { raw, hash }. Only `hash` (sha256 of raw) is stored in the DB;
+// `raw` is the value that goes in the emailed link and is never persisted.
+function generateResetToken() {
+    const raw = crypto.randomBytes(32).toString('hex');
+    const hash = crypto.createHash('sha256').update(raw).digest('hex');
+    return { raw, hash };
+}
+function hashResetToken(raw) {
+    return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+// Renders the same box/button chrome used elsewhere (ban/deleted screens, etc.)
+function renderMessagePage(title, heading, bodyHTML) {
+    return `<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${escapeHTML(title)}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; padding: 30px;">
+        <h1>${escapeHTML(heading)}</h1><br>
+        ${bodyHTML}
+    </div>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => {
+                btn.classList.add('clicked');
+                setTimeout(() => btn.classList.remove('clicked'), 150);
+            });
+        });
+    </script>
+</body>
+</html>`;
+}
+
 app.use(checkIPBan);
 app.use(checkBan);
 
@@ -978,6 +1077,7 @@ app.get('/', (req, res) => {
 
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
+    const email = (req.body.email || '').trim().toLowerCase();
 
     if (!username || !password) {
         return res.sendFile(path.join(__dirname, 'register_error_missing_fields.html'));
@@ -988,6 +1088,16 @@ app.post('/register', async (req, res) => {
     if (!/^[a-zA-Z0-9_.-]+$/.test(username)) {
         return res.sendFile(path.join(__dirname, 'register_error_invalid_chars.html'));
     }
+    if (!email) {
+        return res.status(400).send(renderMessagePage('Missing Email', 'An email address is required',
+            `<h3>Every account needs an email so you can reset your password later.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+    }
+    if (!EMAIL_REGEX.test(email)) {
+        return res.status(400).send(renderMessagePage('Invalid Email', 'That doesn\'t look like a valid email',
+            `<h3>Please double check the email address and try again.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+    }
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
         const gateEnabled = registrationGateEnabled;
@@ -996,9 +1106,14 @@ app.post('/register', async (req, res) => {
             ? "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins"
             : null;
 
-        db.run(`INSERT INTO User_Data (username, password, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?)`, [username, hashedPassword, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
+        db.run(`INSERT INTO User_Data (username, password, email, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
+                if (err.message && err.message.includes('.email')) {
+                    return res.status(400).send(renderMessagePage('Email Taken', 'That email is already linked to an account',
+                        `<h3>Try logging in instead, or use a different email.</h3><br><br>
+                        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+                }
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
             }
             const newUserId = this.lastID;
@@ -1165,6 +1280,14 @@ app.post('/login', (req, res) => {
 </body>
 </html>`);
                 }
+                if (!user.email) {
+                    // Older accounts predate the email requirement. Hold them in a
+                    // "pending" session state (no userId yet) until they add one,
+                    // so nothing else in the app is reachable in the meantime.
+                    req.session.pendingEmailUserId = user.id;
+                    req.session.pendingEmailUsername = user.username;
+                    return res.redirect('/account/add-email');
+                }
                 req.session.userId = user.id;
                 req.session.userUsername = user.username;
                 const loginIP = getClientIP(req);
@@ -1176,6 +1299,167 @@ app.post('/login', (req, res) => {
         } catch (error) {
             console.error(error);
             return res.status(500).sendFile(path.join(__dirname, 'login_error_auth_exception.html'));
+        }
+    });
+});
+
+// ----- Add email (forced, one-time, for pre-existing accounts) -----
+app.get('/account/add-email', (req, res) => {
+    if (req.session.userId) return res.redirect('/feed');
+    if (!req.session.pendingEmailUserId) return res.redirect('/');
+    const username = escapeHTML(req.session.pendingEmailUsername || '');
+    res.send(renderMessagePage('Add Email', 'One more thing',
+        `<h3>We now require an email on every account so you can reset your password if you forget it. Add one to finish logging in as <strong>${username}</strong>.</h3><br>
+        <form method="POST" action="/account/add-email" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+            <input type="text" name="email" placeholder="Email address" required style="width: 260px;">
+            <button type="submit" class="button" style="width: 150px;">Continue</button>
+        </form>`));
+});
+
+app.post('/account/add-email', (req, res) => {
+    if (!req.session.pendingEmailUserId) return res.redirect('/');
+    const userId = req.session.pendingEmailUserId;
+    const email = (req.body.email || '').trim().toLowerCase();
+
+    if (!email || !EMAIL_REGEX.test(email)) {
+        return res.status(400).send(renderMessagePage('Invalid Email', 'That doesn\'t look like a valid email',
+            `<h3>Please double check the email address and try again.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
+    }
+
+    db.run(`UPDATE User_Data SET email = ? WHERE id = ?`, [email, userId], function(err) {
+        if (err) {
+            if (err.message && err.message.includes('.email')) {
+                return res.status(400).send(renderMessagePage('Email Taken', 'That email is already linked to another account',
+                    `<h3>Try a different email.</h3><br><br>
+                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
+            }
+            console.error('Add email error:', err.message);
+            return res.status(500).send(renderMessagePage('Error', 'Something went wrong',
+                `<h3>Please try again.</h3><br><br>
+                <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
+        }
+        const username = req.session.pendingEmailUsername;
+        delete req.session.pendingEmailUserId;
+        delete req.session.pendingEmailUsername;
+        req.session.userId = userId;
+        req.session.userUsername = username;
+        const loginIP = getClientIP(req);
+        db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [loginIP, userId], () => {});
+        logAudit('email_added', username, username, 'added email on login (pre-existing account)');
+        return res.redirect('/feed');
+    });
+});
+
+// ----- Forgot / reset password -----
+app.get('/forgot-password', (req, res) => {
+    if (req.session.userId) return res.redirect('/feed');
+    res.send(renderMessagePage('Forgot Password', 'Reset your password',
+        `<h3>Enter your username or email and we'll send a reset link to the email linked to that account.</h3><br>
+        <form method="POST" action="/forgot-password" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+            <input type="text" name="identifier" placeholder="Username or email" required style="width: 260px;">
+            <button type="submit" class="button" style="width: 180px;">Send reset link</button>
+        </form><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`));
+});
+
+app.post('/forgot-password', (req, res) => {
+    const identifier = (req.body.identifier || '').trim();
+    // Always show the same response either way, so this endpoint can't be used
+    // to probe which usernames/emails have accounts.
+    const done = () => res.send(renderMessagePage('Forgot Password', 'Check your email',
+        `<h3>If an account is linked to that username or email, we've sent a password reset link to its email address. The link expires in 1 hour.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`));
+
+    if (!identifier) return done();
+
+    const isEmail = EMAIL_REGEX.test(identifier);
+    const query = isEmail
+        ? `SELECT * FROM User_Data WHERE email = ? COLLATE NOCASE`
+        : `SELECT * FROM User_Data WHERE username = ? COLLATE NOCASE`;
+    const param = isEmail ? identifier.toLowerCase() : identifier;
+
+    db.get(query, [param], (err, user) => {
+        if (err || !user || !user.email || user.IsDeleted) return done();
+
+        const { raw, hash } = generateResetToken();
+        const expiresAt = new Date(Date.now() + RESET_TOKEN_TTL_MS).toISOString();
+        db.run(`INSERT INTO Password_Resets (user_id, token_hash, expires_at) VALUES (?, ?, ?)`,
+            [user.id, hash, expiresAt], (err2) => {
+                if (err2) { console.error('Password reset insert error:', err2.message); return done(); }
+                const resetLink = `${APP_BASE_URL}/reset-password?token=${raw}`;
+                sendPasswordResetEmail(user.email, user.username, resetLink);
+                logAudit('password_reset_requested', user.username, user.username, `via ${isEmail ? 'email' : 'username'}`);
+                return done();
+            });
+    });
+});
+
+app.get('/reset-password', (req, res) => {
+    const token = req.query.token || '';
+    if (!token) return res.redirect('/forgot-password');
+    const tokenHash = hashResetToken(token);
+
+    db.get(`SELECT * FROM Password_Resets WHERE token_hash = ?`, [tokenHash], (err, resetRow) => {
+        if (err || !resetRow || resetRow.used || new Date(resetRow.expires_at) < new Date()) {
+            return res.status(400).send(renderMessagePage('Link Expired', 'This reset link is no longer valid',
+                `<h3>It may have expired or already been used. Request a new one below.</h3><br><br>
+                <button type="button" class="button" style="width: 180px" onclick="window.location.href='/forgot-password';">Request new link</button>`));
+        }
+        res.send(renderMessagePage('Reset Password', 'Choose a new password',
+            `<form method="POST" action="/reset-password" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+                <input type="hidden" name="token" value="${escapeHTML(token)}">
+                <input type="password" name="password" placeholder="New password" required style="width: 260px;">
+                <input type="password" name="confirm_password" placeholder="Confirm new password" required style="width: 260px;">
+                <button type="submit" class="button" style="width: 150px;">Reset password</button>
+            </form>`));
+    });
+});
+
+app.post('/reset-password', async (req, res) => {
+    const token = req.body.token || '';
+    const { password, confirm_password } = req.body;
+    if (!token) return res.redirect('/forgot-password');
+    const tokenHash = hashResetToken(token);
+
+    const showForm = (message) => res.status(400).send(renderMessagePage('Reset Password', 'Choose a new password',
+        `<h3 style="color: rgb(255,120,120);">${escapeHTML(message)}</h3><br>
+        <form method="POST" action="/reset-password" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
+            <input type="hidden" name="token" value="${escapeHTML(token)}">
+            <input type="password" name="password" placeholder="New password" required style="width: 260px;">
+            <input type="password" name="confirm_password" placeholder="Confirm new password" required style="width: 260px;">
+            <button type="submit" class="button" style="width: 150px;">Reset password</button>
+        </form>`));
+
+    if (!password || password.length < 6) return showForm('Password must be at least 6 characters.');
+    if (password !== confirm_password) return showForm('Passwords do not match.');
+
+    db.get(`SELECT * FROM Password_Resets WHERE token_hash = ?`, [tokenHash], async (err, resetRow) => {
+        if (err || !resetRow || resetRow.used || new Date(resetRow.expires_at) < new Date()) {
+            return res.status(400).send(renderMessagePage('Link Expired', 'This reset link is no longer valid',
+                `<h3>It may have expired or already been used. Request a new one below.</h3><br><br>
+                <button type="button" class="button" style="width: 180px" onclick="window.location.href='/forgot-password';">Request new link</button>`));
+        }
+        try {
+            const hashedPassword = await bcrypt.hash(password, 10);
+            db.run(`UPDATE User_Data SET password = ? WHERE id = ?`, [hashedPassword, resetRow.user_id], (err2) => {
+                if (err2) {
+                    console.error('Password reset update error:', err2.message);
+                    return showForm('Something went wrong. Please try again.');
+                }
+                // Mark this token used and invalidate any other outstanding tokens
+                // for this account, so an old email link can't be replayed later.
+                db.run(`UPDATE Password_Resets SET used = 1 WHERE user_id = ?`, [resetRow.user_id], () => {});
+                db.get(`SELECT username FROM User_Data WHERE id = ?`, [resetRow.user_id], (err3, u) => {
+                    logAudit('password_reset_completed', u ? u.username : 'unknown', u ? u.username : null, null);
+                });
+                return res.send(renderMessagePage('Password Reset', 'Your password has been reset',
+                    `<h3>You can now log in with your new password.</h3><br><br>
+                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to login</button>`));
+            });
+        } catch (e) {
+            console.error('Password reset hash error:', e);
+            return showForm('Something went wrong. Please try again.');
         }
     });
 });

@@ -696,6 +696,21 @@ const db = new sqlite3.Database('./data.db', (err) => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_password_resets_user ON Password_Resets(user_id)`);
+            // Self-service email change requests. A code is emailed to the
+            // ACCOUNT'S CURRENT email (proving the requester still controls
+            // it) and must be entered along with the new address to
+            // complete the change. Only the sha256 hash of the code is
+            // stored, same pattern as Password_Resets.
+            db.run(`CREATE TABLE IF NOT EXISTS Email_Changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                code_hash TEXT NOT NULL,
+                new_email TEXT NOT NULL,
+                expires_at DATETIME NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_email_changes_user ON Email_Changes(user_id)`);
             db.run(`CREATE TABLE IF NOT EXISTS Posts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -978,6 +993,36 @@ function generateResetToken() {
 }
 function hashResetToken(raw) {
     return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+// ----- Email change verification codes -----
+const EMAIL_CHANGE_CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+// Returns { code, hash }. 6-digit numeric code, easy to type/read; only the
+// sha256 hash is persisted, same pattern as password reset tokens.
+function generateEmailChangeCode() {
+    const code = crypto.randomInt(0, 1000000).toString().padStart(6, '0');
+    const hash = crypto.createHash('sha256').update(code).digest('hex');
+    return { code, hash };
+}
+function hashEmailChangeCode(code) {
+    return crypto.createHash('sha256').update(code).digest('hex');
+}
+
+function sendEmailChangeCodeEmail(toEmail, username, code, newEmail) {
+    const subject = 'Confirm your Biodeck email change';
+    const text = `Hi ${username},\n\nA request was made to change the email on your Biodeck account from this address to ${newEmail}. Enter this code on the dashboard to confirm the change. This code expires in 15 minutes and can only be used once.\n\nCode: ${code}\n\nIf you didn't request this, you can safely ignore this email - your email will not change.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>A request was made to change the email on your Biodeck account from this address to ${escapeHTML(newEmail)}. Enter this code on the dashboard to confirm the change. This code expires in 15 minutes and can only be used once.</p><p style="font-size:1.4em;font-weight:700;letter-spacing:2px;">${escapeHTML(code)}</p><p>If you didn't request this, you can safely ignore this email - your email will not change.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[email change] SMTP not configured - code for ${toEmail} (-> ${newEmail}): ${code}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send email change code:', err.message));
 }
 
 // Renders the same box/button chrome used elsewhere (ban/deleted screens, etc.)
@@ -1467,10 +1512,11 @@ app.post('/reset-password', async (req, res) => {
 app.get('/edit', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
 
-    db.get(`SELECT bio, avatar_path, Nickname FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+    db.get(`SELECT bio, avatar_path, Nickname, email FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         const bio = (user && user.bio) ? user.bio : '';
         const avatarPath = (user && user.avatar_path) ? user.avatar_path : null;
         const nickname = (user && user.Nickname) ? user.Nickname : '';
+        const email = (user && user.email) ? user.email : '';
         res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -1518,6 +1564,25 @@ app.get('/edit', (req, res) => {
             </div>
             <button class="button" type="submit" style="padding:10px;width:120px;margin-top:8px;">Save Bio</button>
         </form>
+        <div class="dash-field">
+            <label>Email</label>
+            <p style="margin:0 0 10px;opacity:0.8;">${email ? 'Current: ' + escapeHTML(email) : '<span style="opacity:0.5;">No email on file.</span>'}</p>
+            ${email ? `
+            <div id="email-change-step1">
+                <input class="dash-textarea" style="min-height:unset;" type="text" id="new-email-input" placeholder="New email address" autocomplete="off">
+                <button class="button" type="button" onclick="requestEmailCode()" style="padding:10px;width:auto;margin-top:8px;">Send code to current email</button>
+            </div>
+            <div id="email-change-step2" style="display:none;margin-top:14px;">
+                <p style="opacity:0.7;margin:0 0 8px;">We sent a code to <span id="email-code-sent-to"></span>. Enter it below to confirm the change to <span id="email-code-new-addr"></span>.</p>
+                <input class="dash-textarea" style="min-height:unset;" type="text" id="email-code-input" placeholder="6-digit code" maxlength="6" autocomplete="off">
+                <div style="display:flex;gap:8px;margin-top:8px;">
+                    <button class="button" type="button" onclick="confirmEmailChange()" style="padding:10px;width:auto;">Confirm change</button>
+                    <button class="button" type="button" onclick="cancelEmailChange()" style="padding:10px;width:auto;">Cancel</button>
+                </div>
+            </div>
+            <div id="email-change-result" style="margin-top:8px;font-size:0.85em;"></div>
+            ` : `<button class="button" type="button" onclick="window.location.href='/account/add-email';" style="padding:10px;width:auto;">Add Email</button>`}
+        </div>
         <div class="dash-links">
             <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/feed';">Feed</button>
             <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/messages';">Messages</button>
@@ -1565,6 +1630,58 @@ app.get('/edit', (req, res) => {
             window.history.replaceState(null, '', '/edit');
         }
 
+        let pendingNewEmail = '';
+
+        async function requestEmailCode() {
+            const newEmailInput = document.getElementById('new-email-input');
+            const resultEl = document.getElementById('email-change-result');
+            const newEmail = newEmailInput.value.trim();
+            if (!newEmail) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter a new email address.'; return; }
+            resultEl.style.color = ''; resultEl.textContent = 'Sending code...';
+            try {
+                const r = await fetch('/account/email/request-code', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ new_email: newEmail })
+                });
+                const d = await r.json();
+                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not send code.'; return; }
+                pendingNewEmail = newEmail;
+                document.getElementById('email-code-sent-to').textContent = d.sent_to;
+                document.getElementById('email-code-new-addr').textContent = newEmail;
+                document.getElementById('email-change-step1').style.display = 'none';
+                document.getElementById('email-change-step2').style.display = 'block';
+                resultEl.style.color = ''; resultEl.textContent = '';
+            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+        }
+
+        async function confirmEmailChange() {
+            const codeInput = document.getElementById('email-code-input');
+            const resultEl = document.getElementById('email-change-result');
+            const code = codeInput.value.trim();
+            if (!code) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter the code from your email.'; return; }
+            resultEl.style.color = ''; resultEl.textContent = 'Confirming...';
+            try {
+                const r = await fetch('/account/email/confirm', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ code })
+                });
+                const d = await r.json();
+                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not confirm code.'; return; }
+                resultEl.style.color = 'rgb(0,191,255)'; resultEl.textContent = 'Email updated!';
+                setTimeout(() => window.location.reload(), 900);
+            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+        }
+
+        function cancelEmailChange() {
+            pendingNewEmail = '';
+            document.getElementById('email-code-input').value = '';
+            document.getElementById('email-change-step2').style.display = 'none';
+            document.getElementById('email-change-step1').style.display = 'block';
+            document.getElementById('email-change-result').textContent = '';
+        }
+
         if (new URLSearchParams(window.location.search).get('avatarerror')) {
             const t = document.createElement('div');
             t.textContent = 'Could not upload profile picture - please use an image file under 8MB.';
@@ -1601,6 +1718,85 @@ app.post('/edit/avatar', (req, res) => {
     avatarUpload.single('avatar')(req, res, (err) => {
         if (err || !req.file) return res.redirect('/edit?avatarerror=1');
         db.run(`UPDATE User_Data SET avatar_path = ? WHERE id = ?`, [req.file.path, req.session.userId], () => res.redirect('/edit'));
+    });
+});
+
+// ----- Self-service email change (from the dashboard) -----
+// Step 1: user submits the new address they want. We email a 6-digit code
+// to the CURRENT address on file (not the new one) - this proves whoever
+// is requesting the change still controls the existing account, the same
+// way password resets prove control via the existing email.
+app.post('/account/email/request-code', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const userId = req.session.userId;
+    const newEmail = (req.body.new_email || '').trim().toLowerCase();
+
+    if (!newEmail || !EMAIL_REGEX.test(newEmail)) {
+        return res.status(400).json({ error: 'That doesn\'t look like a valid email.' });
+    }
+
+    db.get(`SELECT username, email FROM User_Data WHERE id = ?`, [userId], (err, user) => {
+        if (err) return res.status(500).json({ error: 'Something went wrong.' });
+        if (!user) return res.status(404).json({ error: 'Account not found.' });
+        if (!user.email) {
+            return res.status(400).json({ error: 'Your account has no email on file yet - add one first.' });
+        }
+        if (newEmail === user.email.toLowerCase()) {
+            return res.status(400).json({ error: 'That\'s already your current email.' });
+        }
+        db.get(`SELECT id FROM User_Data WHERE email = ? COLLATE NOCASE AND id != ?`, [newEmail, userId], (err2, taken) => {
+            if (err2) return res.status(500).json({ error: 'Something went wrong.' });
+            if (taken) return res.status(400).json({ error: 'That email is already linked to another account.' });
+
+            const { code, hash } = generateEmailChangeCode();
+            const expiresAt = new Date(Date.now() + EMAIL_CHANGE_CODE_TTL_MS).toISOString();
+            db.run(`INSERT INTO Email_Changes (user_id, code_hash, new_email, expires_at) VALUES (?, ?, ?, ?)`,
+                [userId, hash, newEmail, expiresAt], (err3) => {
+                    if (err3) { console.error('Email change insert error:', err3.message); return res.status(500).json({ error: 'Something went wrong.' }); }
+                    sendEmailChangeCodeEmail(user.email, user.username, code, newEmail);
+                    logAudit('email_change_requested', user.username, user.username, `to ${newEmail}`);
+                    res.json({ ok: true, sent_to: user.email });
+                });
+        });
+    });
+});
+
+// Step 2: user enters the code that was emailed to their current address.
+// On success the account's email is updated to the address captured in
+// step 1 (re-checked for uniqueness in case it was taken in the meantime).
+app.post('/account/email/confirm', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const userId = req.session.userId;
+    const code = (req.body.code || '').trim();
+    if (!code) return res.status(400).json({ error: 'Enter the code from your email.' });
+    const codeHash = hashEmailChangeCode(code);
+
+    db.get(`SELECT * FROM Email_Changes WHERE user_id = ? AND code_hash = ? ORDER BY id DESC LIMIT 1`, [userId, codeHash], (err, changeRow) => {
+        if (err) return res.status(500).json({ error: 'Something went wrong.' });
+        if (!changeRow || changeRow.used || new Date(changeRow.expires_at) < new Date()) {
+            return res.status(400).json({ error: 'That code is invalid or has expired - request a new one.' });
+        }
+        db.get(`SELECT id FROM User_Data WHERE email = ? COLLATE NOCASE AND id != ?`, [changeRow.new_email, userId], (err2, taken) => {
+            if (err2) return res.status(500).json({ error: 'Something went wrong.' });
+            if (taken) return res.status(400).json({ error: 'That email is already linked to another account - request the change again with a different address.' });
+
+            db.run(`UPDATE User_Data SET email = ? WHERE id = ?`, [changeRow.new_email, userId], (err3) => {
+                if (err3) {
+                    if (err3.message && err3.message.includes('.email')) {
+                        return res.status(400).json({ error: 'That email is already linked to another account.' });
+                    }
+                    console.error('Email change update error:', err3.message);
+                    return res.status(500).json({ error: 'Something went wrong.' });
+                }
+                // Mark this code used and invalidate any other outstanding
+                // requests for this account, same pattern as password resets.
+                db.run(`UPDATE Email_Changes SET used = 1 WHERE user_id = ?`, [userId], () => {});
+                db.get(`SELECT username FROM User_Data WHERE id = ?`, [userId], (err4, u) => {
+                    logAudit('email_changed', u ? u.username : 'unknown', u ? u.username : null, `to ${changeRow.new_email}`);
+                });
+                res.json({ ok: true, email: changeRow.new_email });
+            });
+        });
     });
 });
 
@@ -4358,6 +4554,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div class="action-row">
             <button class="button" onclick="saveProfileText()" style="width:140px;">Save Text</button>
         </div>
+        <label style="margin-top:14px;">Email</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-email" placeholder="(none)" autocomplete="off">
+        <div class="action-row">
+            <button class="button" onclick="saveProfileEmail()" style="width:140px;">Save Email</button>
+        </div>
         <label style="margin-top:14px;">Replace Avatar</label>
         <input type="file" id="profile-avatar-file" accept="image/*">
         <div class="action-row">
@@ -4455,6 +4656,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
             document.getElementById('profile-nickname').value = data.Nickname || '';
             document.getElementById('profile-bio').value = data.bio || '';
+            document.getElementById('profile-email').value = data.email || '';
             renderProfileAvatarPreview(data.avatar_url, data.username);
             resultEl.className = 'ok'; resultEl.textContent = 'Loaded profile for @' + username + '.';
         } catch (e) {
@@ -4478,6 +4680,26 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const data = await res.json();
             if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
             resultEl.className = 'ok'; resultEl.textContent = 'Profile text updated for @' + username + '.';
+        } catch (e) {
+            resultEl.className = 'err'; resultEl.textContent = 'Network error.';
+        }
+    }
+
+    async function saveProfileEmail() {
+        const username = document.getElementById('profile-username').value.trim();
+        const resultEl = document.getElementById('profile-result');
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Enter a username.'; return; }
+        const email = document.getElementById('profile-email').value.trim();
+        resultEl.className = ''; resultEl.textContent = 'Saving...';
+        try {
+            const res = await fetch('/admin/profile/' + encodeURIComponent(username) + '/email', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email })
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'ok'; resultEl.textContent = 'Email updated for @' + username + '.';
         } catch (e) {
             resultEl.className = 'err'; resultEl.textContent = 'Network error.';
         }
@@ -4786,13 +5008,14 @@ app.post('/admin/registration-gate', requireAdmin, requireHeadAdmin, (req, res) 
 // a full account deletion.
 app.get('/admin/profile/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
-    db.get(`SELECT username, Nickname, bio, avatar_path FROM User_Data WHERE username = ?`, [target], (err, user) => {
+    db.get(`SELECT username, Nickname, bio, avatar_path, email FROM User_Data WHERE username = ?`, [target], (err, user) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!user) return res.status(404).json({ error: 'user not found' });
         res.json({
             username: user.username,
             Nickname: user.Nickname || '',
             bio: user.bio || '',
+            email: user.email || '',
             avatar_url: user.avatar_path ? avatarPathToURL(user.avatar_path) : null
         });
     });
@@ -4809,6 +5032,29 @@ app.post('/admin/profile/:username/text', requireAdmin, (req, res) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
         res.json({ ok: true, username: target });
+    });
+});
+
+app.post('/admin/profile/:username/email', requireAdmin, (req, res) => {
+    const target = req.params.username;
+    const email = (req.body.email || '').trim().toLowerCase();
+    if (email && !EMAIL_REGEX.test(email)) {
+        return res.status(400).json({ error: 'That doesn\'t look like a valid email.' });
+    }
+    db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err, user) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!user) return res.status(404).json({ error: 'user not found' });
+        db.run(`UPDATE User_Data SET email = ? WHERE username = ?`, [email || null, target], function(err2) {
+            if (err2) {
+                if (err2.message && err2.message.includes('.email')) {
+                    return res.status(400).json({ error: 'That email is already linked to another account.' });
+                }
+                return res.status(500).json({ error: 'db error' });
+            }
+            if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
+            logAudit('admin_email_changed', req.session.userUsername, target, email ? `set to ${email}` : 'cleared');
+            res.json({ ok: true, username: target, email });
+        });
     });
 });
 

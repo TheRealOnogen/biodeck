@@ -1,6 +1,6 @@
 require('dotenv').config({ path: 'vars.env' });
 const express = require('express');
-const sqlite3 = require('sqlite3').verbose();
+const Database = require('better-sqlite3');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
 const path = require('path');
@@ -641,13 +641,112 @@ function buildFeedHTML(posts, sessionUsername, fileMaxHeight, isAdmin) {
 
 
 
-const db = new sqlite3.Database('./data.db', (err) => {
-    if (err) console.error('Database connection error :', err.message);
-    else {
-        console.log('Connected to database');
-        db.run(`PRAGMA journal_mode=WAL`, (err) => {
-            if (err) console.error('WAL error:', err.message);
-        db.serialize(() => {
+// ----- better-sqlite3 setup -----
+// better-sqlite3 is synchronous (no callbacks, no query queue), which is
+// faster and simpler than node-sqlite3, but this file was written throughout
+// against node-sqlite3's callback API (db.run/get/all/serialize with
+// (err, row) callbacks and `this.lastID`/`this.changes`). Rather than rewrite
+// every one of the ~200 call sites (and risk subtly breaking any of them),
+// `db` below is a thin compatibility shim: it runs each query synchronously
+// via better-sqlite3 under the hood, then invokes the callback on
+// process.nextTick with the same (err, row/rows) / this-bound
+// {lastID, changes} shape node-sqlite3 callers expect. Every call site below
+// this point is unchanged from the node-sqlite3 version.
+let sqliteDb;
+try {
+    sqliteDb = new Database('./data.db');
+} catch (err) {
+    console.error('Database connection error :', err.message);
+    process.exit(1);
+}
+
+// Caches prepared statements by SQL text so repeated queries (the vast
+// majority of calls here use a fixed SQL string) aren't re-prepared every time.
+const stmtCache = new Map();
+function getStmt(sql) {
+    let stmt = stmtCache.get(sql);
+    if (!stmt) {
+        stmt = sqliteDb.prepare(sql);
+        stmtCache.set(sql, stmt);
+    }
+    return stmt;
+}
+
+function normalizeArgs(params, callback) {
+    if (typeof params === 'function') return { params: [], callback: params };
+    if (params === undefined) return { params: [], callback };
+    return { params: Array.isArray(params) ? params : [params], callback };
+}
+
+const db = {
+    run(sql, params, callback) {
+        const norm = normalizeArgs(params, callback);
+        let result = null, error = null;
+        try {
+            if (/^\s*PRAGMA/i.test(sql)) {
+                sqliteDb.pragma(sql.replace(/^\s*PRAGMA\s+/i, ''));
+                result = { changes: 0, lastInsertRowid: undefined };
+            } else {
+                result = getStmt(sql).run(...norm.params);
+            }
+        } catch (err) {
+            error = err;
+        }
+        if (typeof norm.callback === 'function') {
+            const ctx = { lastID: result ? result.lastInsertRowid : undefined, changes: result ? result.changes : 0 };
+            process.nextTick(() => norm.callback.call(ctx, error));
+        } else if (error) {
+            console.error('DB run error (no callback):', error.message, '\nSQL:', sql);
+        }
+        return db;
+    },
+
+    get(sql, params, callback) {
+        const norm = normalizeArgs(params, callback);
+        let row, error = null;
+        try {
+            row = getStmt(sql).get(...norm.params);
+        } catch (err) {
+            error = err;
+        }
+        if (typeof norm.callback === 'function') {
+            process.nextTick(() => norm.callback(error, row));
+        } else if (error) {
+            console.error('DB get error (no callback):', error.message, '\nSQL:', sql);
+        }
+        return db;
+    },
+
+    all(sql, params, callback) {
+        const norm = normalizeArgs(params, callback);
+        let rows, error = null;
+        try {
+            rows = getStmt(sql).all(...norm.params);
+        } catch (err) {
+            error = err;
+        }
+        if (typeof norm.callback === 'function') {
+            process.nextTick(() => norm.callback(error, rows || []));
+        } else if (error) {
+            console.error('DB all error (no callback):', error.message, '\nSQL:', sql);
+        }
+        return db;
+    },
+
+    // better-sqlite3 runs everything synchronously on a single connection,
+    // so there's no queue to serialize against like there is with
+    // node-sqlite3 - calling fn() runs its db.run/get/all calls in program
+    // order already. This just preserves the call shape used below.
+    serialize(fn) {
+        if (typeof fn === 'function') fn();
+        return db;
+    }
+};
+
+console.log('Connected to database');
+db.run(`PRAGMA journal_mode=WAL`, (err) => {
+    if (err) console.error('WAL error:', err.message);
+db.serialize(() => {
             db.run(`CREATE TABLE IF NOT EXISTS User_Data (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE,
@@ -836,8 +935,6 @@ const db = new sqlite3.Database('./data.db', (err) => {
             });
         });
         });
-    }
-});
 
 app.use(express.urlencoded({extended:true}))
 app.use(express.json())
@@ -1839,7 +1936,7 @@ app.get('/edit', (req, res) => {
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
 <style>
-    body { margin: 0; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    body { margin: 0; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; padding: 40px 0; box-sizing: border-box; }
     .dashboard-box { color: white; width: 500px; padding: 30px; text-align: center; }
     .dash-field { margin: 12px 0; text-align: left; }
     .dash-field label { display: block; margin-bottom: 4px; font-size: 0.9em; opacity: 0.7; }

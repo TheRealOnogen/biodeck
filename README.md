@@ -8,12 +8,13 @@ Biodeck is a kewl website. idek wat to explain
 - html5
 - css3
 - sqlite3
+- dotenv
+- nodemailer
 
 ## how thig worke
 - ``server.js``: Server
-- ``html files``: html files
-- ``public``: public folder
-    - ``uploads``: wher uploaded thig go
-    - ``v86``: v86 code thig idk
-
-![h](https://theoldnet.com/images/w3c.gif)
+- ``html files``: HTML files
+- ``vars.env``: Environment variables (for nodemailer)
+- ``public``: Public folder
+    - ``uploads``: Uploads
+    - ``v86``: v86

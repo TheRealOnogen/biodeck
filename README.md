@@ -14,7 +14,7 @@ Biodeck is a kewl website. idek wat to explain
 ## how thig worke
 - ``server.js``: Server
 - ``html files``: HTML files
-- ``vars.env``: Environment variables (for nodemailer)
+- ``vars.env``: Environment variables (for nodemailer, rename vars.env.public to vars.env and put your info in it)
 - ``public``: Public folder
     - ``uploads``: Uploads
     - ``v86``: v86

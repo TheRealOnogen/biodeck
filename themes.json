@@ -4,7 +4,18 @@
   "displayName": "Biodeck",
   "file": "styles.css"
   },
-  { "name": "onogenated",
+  {
+  "name": "light",
+  "displayName": "Biodeck Light",
+  "file": "styles_light.css"
+  },
+  {
+  "name": "gray",
+  "displayName": "Biodeck Ash",
+  "file": "styles_gray.css"
+  },
+  {
+  "name": "onogenated",
   "displayName": "Biodeck Onogenated",
   "file": "styles_onogenated.css"
   }

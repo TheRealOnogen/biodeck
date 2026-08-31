@@ -201,7 +201,7 @@ const NOTIF_BADGE_SCRIPT = `<script>
                 document.querySelectorAll('.notif-nav-link').forEach(function(el) {
                     el.textContent = label;
                     el.style.fontWeight = count > 0 ? '700' : '';
-                    el.style.color = count > 0 ? 'rgb(0,191,255)' : '';
+                    el.style.color = count > 0 ? 'var(--accent-color)' : '';
                 });
                 document.querySelectorAll('#nav-hamburger, #profile-nav-hamburger').forEach(function(btn) {
                     var dot = btn.querySelector('.notif-dot');
@@ -252,7 +252,7 @@ const USER_EVENTS_SCRIPT = `<script>
         document.body.style = '';
         var box = document.createElement('div');
         box.className = 'box';
-        box.style.cssText = 'color:white;height:auto;width:500px;max-width:90vw;word-break:break-word;overflow-wrap:break-word;box-sizing:border-box;';
+        box.style.cssText = 'color:var(--text-color);height:auto;width:500px;max-width:90vw;word-break:break-word;overflow-wrap:break-word;box-sizing:border-box;';
         box.innerHTML = inner;
         document.body.appendChild(box);
         // Re-attach button click animation since we wiped the DOM
@@ -357,13 +357,13 @@ function renderEmbeds(text) {
 
         if (/\.(mp4|webm|ogg|ogv|mov)(\?.*)?$/i.test(url)) {
             usedUrls.add(url);
-            embeds.push(`<div style="margin-top:8px;"><video controls preload="metadata" style="max-width:320px;max-height:240px;border-radius:8px;display:block;background:black;"><source src="${escapeHTML(url)}">Your browser can't play this video. <a href="${escapeHTML(url)}" target="_blank" style="color:rgb(0,191,255);">Download</a></video></div>`);
+            embeds.push(`<div style="margin-top:8px;"><video controls preload="metadata" style="max-width:320px;max-height:240px;border-radius:8px;display:block;background:black;"><source src="${escapeHTML(url)}">Your browser can't play this video. <a href="${escapeHTML(url)}" target="_blank" style="color:var(--accent-color);">Download</a></video></div>`);
             continue;
         }
 
         if (/\.(mp3|wav|flac|aac|m4a|opus|oga)(\?.*)?$/i.test(url)) {
             usedUrls.add(url);
-            embeds.push(`<div style="margin-top:8px;"><audio controls preload="metadata" style="width:280px;max-width:100%;border-radius:8px;display:block;"><source src="${escapeHTML(url)}">Your browser can't play this audio. <a href="${escapeHTML(url)}" target="_blank" style="color:rgb(0,191,255);">Download</a></audio></div>`);
+            embeds.push(`<div style="margin-top:8px;"><audio controls preload="metadata" style="width:280px;max-width:100%;border-radius:8px;display:block;"><source src="${escapeHTML(url)}">Your browser can't play this audio. <a href="${escapeHTML(url)}" target="_blank" style="color:var(--accent-color);">Download</a></audio></div>`);
             continue;
         }
     }
@@ -404,21 +404,21 @@ function renderMessageBubble(m, me, replyMsg) {
     const avatarHTML = renderAvatarHTML(m.avatar_path, m.from_user, 28);
     const senderHeader = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
                 <a href="/user/${escapeHTML(m.from_user)}" style="flex-shrink:0;">${avatarHTML}</a>
-                <a href="/user/${escapeHTML(m.from_user)}" style="color:white;text-decoration:none;font-weight:bold;font-size:0.8em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
+                <a href="/user/${escapeHTML(m.from_user)}" class="msg-sender-name" style="text-decoration:none;font-weight:bold;font-size:0.8em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
             </div>`;
     const replyBanner = replyMsg
-        ? `<div style="font-size:0.78em;opacity:0.6;border-left:3px solid white;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
+        ? `<div class="msg-reply-banner" style="font-size:0.78em;opacity:0.6;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
         : '';
-    const deleteLink = mine ? `<a href="#" onclick="deleteMessage(${m.id});return false;" style="color:rgb(255,90,90);text-decoration:none;">Delete</a>` : '';
+    const deleteLink = mine ? `<a href="#" onclick="deleteMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
-        <div style="max-width:70%;background:${mine ? 'rgba(0,191,255,0.15)' : 'rgba(255,255,255,0.08)'};border:1px solid ${mine ? 'rgba(0,191,255,0.4)' : 'rgba(255,255,255,0.2)'};border-radius:12px;padding:8px 12px;">
+        <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderHeader}
             ${replyBanner}
             <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
-                <a href="#" onclick="setReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" style="color:rgb(0,191,255);text-decoration:none;">Reply</a>
+                <a href="#" onclick="setReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
                 ${deleteLink}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
@@ -472,9 +472,9 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
         const ext = path.extname(f.name || '').toLowerCase();
         const url = `/uploads/${path.basename(f.path)}`;
         if (MSG_VIDEO_MIME_TYPES[ext]) {
-            html += `<div class="post-file"><video controls preload="metadata" style="max-height:${maxHeight}px;max-width:${maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;background:black;"><source src="${url}" type="${MSG_VIDEO_MIME_TYPES[ext]}">Your browser can't play this video. <a href="${url}" target="_blank" style="color:rgb(0,191,255);">Download it instead</a>.</video></div>`;
+            html += `<div class="post-file"><video controls preload="metadata" style="max-height:${maxHeight}px;max-width:${maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;background:black;"><source src="${url}" type="${MSG_VIDEO_MIME_TYPES[ext]}">Your browser can't play this video. <a href="${url}" target="_blank" style="color:var(--accent-color);">Download it instead</a>.</video></div>`;
         } else if (MSG_AUDIO_MIME_TYPES[ext]) {
-            html += `<div class="post-file"><audio controls preload="metadata" style="width:100%;max-width:${maxWidth === 'min(100%,80vw)' ? '400px' : maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"><source src="${url}" type="${MSG_AUDIO_MIME_TYPES[ext]}">Your browser can't play this audio. <a href="${url}" target="_blank" style="color:rgb(0,191,255);">Download it instead</a>.</audio></div>`;
+            html += `<div class="post-file"><audio controls preload="metadata" style="width:100%;max-width:${maxWidth === 'min(100%,80vw)' ? '400px' : maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"><source src="${url}" type="${MSG_AUDIO_MIME_TYPES[ext]}">Your browser can't play this audio. <a href="${url}" target="_blank" style="color:var(--accent-color);">Download it instead</a>.</audio></div>`;
         } else {
             html += `<div class="post-file"><a href="${url}" target="_blank">${escapeHTML(f.name)}</a></div>`;
         }
@@ -593,14 +593,14 @@ function processMentions(content, actorUsername, { type, post_id = null, message
 function linkifyMentions(escapedText) {
     if (!escapedText) return escapedText;
     return escapedText.replace(/(^|[\s>])@([a-zA-Z0-9_]{1,32})/g, (full, pre, uname) => {
-        return `${pre}<a href="/user/${uname}" style="color:rgb(0,191,255);text-decoration:none;font-weight:600;">@${uname}</a>`;
+        return `${pre}<a href="/user/${uname}" style="color:var(--accent-color);text-decoration:none;font-weight:600;">@${uname}</a>`;
     });
 }
 
 const NOTIF_ICONS = { reply: '>', dm: '>', friend_request: '+', friend_accept: '✓', friend_decline: '×', mention_post: '@', mention_dm: '@', mention_gc: '@' };
 
 function notifText(n) {
-    const actor = `<a href="/user/${escapeHTML(n.actor_username)}" style="color:white;font-weight:bold;text-decoration:none;">${escapeHTML(displayName(n.actor_username, n.actor_nickname))}</a>`;
+    const actor = `<a href="/user/${escapeHTML(n.actor_username)}" style="color:var(--text-color);font-weight:bold;text-decoration:none;">${escapeHTML(displayName(n.actor_username, n.actor_nickname))}</a>`;
     switch (n.type) {
         case 'reply': return `${actor} replied to your post`;
         case 'dm': return `${actor} sent you a message`;
@@ -627,7 +627,7 @@ function renderNotificationItem(n) {
     const icon = NOTIF_ICONS[n.type] || '*';
     const preview = n.content_preview ? `<div style="opacity:0.6;font-size:0.85em;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(n.content_preview)}</div>` : '';
     const unreadDot = !n.read ? `<span style="width:8px;height:8px;border-radius:50%;background:rgb(0,191,255);flex-shrink:0;"></span>` : `<span style="width:8px;height:8px;flex-shrink:0;"></span>`;
-    return `<div class="notif-item" data-id="${n.id}" data-href="${notifLink(n)}" style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:white;cursor:pointer;margin-bottom:10px;background:${n.read ? 'transparent' : 'rgba(0,191,255,0.06)'};">
+    return `<div class="notif-item" data-id="${n.id}" data-href="${notifLink(n)}" style="display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:var(--text-color);cursor:pointer;margin-bottom:10px;background:${n.read ? 'transparent' : 'rgba(0,191,255,0.06)'};">
         ${unreadDot}
         <span style="font-size:1.1em;flex-shrink:0;">${icon}</span>
         <div style="flex:1;min-width:0;">
@@ -651,7 +651,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     return `<div class="post-header" style="display:flex;align-items:flex-start;gap:8px;">
             <a href="/user/${safeUsername}" style="flex-shrink:0;">${avatarHTML}</a>
             <div style="display:flex;flex-direction:column;min-width:0;">
-                <a href="/user/${safeUsername}" style="color:white;text-decoration:none;font-weight:bold;">${renderNameWithHandle(post.username, post.Nickname)}</a>
+                <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;">${renderNameWithHandle(post.username, post.Nickname)}</a>
                 <span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>
             </div>
         </div>
@@ -671,10 +671,10 @@ function renderPinnedItem(post) {
     const preview = safeContent.length > 140 ? safeContent.slice(0, 140) + '…' : safeContent;
     const previewHTML = preview || '<span style="opacity:0.5;">(attachment)</span>';
     return `<div class="pinned-item" data-pin-id="${post.id}" style="display:flex;align-items:center;gap:10px;padding:8px 16px;background:rgba(255,180,40,0.08);border-bottom:1px solid rgba(255,180,40,0.25);">
-        <span style="font-size:0.7em;letter-spacing:0.08em;color:rgb(255,180,40);font-weight:700;text-transform:uppercase;flex-shrink:0;">Pinned</span>
-        <a href="/user/${safeUsername}" style="color:white;text-decoration:none;font-weight:bold;flex-shrink:0;">${escapeHTML(displayName(post.username, post.Nickname))}</a>
+        <span style="font-size:0.7em;letter-spacing:0.08em;color:var(--pinned-color);font-weight:700;text-transform:uppercase;flex-shrink:0;">Pinned</span>
+        <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex-shrink:0;">${escapeHTML(displayName(post.username, post.Nickname))}</a>
         <span style="opacity:0.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${previewHTML}</span>
-        <a href="#" onclick="dismissPin(${post.id});return false;" title="Hide this pin" style="color:rgba(255,255,255,0.6);text-decoration:none;font-weight:700;flex-shrink:0;padding:0 4px;">✕</a>
+        <a href="#" onclick="dismissPin(${post.id});return false;" title="Hide this pin" style="color:var(--text-dimmer-color);text-decoration:none;font-weight:700;flex-shrink:0;padding:0 4px;">✕</a>
     </div>`;
 }
 
@@ -1068,7 +1068,7 @@ function checkIPBan(req, res, next) {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>Your IP has been banned</h1><br>
         <h3>Ban Reason: ${reason}</h3><br><br>
         <p style="opacity:0.6;font-size:0.9em;">If you believe this is a mistake, contact an administrator.</p>
@@ -1100,7 +1100,7 @@ function checkBan(req, res, next) {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>Your account has been deleted</h1><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
@@ -1125,7 +1125,7 @@ function checkBan(req, res, next) {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${reason}</h3><br><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
@@ -1147,7 +1147,7 @@ function checkBan(req, res, next) {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${reason}</h3><br><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
@@ -1374,7 +1374,7 @@ function renderMessagePage(title, heading, bodyHTML) {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; padding: 30px;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; padding: 30px;">
         <h1>${escapeHTML(heading)}</h1><br>
         ${bodyHTML}
     </div>
@@ -1579,7 +1579,7 @@ app.post('/register', async (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${escapeHTML(reason)}</h3><br><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
@@ -1641,7 +1641,7 @@ app.post('/login', (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${escapeHTML(reason)}</h3><br><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
@@ -1670,7 +1670,7 @@ app.post('/login', (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body>
-    <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${escapeHTML(reason)}</h3><br><br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
@@ -1953,7 +1953,7 @@ app.post('/reset-password', async (req, res) => {
     const tokenHash = hashResetToken(token);
 
     const showForm = (message) => res.status(400).send(renderMessagePage('Reset Password', 'Choose a new password',
-        `<h3 style="color: rgb(255,120,120);">${escapeHTML(message)}</h3><br>
+        `<h3 style="color: var(--danger-light-color);">${escapeHTML(message)}</h3><br>
         <form method="POST" action="/reset-password" style="display:flex;flex-direction:column;gap:14px;align-items:center;">
             <input type="hidden" name="token" value="${escapeHTML(token)}">
             <input type="password" name="password" placeholder="New password" required style="width: 260px;">
@@ -2082,7 +2082,7 @@ app.get('/edit', (req, res) => {
         </div>
         <hr style="border-color:rgba(255,80,80,0.3);margin:26px 0 14px;">
         <div class="dash-field" style="text-align:center;">
-            <h3 style="color:rgb(255, 0, 0);margin-bottom:4px;">Danger Zone</h3>
+            <h3 style="color:var(--danger-strong-color);margin-bottom:4px;">Danger Zone</h3>
             <p style="opacity:0.6;font-size:0.82em;">Deleting your account is <strong>permanent</strong>. It removes your posts, DMs, group chat messages and memberships, follows, friends, friend requests, and notifications from the database. There is no way to undo this or recover your data afterward.</p>
             <button class="button" type="button" onclick="openDeleteAccountBox()" style="width:auto;">Delete My Account</button>
             <div id="delete-account-box" style="display:none;margin-top:14px;text-align:left;">
@@ -2113,14 +2113,14 @@ app.get('/edit', (req, res) => {
         bioEl.addEventListener('input', function () {
             const len = this.value.length;
             bioCounter.textContent = len + ' / 1000';
-            bioCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            bioCounter.style.color = len > 900 ? (len >= 1000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             bioCounter.style.opacity = len > 900 ? '1' : '0.5';
         });
 
         if (new URLSearchParams(window.location.search).get('nicknameerror')) {
             const t = document.createElement('div');
             t.textContent = 'Nickname too long - 32 character limit.';
-            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/edit');
@@ -2129,7 +2129,7 @@ app.get('/edit', (req, res) => {
         if (new URLSearchParams(window.location.search).get('bioerror')) {
             const t = document.createElement('div');
             t.textContent = 'Bio too long - 1,000 character limit.';
-            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/edit');
@@ -2138,7 +2138,7 @@ app.get('/edit', (req, res) => {
         if (new URLSearchParams(window.location.search).get('themeerror')) {
             const t = document.createElement('div');
             t.textContent = 'That theme is not available.';
-            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/edit');
@@ -2150,7 +2150,7 @@ app.get('/edit', (req, res) => {
             const newEmailInput = document.getElementById('new-email-input');
             const resultEl = document.getElementById('email-change-result');
             const newEmail = newEmailInput.value.trim();
-            if (!newEmail) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter a new email address.'; return; }
+            if (!newEmail) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Enter a new email address.'; return; }
             resultEl.style.color = ''; resultEl.textContent = 'Sending code...';
             try {
                 const r = await fetch('/account/email/request-code', {
@@ -2159,21 +2159,21 @@ app.get('/edit', (req, res) => {
                     body: JSON.stringify({ new_email: newEmail })
                 });
                 const d = await r.json();
-                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not send code.'; return; }
+                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not send code.'; return; }
                 pendingNewEmail = newEmail;
                 document.getElementById('email-code-sent-to').textContent = d.sent_to;
                 document.getElementById('email-code-new-addr').textContent = newEmail;
                 document.getElementById('email-change-step1').style.display = 'none';
                 document.getElementById('email-change-step2').style.display = 'block';
                 resultEl.style.color = ''; resultEl.textContent = '';
-            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+            } catch (e) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; }
         }
 
         async function confirmEmailChange() {
             const codeInput = document.getElementById('email-code-input');
             const resultEl = document.getElementById('email-change-result');
             const code = codeInput.value.trim();
-            if (!code) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter the code from your email.'; return; }
+            if (!code) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Enter the code from your email.'; return; }
             resultEl.style.color = ''; resultEl.textContent = 'Confirming...';
             try {
                 const r = await fetch('/account/email/confirm', {
@@ -2182,10 +2182,10 @@ app.get('/edit', (req, res) => {
                     body: JSON.stringify({ code })
                 });
                 const d = await r.json();
-                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not confirm code.'; return; }
-                resultEl.style.color = 'rgb(0,191,255)'; resultEl.textContent = 'Email updated!';
+                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not confirm code.'; return; }
+                resultEl.style.color = 'var(--accent-color)'; resultEl.textContent = 'Email updated!';
                 setTimeout(() => window.location.reload(), 900);
-            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+            } catch (e) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; }
         }
 
         function cancelEmailChange() {
@@ -2209,7 +2209,7 @@ app.get('/edit', (req, res) => {
         async function confirmDeleteAccount() {
             const password = document.getElementById('delete-account-password').value;
             const resultEl = document.getElementById('delete-account-result');
-            if (!password) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Enter your password to confirm.'; return; }
+            if (!password) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Enter your password to confirm.'; return; }
             if (!confirm('This will PERMANENTLY delete your account and all of your data. This cannot be undone. Continue?')) return;
 
             resultEl.style.color = ''; resultEl.textContent = 'Deleting...';
@@ -2220,16 +2220,16 @@ app.get('/edit', (req, res) => {
                     body: JSON.stringify({ password })
                 });
                 const d = await r.json();
-                if (!r.ok) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = d.error || 'Could not delete account.'; return; }
-                resultEl.style.color = 'rgb(0,191,255)'; resultEl.textContent = 'Account deleted. Redirecting...';
+                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not delete account.'; return; }
+                resultEl.style.color = 'var(--accent-color)'; resultEl.textContent = 'Account deleted. Redirecting...';
                 setTimeout(() => window.location.href = '/', 1200);
-            } catch (e) { resultEl.style.color = 'rgb(255,120,120)'; resultEl.textContent = 'Network error.'; }
+            } catch (e) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; }
         }
 
         if (new URLSearchParams(window.location.search).get('avatarerror')) {
             const t = document.createElement('div');
             t.textContent = 'Could not upload profile picture - please use an image file under 8MB.';
-            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/edit');
@@ -2411,7 +2411,7 @@ app.get('/feed', (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-feed">
-    <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
+    <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
             <div id="feed-search-bar">
@@ -2446,7 +2446,7 @@ app.get('/feed', (req, res) => {
 
         ${pinnedHTML ? `<div id="pinned-bar">${pinnedHTML}</div>` : ''}
 
-        <div id="posts" style="color: white;">
+        <div id="posts" style="color: var(--text-color);">
             ${postsHTML.length ? postsHTML : '<p id="no-posts-msg">No posts yet.</p>'}
             <div id="load-more-sentinel" style="height:1px;"></div>
             <div id="load-more-spinner" style="display:none;text-align:center;padding:16px;opacity:0.5;font-size:0.9em;">Loading older posts…</div>
@@ -2520,14 +2520,14 @@ app.get('/feed', (req, res) => {
         postContent.addEventListener('input', function () {
             const len = this.value.length;
             postCounter.textContent = len + ' / 1000';
-            postCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            postCounter.style.color = len > 900 ? (len >= 1000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             postCounter.style.opacity = len > 3800 ? '1' : '0.5';
         });
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
             const t = document.createElement('div');
             t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
-            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/feed');
@@ -2961,7 +2961,7 @@ app.get('/following-feed', (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-following-feed">
-    <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
+    <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${sessionUsername}</strong></div>
             <div id="feed-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -2989,14 +2989,14 @@ app.get('/following-feed', (req, res) => {
             </div>
         </div>
 
-        <div id="posts" style="color: white;">
+        <div id="posts" style="color: var(--text-color);">
             ${postsHTML || `<p id="no-posts-msg" style="opacity:0.5;margin-top:40px;">No posts yet from people you follow.</p>`}
             <div id="load-more-sentinel" style="height:1px;"></div>
             <div id="load-more-spinner" style="display:none;text-align:center;opacity:0.5;padding:16px 0;">Loading…</div>
         </div>
 
         <div id="post-form-container">
-            <div id="reply-indicator">> Replying to <span id="reply-to-name"></span> - <a href="#" onclick="clearReply();return false;" style="color:rgb(0,191,255);">Cancel</a></div>
+            <div id="reply-indicator">> Replying to <span id="reply-to-name"></span> - <a href="#" onclick="clearReply();return false;" style="color:var(--accent-color);">Cancel</a></div>
             <form action="/feed/post" method="POST" enctype="multipart/form-data">
                 <input type="hidden" name="reply_to" id="reply-to-input" value="">
                 <div id="post-form-row">
@@ -3027,14 +3027,14 @@ app.get('/following-feed', (req, res) => {
         postContent.addEventListener('input', function () {
             const len = this.value.length;
             postCounter.textContent = len + ' / 1000';
-            postCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            postCounter.style.color = len > 900 ? (len >= 1000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             postCounter.style.opacity = len > 900 ? '1' : '0.5';
         });
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
             const t = document.createElement('div');
             t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
-            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/following-feed');
@@ -3263,7 +3263,7 @@ app.get('/post/:id', (req, res) => {
 
         const renderPage = (parentPost) => {
             const parentContextHTML = !rootPost.reply_to ? '' : (parentPost
-                ? `<div class="reply-context"><a href="/post/${parentPost.id}" style="color:rgb(0,191,255);text-decoration:none;">> Replying to @${escapeHTML(parentPost.username)}</a></div>`
+                ? `<div class="reply-context"><a href="/post/${parentPost.id}" style="color:var(--accent-color);text-decoration:none;">> Replying to @${escapeHTML(parentPost.username)}</a></div>`
                 : `<div class="reply-context" style="opacity:0.4;">> Replying to a deleted post</div>`);
 
             db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId], (err2, replies) => {
@@ -3284,7 +3284,7 @@ app.get('/post/:id', (req, res) => {
 <link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-post">
-    <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
+    <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
             <div id="feed-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -3302,7 +3302,7 @@ app.get('/post/:id', (req, res) => {
             </div>
         </div>
 
-        <div id="posts" style="color: white;">
+        <div id="posts" style="color: var(--text-color);">
             <div id="thread-root">
                 ${parentContextHTML}
                 <div class="post" id="root-post-${rootPost.id}">
@@ -3353,14 +3353,14 @@ app.get('/post/:id', (req, res) => {
         postContent.addEventListener('input', function () {
             const len = this.value.length;
             postCounter.textContent = len + ' / 1000';
-            postCounter.style.color = len > 900 ? (len >= 1000 ? 'rgb(255,80,80)' : 'orange') : '';
+            postCounter.style.color = len > 900 ? (len >= 1000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             postCounter.style.opacity = len > 900 ? '1' : '0.5';
         });
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
             const t = document.createElement('div');
             t.textContent = 'Reply too long or too many files selected - 1,000 character limit, max 5 files.';
-            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/post/${rootPost.id}');
@@ -3684,7 +3684,7 @@ app.get('/friends', (req, res) => {
                 function renderUserRow(username, avatarPath, actionHTML) {
                     return `<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
                         <a href="/user/${escapeHTML(username)}" style="flex-shrink:0;">${renderAvatarHTML(avatarPath, username, 40)}</a>
-                        <a href="/user/${escapeHTML(username)}" style="color:white;text-decoration:none;font-weight:bold;flex:1;">${escapeHTML(username)}</a>
+                        <a href="/user/${escapeHTML(username)}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex:1;">${escapeHTML(username)}</a>
                         ${actionHTML}
                     </div>`;
                 }
@@ -3692,13 +3692,13 @@ app.get('/friends', (req, res) => {
                 const friendsHTML = (friends || []).map(f =>
                     renderUserRow(f.friend_username, f.avatar_path,
                         `<a href="/messages/${escapeHTML(f.friend_username)}" class="button" style="padding:6px 12px;text-decoration:none;font-size:0.85em;">Message</a>
-                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:rgb(255,120,120);">Unfriend</button>`)
+                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);">Unfriend</button>`)
                 ).join('');
 
                 const incomingHTML = (incoming || []).map(r =>
                     renderUserRow(r.from_user, r.avatar_path,
-                        `<button class="button" onclick="acceptRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(0,191,255,0.15);border-color:rgba(0,191,255,0.6);color:rgb(0,191,255);width: auto;height: 25px;">Accept</button>
-                         <button class="button" onclick="declineRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.08);border-color:rgba(255,60,60,0.4);color:rgb(255,120,120);width: auto;height: 25px;">Decline</button>`)
+                        `<button class="button" onclick="acceptRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(0,191,255,0.15);border-color:rgba(0,191,255,0.6);color:var(--accent-color);width: auto;height: 25px;">Accept</button>
+                         <button class="button" onclick="declineRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.08);border-color:rgba(255,60,60,0.4);color:var(--danger-light-color);width: auto;height: 25px;">Decline</button>`)
                 ).join('');
 
                 const outgoingHTML = (outgoing || []).map(r =>
@@ -3831,7 +3831,7 @@ app.get('/followers', (req, res) => {
     db.all(`SELECT f.follower_username, u.avatar_path FROM Follows f LEFT JOIN User_Data u ON f.follower_username = u.username WHERE f.following_username = ? ORDER BY f.created_at DESC`, [me], (err, followers) => {
         const followersHTML = (followers || []).map(f => {
             const avatarHTML = renderAvatarHTML(f.avatar_path, f.follower_username, 36);
-            return `<a href="/user/${escapeHTML(f.follower_username)}" style="display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:white;text-decoration:none;margin-bottom:10px;transition:background 0.15s;">
+            return `<a href="/user/${escapeHTML(f.follower_username)}" style="display:flex;align-items:center;gap:12px;padding:12px 16px;border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:var(--text-color);text-decoration:none;margin-bottom:10px;transition:background 0.15s;">
                 ${avatarHTML}
                 <strong>@${escapeHTML(f.follower_username)}</strong>
             </a>`;
@@ -3913,7 +3913,7 @@ app.get('/user/:username', (req, res) => {
                 db.all(`SELECT *, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts WHERE username = ? ORDER BY created_at DESC`, [profileUsername], (err2, posts) => {
                     const postsHTML = (posts || []).map(post => {
                         const fileHTML = renderAttachmentsHTML(getAttachments(post), 300);
-                        return `<div class="post" style="border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:10px;margin-bottom:14px;text-align:left;">
+                        return `<div class="post" style="border:1px solid var(--post-border-color);border-radius:10px;padding:10px;margin-bottom:14px;text-align:left;">
                             <span class="post-time" data-ts="${post.created_at ? post.created_at.replace(' ', 'T') + 'Z' : ''}" style="font-size:0.8em;opacity:0.6;"></span>
                             <div class="post-content" style="margin-top:4px;">${escapeHTML(post.content)}</div>
                             ${fileHTML}
@@ -3929,8 +3929,8 @@ app.get('/user/:username', (req, res) => {
                         'Add Friend'
                     }</a>`;
                     const followersLink = isOwnProfile
-                        ? `<a href="/followers" style="color:rgba(255,255,255,0.5);text-decoration:none;font-size:0.85em;">${numFollowers} follower${numFollowers !== 1 ? 's' : ''}</a>`
-                        : `<span style="color:rgba(255,255,255,0.5);font-size:0.85em;">${numFollowers} follower${numFollowers !== 1 ? 's' : ''}</span>`;
+                        ? `<a href="/followers" style="color:var(--text-muted-color);text-decoration:none;font-size:0.85em;">${numFollowers} follower${numFollowers !== 1 ? 's' : ''}</a>`
+                        : `<span style="color:var(--text-muted-color);font-size:0.85em;">${numFollowers} follower${numFollowers !== 1 ? 's' : ''}</span>`;
 
                     res.send(`<!DOCTYPE html>
 <html lang="en">
@@ -3962,7 +3962,7 @@ app.get('/user/:username', (req, res) => {
         <div style="display:flex;justify-content:center;margin-bottom:12px;">
             ${renderAvatarHTML(user.avatar_path, user.username, 100)}
         </div>
-        ${(user.IsOwner || user.IsDeveloper || user.IsSupporter || user.IsAdmin || user.IsHeadAdmin || user.IsBanned || user.IsDeleted) ? `<div style="display:flex;gap:8px;justify-content:center;margin-bottom:6px;flex-wrap:wrap;">${user.IsOwner ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(255,200,50);font-weight:700;text-transform:uppercase;">Owner</span>' : ''}${user.IsHeadAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(255, 0, 0);font-weight:700;text-transform:uppercase;">Head Admin</span>' : ''}${user.IsAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(255,100,100);font-weight:700;text-transform:uppercase;">Admin</span>' : ''}${user.IsDeveloper ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(0,191,255);font-weight:700;text-transform:uppercase;">Developer</span>' : ''}${user.IsSupporter ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(180,100,255);font-weight:700;text-transform:uppercase;">Supporter</span>' : ''}${user.IsDeleted ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(150,150,150);font-weight:700;text-transform:uppercase;border:1px solid rgb(150,150,150);border-radius:4px;padding:1px 6px;">Deleted</span>' : (user.IsBanned ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:rgb(255,80,80);font-weight:700;text-transform:uppercase;border:1px solid rgb(255,80,80);border-radius:4px;padding:1px 6px;">Banned</span>' : '')}</div>` : ''}
+        ${(user.IsOwner || user.IsDeveloper || user.IsSupporter || user.IsAdmin || user.IsHeadAdmin || user.IsBanned || user.IsDeleted) ? `<div style="display:flex;gap:8px;justify-content:center;margin-bottom:6px;flex-wrap:wrap;">${user.IsOwner ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--gold-color);font-weight:700;text-transform:uppercase;">Owner</span>' : ''}${user.IsHeadAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--danger-strong-color);font-weight:700;text-transform:uppercase;">Head Admin</span>' : ''}${user.IsAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--admin-color);font-weight:700;text-transform:uppercase;">Admin</span>' : ''}${user.IsDeveloper ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--accent-color);font-weight:700;text-transform:uppercase;">Developer</span>' : ''}${user.IsSupporter ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--purple-color);font-weight:700;text-transform:uppercase;">Supporter</span>' : ''}${user.IsDeleted ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--gray-color);font-weight:700;text-transform:uppercase;border:1px solid rgb(150,150,150);border-radius:4px;padding:1px 6px;">Deleted</span>' : (user.IsBanned ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--danger-color);font-weight:700;text-transform:uppercase;border:1px solid rgb(255,80,80);border-radius:4px;padding:1px 6px;">Banned</span>' : '')}</div>` : ''}
         <h1>${user.Nickname && user.Nickname.trim() ? escapeHTML(user.Nickname.trim()) : '@' + escapeHTML(user.username)}</h1>
         ${user.Nickname && user.Nickname.trim() ? `<div style="opacity:0.5;font-size:0.9em;margin-top:-10px;margin-bottom:6px;">@${escapeHTML(user.username)}</div>` : ''}
         <div style="margin-bottom:8px;">${followersLink}</div>
@@ -4076,7 +4076,7 @@ app.get('/messages', (req, res) => {
             GROUP BY other_user ORDER BY last_at DESC`,
         [me, me, me], (err, convos) => {
         const convosHTML = (convos || []).map(c => `
-            <a href="/messages/${c.other_user}" style="display:block;padding:14px 16px;border:1px solid rgba(255,255,255,0.15);border-radius:10px;color:white;text-decoration:none;margin-bottom:10px;transition:background 0.15s;">
+            <a href="/messages/${c.other_user}" class="msg-sender-name msg-convo-link">
                 <strong>@${c.other_user}</strong>
                 <span style="float:right;font-size:0.8em;opacity:0.5;" data-ts="${c.last_at.replace(' ','T')+'Z'}"></span>
             </a>`).join('');
@@ -4109,7 +4109,7 @@ app.get('/messages', (req, res) => {
         </div>
     </div>
     <div id="inbox">
-        <h2>Inbox <a href="/groups" style="font-size:0.6em;color:rgb(0,191,255);text-decoration:none;margin-left:12px;font-weight:400;">+ Group Chats</a></h2>
+        <h2>Inbox <a href="/groups" style="font-size:0.6em;color:var(--accent-color);text-decoration:none;margin-left:12px;font-weight:400;">+ Group Chats</a></h2>
         ${convosHTML || '<p style="opacity:0.4;">No conversations yet.</p>'}
     </div>
     <script>
@@ -4160,7 +4160,7 @@ app.get('/messages/:username', (req, res) => {
 </head>
 <body class="page-chat">
     <div id="chat-topbar">
-        <div id="chat-topbar-left">Chat with <strong><a href="/user/${other}" style="color:white;text-decoration:none;">@${other}</a></strong></div>
+        <div id="chat-topbar-left">Chat with <strong><a href="/user/${other}" class="msg-sender-name" style="text-decoration:none;">@${other}</a></strong></div>
         <div id="chat-topbar-right" style="position:relative;display:flex;align-items:center;">
             <a href="/messages">Inbox</a>
             <a href="/feed">Feed</a>
@@ -4179,7 +4179,7 @@ app.get('/messages/:username', (req, res) => {
         ${msgsHTML || '<p id="chat-empty-placeholder" style="text-align:center;opacity:0.4;">No messages yet. Say hi!</p>'}
     </div>
     <div id="chat-input-bar">
-        <div id="chat-reply-indicator">Replying to <span id="chat-reply-to-name"></span> &nbsp;<a href="#" onclick="clearReply();return false;" style="color:rgb(0,191,255);">cancel</a></div>
+        <div id="chat-reply-indicator">Replying to <span id="chat-reply-to-name"></span> &nbsp;<a href="#" onclick="clearReply();return false;" style="color:var(--accent-color);">cancel</a></div>
         <form action="/messages/${other}/send" method="POST" enctype="multipart/form-data" id="chat-form">
             <input type="hidden" name="reply_to" id="chat-reply-to-input" value="">
             <div id="chat-form-row">
@@ -4192,7 +4192,7 @@ app.get('/messages/:username', (req, res) => {
             <div id="chat-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 4000</div>
         </form>
     </div>
-    <div id="chat-conn-indicator" style="position:fixed;top:54px;left:50%;transform:translateX(-50%);background:rgba(255,170,0,0.9);color:black;padding:4px 14px;border-radius:0 0 8px 8px;font-size:0.78em;font-weight:600;z-index:99;display:none;">Reconnecting…</div>
+    <div id="chat-conn-indicator" style="position:fixed;top:54px;left:50%;transform:translateX(-50%);background:rgba(255,170,0,0.9);color:var(--on-warning-color);padding:4px 14px;border-radius:0 0 8px 8px;font-size:0.78em;font-weight:600;z-index:99;display:none;">Reconnecting…</div>
     <script>
         document.querySelectorAll('[data-ts]').forEach(el => {
             const ts = el.getAttribute('data-ts');
@@ -4267,7 +4267,7 @@ app.get('/messages/:username', (req, res) => {
         chatContent.addEventListener('input', function () {
             const len = this.value.length;
             chatCounter.textContent = len + ' / 4000';
-            chatCounter.style.color = len > 3800 ? (len >= 4000 ? 'rgb(255,80,80)' : 'orange') : '';
+            chatCounter.style.color = len > 3800 ? (len >= 4000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             chatCounter.style.opacity = len > 3800 ? '1' : '0.5';
         });
         chatContent.addEventListener('keydown', function (e) {
@@ -4295,7 +4295,7 @@ app.get('/messages/:username', (req, res) => {
         function showChatError(message) {
             const t = document.createElement('div');
             t.textContent = message;
-            t.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
         }
@@ -4663,12 +4663,12 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         if (err) return res.status(500).send('DB error');
         const userRows = (users || []).map(u => {
             const badges = [
-                u.IsOwner ? '<span style="color:rgb(255,200,50);font-weight:700;">Owner</span>' : '',
-                u.IsHeadAdmin ? '<span style="color:rgb(255, 0, 0);font-weight:700;">Head Admin</span>' : '',
-                u.IsAdmin ? '<span style="color:rgb(255,100,100);font-weight:700;">Admin</span>' : '',
-                u.IsDeveloper ? '<span style="color:rgb(0,191,255);font-weight:700;">Dev</span>' : '',
-                u.IsSupporter ? '<span style="color:rgb(180,100,255);font-weight:700;">Supporter</span>' : '',
-                u.IsDeleted ? '<span style="color:rgb(150,150,150);font-weight:700;">Deleted</span>' : (u.IsBanned ? '<span style="color:rgb(255,80,80);font-weight:700;">Banned</span>' : ''),
+                u.IsOwner ? '<span style="color:var(--gold-color);font-weight:700;">Owner</span>' : '',
+                u.IsHeadAdmin ? '<span style="color:var(--danger-strong-color);font-weight:700;">Head Admin</span>' : '',
+                u.IsAdmin ? '<span style="color:var(--admin-color);font-weight:700;">Admin</span>' : '',
+                u.IsDeveloper ? '<span style="color:var(--accent-color);font-weight:700;">Dev</span>' : '',
+                u.IsSupporter ? '<span style="color:var(--purple-color);font-weight:700;">Supporter</span>' : '',
+                u.IsDeleted ? '<span style="color:var(--gray-color);font-weight:700;">Deleted</span>' : (u.IsBanned ? '<span style="color:var(--danger-color);font-weight:700;">Banned</span>' : ''),
             ].filter(Boolean).join(' ');
             const ipBtn = u.last_ip
                 ? `<button class="button" style="font-size:0.75em;padding:2px 8px;margin-left:6px;" onclick="prefillIPBan('${escapeHTML(u.last_ip)}')">IP Ban</button>`
@@ -4676,7 +4676,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const nicknameSuffix = (u.Nickname && u.Nickname.trim()) ? ` <span style="opacity:0.5;font-weight:400;">(${escapeHTML(u.Nickname.trim())})</span>` : '';
             const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') : '');
             return `<tr>
-                <td><a href="/user/${escapeHTML(u.username)}" style="color:white;text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
+                <td><a href="/user/${escapeHTML(u.username)}" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
                 <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${badges || '<span style="opacity:0.4;">-</span>'}</td>
                 <td style="font-size:0.8em;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${statusReason}</td>
                 <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${u.last_ip ? escapeHTML(u.last_ip) : '<span style="opacity:0.3;">-</span>'}${ipBtn}</td>
@@ -4750,7 +4750,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <div class="panel" style="border-color:rgba(255,255,255,0.2);">
         <h2>Registration Gate</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, new signups are created banned pending activation and admins get pinged (Activations group chat + DM) to manually activate them. When <strong>OFF</strong>, registration is fully open - new accounts are created active immediately, with no pings.</p>
-        <p style="margin-top:10px;">Status: <span id="reg-gate-status">${registrationGateEnabled ? '<span style="color:rgb(80,255,160);font-weight:700;">ON</span>' : '<span style="color:rgb(255,80,80);font-weight:700;">OFF</span>'}</span></p>
+        <p style="margin-top:10px;">Status: <span id="reg-gate-status">${registrationGateEnabled ? '<span style="color:var(--success-color);font-weight:700;">ON</span>' : '<span style="color:var(--danger-color);font-weight:700;">OFF</span>'}</span></p>
         ${req.isHeadAdmin ? `
         <div class="action-row">
             <button class="button" onclick="toggleRegistrationGate(true)" style="width:100px;">Turn ON</button>
@@ -4777,7 +4777,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     </div>
 
     <div class="panel" style="border-color:rgba(255,255,255,0.2);">
-        <h2 style="color:rgba(255, 255, 255, 0.8);">IP Ban / Unban</h2>
+        <h2 style="color:var(--text-dim-color);">IP Ban / Unban</h2>
         <label>IP Address</label>
         <input style="border-radius: 20px; height: 30px;" type="text" id="target-ip" placeholder="e.g. 192.168.1.1" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
@@ -4794,7 +4794,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     </div>
 
     <div class="panel" style="rgba(255,255,255,0.2);">
-        <h2 style="color:rgba(255, 255, 255, 0.8);">Banned IPs</h2>
+        <h2 style="color:var(--text-dim-color);">Banned IPs</h2>
         <table>
             <thead><tr><th>IP Address</th><th>Reason</th><th>Banned By</th><th></th></tr></thead>
             <tbody id="ip-ban-table">
@@ -4804,7 +4804,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     </div>
 
     <div class="panel" style="border-color:rgba(255,255,255,0.2;">
-        <h2 style="color:rgb(255, 255, 255, 0.8);">Delete Account</h2>
+        <h2 style="color:var(--text-dim-color);">Delete Account</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Does not remove the account from the database. Resets the avatar to the default, sets the display name to "Account Deleted", clears the bio, marks the account as deleted, and deletes all of its posts. The username is kept.</p>
         <label>Username</label>
         <input style="border-radius: 20px; height: 30px;" type="text" id="delete-username" placeholder="e.g. testuser" autocomplete="off">
@@ -4816,7 +4816,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="delete-result"></div>
         ${req.isHeadAdmin ? `
         <hr style="border-color:rgba(255,80,80,0.3);margin:18px 0;">
-        <h3 style="color:rgb(255, 0, 0);margin-bottom:4px;">Delete From Database</h3>
+        <h3 style="color:var(--danger-strong-color);margin-bottom:4px;">Delete From Database</h3>
         <p style="opacity:0.6;font-size:0.8em;margin-top:-2px;">Permanently erases the account and everything tied to it - posts, DMs, group chat messages/memberships, follows, friends, friend requests, and notifications. This cannot be undone and the username becomes available again. Head Admin / Owner only.</p>
         <label>Username</label>
         <input style="border-radius: 20px; height: 30px;" type="text" id="hard-delete-username" placeholder="e.g. testuser" autocomplete="off">
@@ -4919,8 +4919,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const d = await r.json();
             if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
             document.getElementById('reg-gate-status').innerHTML = d.enabled
-                ? '<span style="color:rgb(80,255,160);font-weight:700;">ON</span>'
-                : '<span style="color:rgb(255,80,80);font-weight:700;">OFF</span>';
+                ? '<span style="color:var(--success-color);font-weight:700;">ON</span>'
+                : '<span style="color:var(--danger-color);font-weight:700;">OFF</span>';
             result.className = 'ok'; result.textContent = 'Saved.';
             setTimeout(() => { result.textContent = ''; }, 1500);
         } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
@@ -5612,23 +5612,23 @@ function renderGCMessageBubble(m, me, replyMsg) {
     const fileHTML = renderAttachmentsHTML(getAttachments(m), 260, '260px');
     const { embedHTML, cleanText } = renderEmbeds(m.content || '');
     const replyBanner = replyMsg
-        ? `<div style="font-size:0.78em;opacity:0.6;border-left:3px solid white;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
+        ? `<div class="msg-reply-banner" style="font-size:0.78em;opacity:0.6;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
         : '';
     const avatarHTML = renderAvatarHTML(m.avatar_path, m.from_user, 28);
     const senderLabel = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
         <a href="/user/${escapeHTML(m.from_user)}" style="flex-shrink:0;">${avatarHTML}</a>
-        <a href="/user/${escapeHTML(m.from_user)}" style="color:${mine ? 'white' : 'rgb(0,191,255)'};text-decoration:none;font-weight:700;font-size:0.75em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
+        <a href="/user/${escapeHTML(m.from_user)}" class="${mine ? 'msg-sender-mine' : 'msg-sender-other'}" style="text-decoration:none;font-weight:700;font-size:0.75em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
     </div>`;
-    const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" style="color:rgb(255,90,90);text-decoration:none;">Delete</a>` : '';
+    const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
-        <div style="max-width:70%;background:${mine ? 'rgba(0,191,255,0.15)' : 'rgba(255,255,255,0.08)'};border:1px solid ${mine ? 'rgba(0,191,255,0.4)' : 'rgba(255,255,255,0.2)'};border-radius:12px;padding:8px 12px;">
+        <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderLabel}
             ${replyBanner}
             <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
-                <a href="#" onclick="setGCReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" style="color:rgb(0,191,255);text-decoration:none;">Reply</a>
+                <a href="#" onclick="setGCReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
                 ${deleteLink}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
@@ -5649,7 +5649,7 @@ app.get('/groups', (req, res) => {
         const groupsHTML = (groups || []).map(g => `
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
                 <div>
-                    <a href="/groups/${g.id}" style="color:white;text-decoration:none;font-weight:bold;font-size:1.05em;">${escapeHTML(g.name)}</a>
+                    <a href="/groups/${g.id}" style="color:var(--text-color);text-decoration:none;font-weight:bold;font-size:1.05em;">${escapeHTML(g.name)}</a>
                     <div style="font-size:0.8em;opacity:0.5;margin-top:3px;">${escapeHTML(g.members_list || '')}</div>
                 </div>
                 <a href="/groups/${g.id}" class="button" style="padding:8px 16px;text-decoration:none;white-space:nowrap;">Open</a>
@@ -5688,7 +5688,7 @@ app.get('/groups', (req, res) => {
             <div id="friends-picker-list"><p style="opacity:0.4;text-align:center;">Loading…</p></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button class="button" onclick="closeFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;">Cancel</button>
-                <button class="button" onclick="confirmFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;background:rgba(0, 0, 0, 0.15);border-color:rgb(255, 255, 255);color:rgb(255, 255, 255);">Done</button>
+                <button class="button" onclick="confirmFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;background:rgba(0, 0, 0, 0.15);border-color:rgb(255, 255, 255);color:var(--text-color);">Done</button>
             </div>
         </div>
     </div>
@@ -5728,7 +5728,7 @@ app.get('/groups', (req, res) => {
         function openFriendsPicker() {
             if (!allFriends.length) {
                 const result = document.getElementById('gc-create-result');
-                result.style.color = 'rgb(255,80,80)';
+                result.style.color = 'var(--danger-color)';
                 result.textContent = 'You have no friends to add yet.';
                 return;
             }
@@ -5783,15 +5783,15 @@ app.get('/groups', (req, res) => {
             const name = document.getElementById('gc-name').value.trim();
             const members = [...selectedFriends];
             const result = document.getElementById('gc-create-result');
-            if (!name) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Group name is required.'; return; }
-            if (!members.length) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Add at least one friend.'; return; }
-            result.style.color = 'white'; result.textContent = 'Creating...';
+            if (!name) { result.style.color = 'var(--danger-color)'; result.textContent = 'Group name is required.'; return; }
+            if (!members.length) { result.style.color = 'var(--danger-color)'; result.textContent = 'Add at least one friend.'; return; }
+            result.style.color = 'var(--text-color)'; result.textContent = 'Creating...';
             try {
                 const r = await fetch('/groups/create', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ name, members }) });
                 const d = await r.json();
-                if (!r.ok) { result.style.color = 'rgb(255,80,80)'; result.textContent = d.error || 'Error creating group.'; }
+                if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error creating group.'; }
                 else { window.location.href = '/groups/' + d.id; }
-            } catch(e) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Network error.'; }
+            } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
         document.getElementById('friends-picker-modal').addEventListener('click', function(e) {
@@ -5933,8 +5933,8 @@ app.get('/groups/:id', (req, res) => {
                     const isCreator = group.created_by === me;
                     const membersListHTML = (members || []).map(mbr =>
                         `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);border-radius:20px;padding:3px 10px;font-size:0.82em;">
-                            <a href="/user/${escapeHTML(mbr.username)}" style="color:white;text-decoration:none;">${escapeHTML(mbr.username)}</a>
-                            ${isCreator && mbr.username !== me ? `<button onclick="kickMember('${escapeHTML(mbr.username)}')" title="Kick ${escapeHTML(mbr.username)}" style="background:none;border:none;color:rgb(255,80,80);cursor:pointer;font-size:0.9em;padding:0 2px;line-height:1;" aria-label="Kick ${escapeHTML(mbr.username)}">✕</button>` : ''}
+                            <a href="/user/${escapeHTML(mbr.username)}" style="color:var(--text-color);text-decoration:none;">${escapeHTML(mbr.username)}</a>
+                            ${isCreator && mbr.username !== me ? `<button onclick="kickMember('${escapeHTML(mbr.username)}')" title="Kick ${escapeHTML(mbr.username)}" style="background:none;border:none;color:var(--danger-color);cursor:pointer;font-size:0.9em;padding:0 2px;line-height:1;" aria-label="Kick ${escapeHTML(mbr.username)}">✕</button>` : ''}
                         </span>`).join('');
 
                     res.send(`<!DOCTYPE html>
@@ -5970,7 +5970,7 @@ app.get('/groups/:id', (req, res) => {
         ${membersListHTML}
         <div id="add-member-row">
             <button class="button" onclick="openGCAddPicker()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;box-sizing: border-box !important;">+ Add Friends</button>
-            <button class="button gc-action-btn" onclick="leaveGroup()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;border-color:rgb(255,80,80);color:rgb(255,80,80);" id="leave-gc-btn">Leave</button>
+            <button class="button gc-action-btn" onclick="leaveGroup()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;border-color:rgb(255,80,80);color:var(--danger-color);" id="leave-gc-btn">Leave</button>
             <span id="add-member-result" style="font-size:0.8em;"></span>
         </div>
     </div>
@@ -5987,7 +5987,7 @@ app.get('/groups/:id', (req, res) => {
         ${msgsHTML || '<p id="gc-empty-placeholder" style="text-align:center;opacity:0.4;">No messages yet. Say hi!</p>'}
     </div>
     <div id="gc-chat-input-bar">
-        <div id="gc-reply-indicator">Replying to <span id="gc-reply-to-name"></span> &nbsp;<a href="#" onclick="clearGCReply();return false;" style="color:rgb(0,191,255);">cancel</a></div>
+        <div id="gc-reply-indicator">Replying to <span id="gc-reply-to-name"></span> &nbsp;<a href="#" onclick="clearGCReply();return false;" style="color:var(--accent-color);">cancel</a></div>
         <form action="/groups/${groupId}/send" method="POST" enctype="multipart/form-data" id="gc-form">
             <input type="hidden" name="reply_to" id="gc-reply-to-input" value="">
             <div id="gc-form-row">
@@ -6000,7 +6000,7 @@ app.get('/groups/:id', (req, res) => {
             <div id="gc-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 4000</div>
         </form>
     </div>
-    <div id="gc-conn-indicator" style="position:fixed;top:54px;left:50%;transform:translateX(-50%);background:rgba(255,170,0,0.9);color:black;padding:4px 14px;border-radius:0 0 8px 8px;font-size:0.78em;font-weight:600;z-index:99;display:none;">Reconnecting…</div>
+    <div id="gc-conn-indicator" style="position:fixed;top:54px;left:50%;transform:translateX(-50%);background:rgba(255,170,0,0.9);color:var(--on-warning-color);padding:4px 14px;border-radius:0 0 8px 8px;font-size:0.78em;font-weight:600;z-index:99;display:none;">Reconnecting…</div>
     <script>
         document.querySelectorAll('[data-ts]').forEach(el => {
             const ts = el.getAttribute('data-ts');
@@ -6072,7 +6072,7 @@ app.get('/groups/:id', (req, res) => {
         gcContent.addEventListener('input', function () {
             const len = this.value.length;
             gcCounter.textContent = len + ' / 4000';
-            gcCounter.style.color = len > 3800 ? (len >= 4000 ? 'rgb(255,80,80)' : 'orange') : '';
+            gcCounter.style.color = len > 3800 ? (len >= 4000 ? 'var(--danger-color)' : 'var(--warning-color)') : '';
             gcCounter.style.opacity = len > 3800 ? '1' : '0.5';
         });
         gcContent.addEventListener('keydown', function(e) {
@@ -6101,7 +6101,7 @@ app.get('/groups/:id', (req, res) => {
         function showGCError(message) {
             const t = document.createElement('div');
             t.textContent = message;
-            t.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            t.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
         }
@@ -6141,13 +6141,13 @@ app.get('/groups/:id', (req, res) => {
         async function addMember(username) {
             const result = document.getElementById('add-member-result');
             if (!username) return;
-            result.style.color = 'white'; result.textContent = 'Adding...';
+            result.style.color = 'var(--text-color)'; result.textContent = 'Adding...';
             try {
                 const r = await fetch('/groups/${groupId}/add-member', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username }) });
                 const d = await r.json();
-                if (!r.ok) { result.style.color = 'rgb(255,80,80)'; result.textContent = d.error || 'Error.'; }
-                else { result.style.color = 'rgb(0,191,255)'; result.textContent = username + ' added!'; setTimeout(() => { result.textContent = ''; location.reload(); }, 900); }
-            } catch(e) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Network error.'; }
+                if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error.'; }
+                else { result.style.color = 'var(--accent-color)'; result.textContent = username + ' added!'; setTimeout(() => { result.textContent = ''; location.reload(); }, 900); }
+            } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
         let gcAddAllFriends = [];
@@ -6163,7 +6163,7 @@ app.get('/groups/:id', (req, res) => {
         function openGCAddPicker() {
             if (!gcAddAllFriends.length) {
                 const result = document.getElementById('add-member-result');
-                result.style.color = 'rgb(255,80,80)'; result.textContent = 'You have no friends to add.';
+                result.style.color = 'var(--danger-color)'; result.textContent = 'You have no friends to add.';
                 return;
             }
             document.getElementById('gc-add-picker-search').value = '';
@@ -6196,25 +6196,25 @@ app.get('/groups/:id', (req, res) => {
         async function leaveGroup() {
             if (!confirm('Are you sure you want to leave this group?')) return;
             const result = document.getElementById('add-member-result');
-            result.style.color = 'white'; result.textContent = 'Leaving...';
+            result.style.color = 'var(--text-color)'; result.textContent = 'Leaving...';
             try {
                 const r = await fetch('/groups/${groupId}/leave', { method: 'POST' });
                 const d = await r.json();
-                if (!r.ok) { result.style.color = 'rgb(255,80,80)'; result.textContent = d.error || 'Error leaving group.'; }
+                if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error leaving group.'; }
                 else { window.location.href = '/groups'; }
-            } catch(e) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Network error.'; }
+            } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
         async function kickMember(username) {
             if (!confirm('Kick ' + username + ' from this group?')) return;
             const result = document.getElementById('add-member-result');
-            result.style.color = 'white'; result.textContent = 'Kicking ' + username + '...';
+            result.style.color = 'var(--text-color)'; result.textContent = 'Kicking ' + username + '...';
             try {
                 const r = await fetch('/groups/${groupId}/kick/' + encodeURIComponent(username), { method: 'POST' });
                 const d = await r.json();
-                if (!r.ok) { result.style.color = 'rgb(255,80,80)'; result.textContent = d.error || 'Error.'; }
-                else { result.style.color = 'rgb(0,191,255)'; result.textContent = username + ' kicked!'; setTimeout(() => { result.textContent = ''; location.reload(); }, 900); }
-            } catch(e) { result.style.color = 'rgb(255,80,80)'; result.textContent = 'Network error.'; }
+                if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error.'; }
+                else { result.style.color = 'var(--accent-color)'; result.textContent = username + ' kicked!'; setTimeout(() => { result.textContent = ''; location.reload(); }, 900); }
+            } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
         document.getElementById('gc-add-picker-modal').addEventListener('click', function(e) {

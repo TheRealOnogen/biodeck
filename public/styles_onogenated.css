@@ -1455,8 +1455,8 @@ body.page-chat .chat-action-btn {
   transition: 0.2s;
 }
 body.page-chat .chat-action-btn:hover {
-  background-color: white;
-  color: rgb(0, 17, 41);
+  background-color: rgb(0, 41, 99);
+  color: white;
 }
 body.page-chat .chat-action-btn.clicked {
   background-color: rgb(0, 17, 41) !important;

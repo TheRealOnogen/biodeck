@@ -2457,8 +2457,8 @@ app.get('/feed', (req, res) => {
                 <div id="post-form-row">
                     <textarea class="box" name="content" id="post-content" placeholder="What's on your mind?" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
-                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
-                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Post</button>
+                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
+                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Post</button>
                 </div>
                 <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
@@ -3692,7 +3692,7 @@ app.get('/friends', (req, res) => {
                 const friendsHTML = (friends || []).map(f =>
                     renderUserRow(f.friend_username, f.avatar_path,
                         `<a href="/messages/${escapeHTML(f.friend_username)}" class="button" style="padding:6px 12px;text-decoration:none;font-size:0.85em;">Message</a>
-                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);">Unfriend</button>`)
+                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;height:44px;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);">Unfriend</button>`)
                 ).join('');
 
                 const incomingHTML = (incoming || []).map(r =>

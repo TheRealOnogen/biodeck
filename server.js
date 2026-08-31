@@ -1935,16 +1935,8 @@ app.get('/edit', (req, res) => {
 <title>Dashboard</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; display: flex; justify-content: center; align-items: flex-start; min-height: 100vh; padding: 40px 0; box-sizing: border-box; }
-    .dashboard-box { color: white; width: 500px; padding: 30px; text-align: center; }
-    .dash-field { margin: 12px 0; text-align: left; }
-    .dash-field label { display: block; margin-bottom: 4px; font-size: 0.9em; opacity: 0.7; }
-    .dash-textarea { width: 100%; box-sizing: border-box; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; resize: vertical; min-height: 80px; }
-    .dash-links { margin-top: 20px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
-</style>
 </head>
-<body>
+<body class="page-edit">
     <div class="box dashboard-box">
         <h1>Dashboard</h1>
         <p style="opacity:0.6;">@${req.session.userUsername}</p>
@@ -2312,65 +2304,8 @@ app.get('/feed', (req, res) => {
 <title>Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-    #feed-wrapper { display: flex; flex-direction: column; height: 100vh; width: 100vw; box-sizing: border-box; border-radius: 0; border: none; }
-    #feed-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #feed-topbar-left { font-size: 0.95em; white-space: nowrap; }
-    #feed-topbar-right a { color: rgb(0,191,255); margin-left: 15px; text-decoration: none; white-space: nowrap; }
-    #feed-topbar-right a:hover { text-decoration: underline; }
-    #feed-search-bar { position: absolute; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 6px; }
-    #feed-search-input { text-align: left; align-items: center; width: 300px; max-width: 300px; box-sizing: border-box; }
-    @media (max-width: 900px) { #feed-search-input { width: 200px; max-width: 200px; } }
-    @media (max-width: 600px) { #feed-search-input { width: 130px; max-width: 130px; } }
-    @media (max-width: 420px) { #feed-search-input { width: 100px; max-width: 100px; } }
-    #feed-search-input:focus { border-color: rgb(0,191,255); }
-    #feed-search-input::placeholder { opacity: 0.5; }
-    #feed-topbar-right a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 2100px) {
-        #feed-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-        #feed-search-bar { position: static; transform: none; flex: 1; justify-content: center; }
-    }
-    #feed-search-clear { background: none; border: none; color: rgba(255,255,255,0.5); font-size: 1em; cursor: pointer; padding: 2px 6px; line-height: 1; }
-    #feed-search-clear:hover { color: white; }
-    #feed-search-results { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: black; z-index: 98; overflow-y: auto; padding: 80px 20px 20px; color: white; }
-    #feed-search-results .post { max-width: 600px; margin: 0 auto; text-align: left; }
-    #feed-search-no-results { text-align: center; opacity: 0.5; margin-top: 40px; }
-    #pinned-bar { position: fixed; left: 0; right: 0; z-index: 99; display: flex; flex-direction: column; background: black; max-height: 35vh; overflow-y: auto; border-bottom: 2px solid rgba(255,180,40,0.4); }
-    .pinned-item a:hover { text-decoration: underline; }
-    #posts { flex: 1; overflow-y: auto; padding: 70px 20px 130px 20px; text-align: center; }
-    #post-form-container { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
-    #reply-indicator { font-size: 0.85em; opacity: 0.7; display: none; margin-bottom: 6px; text-align: center; }
-    #post-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
-    #post-form-row textarea { text-align: left; flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
-    #file-name-display { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
-    .post { max-width: 600px; margin: 0 auto; text-align: left; }
-    .post-actions { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
-    .post-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: 0.2s;
-    }
-    .post-action-btn:hover {
-    background-color: white;
-    color: black;
-    }
-    .post-action-btn.clicked {
-        background-color: black !important;
-        color: white !important;
-    }
-</style>
 </head>
-<body>
+<body class="page-feed">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
@@ -2919,38 +2854,8 @@ app.get('/following-feed', (req, res) => {
 <title>Following Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-    #feed-wrapper { display: flex; flex-direction: column; height: 100vh; width: 100vw; box-sizing: border-box; border-radius: 0; border: none; }
-    #feed-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; gap: 12px; }
-    #feed-topbar-left { font-size: 0.95em; white-space: nowrap; }
-    #feed-topbar-right a { color: rgb(0,191,255); margin-left: 15px; text-decoration: none; white-space: nowrap; }
-    #feed-topbar-right a:hover { text-decoration: underline; }
-    #feed-topbar-right a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 1200px) {
-        #feed-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #posts { flex: 1; overflow-y: auto; padding: 70px 20px 130px 20px; text-align: center; }
-    #post-form-container { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
-    #reply-indicator { font-size: 0.85em; opacity: 0.7; display: none; margin-bottom: 6px; text-align: center; }
-    #post-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
-    #post-form-row textarea { text-align: left; flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
-    #file-name-display { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
-    .post { max-width: 600px; margin: 0 auto; text-align: left; }
-    .post-actions { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
-    .post-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: 0.2s; }
-    .post-action-btn:hover { background-color: white; color: black; }
-    .post-action-btn.clicked { background-color: black !important; color: white !important; }
-</style>
 </head>
-<body>
+<body class="page-following-feed">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${sessionUsername}</strong></div>
@@ -3272,53 +3177,8 @@ app.get('/post/:id', (req, res) => {
 <title>Post</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; overflow: hidden; display: flex; flex-direction: column; height: 100vh; }
-    #feed-wrapper { display: flex; flex-direction: column; height: 100vh; width: 100vw; box-sizing: border-box; border-radius: 0; border: none; }
-    #feed-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #feed-topbar-left { font-size: 0.95em; }
-    #feed-topbar-right { position: relative; display: flex; align-items: center; }
-    #feed-topbar-right a { color: rgb(0,191,255); margin-left: 15px; text-decoration: none; }
-    #feed-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #feed-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #posts { flex: 1; overflow-y: auto; padding: 70px 20px 130px 20px; text-align: center; }
-    #post-form-container { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
-    #post-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
-    #post-form-row textarea { text-align: left;  flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
-    #file-name-display { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
-    .post { max-width: 600px; margin: 0 auto; text-align: left; }
-    .post-actions { margin-top: 6px; display: flex; align-items: center; gap: 8px; }
-    .post-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    transition: 0.2s;
-    }
-    .post-action-btn:hover {
-    background-color: white;
-    color: black;
-    }
-    .post-action-btn.clicked {
-        background-color: black !important;
-        color: white !important;
-    }
-    #thread-root { max-width: 600px; margin: 0 auto; text-align: left; }
-    .reply-context { font-size: 0.8em; opacity: 0.6; margin-bottom: 6px; }
-    #thread-divider { max-width: 600px; margin: 16px auto 18px; display: flex; align-items: center; gap: 10px; }
-    #thread-divider .line { flex: 1; height: 1px; background: rgba(255,255,255,0.2); }
-    #thread-divider span { font-size: 0.75em; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.5; flex-shrink: 0; }
-</style>
 </head>
-<body>
+<body class="page-post">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
@@ -3750,27 +3610,8 @@ app.get('/friends', (req, res) => {
 <title>Friends</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; }
-    #friends-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #friends-topbar-left { font-size: 0.95em; }
-    #friends-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #friends-topbar-right a:hover { text-decoration: underline; }
-    #friends-content { max-width: 600px; margin: 80px auto 40px; padding: 0 20px; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #friends-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    .section-title { font-size: 1.1em; font-weight: 700; margin: 28px 0 8px; opacity: 0.9; }
-    .badge { display: inline-block; background: rgb(0,191,255); color: black; border-radius: 10px; font-size: 0.7em; font-weight: 700; padding: 1px 7px; margin-left: 6px; vertical-align: middle; }
-</style>
 </head>
-<body>
+<body class="page-friends">
     <div id="friends-topbar">
             <div id="friends-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
             <div id="friends-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -3898,26 +3739,8 @@ app.get('/followers', (req, res) => {
 <title>Followers</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; }
-    #followers-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #followers-topbar-left { font-size: 0.95em; }
-    #followers-topbar-right { position: relative; display: flex; align-items: center; }
-    #followers-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #followers-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #followers-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #followers-list { max-width: 600px; width: 100%; margin: 80px auto 40px; padding: 0 20px; box-sizing: border-box; }
-</style>
 </head>
-<body>
+<body class="page-followers">
     <div id="followers-topbar">
         <div id="followers-topbar-left">Logged in as <strong>${me}</strong></div>
         <div id="followers-topbar-right">
@@ -4012,31 +3835,8 @@ app.get('/user/:username', (req, res) => {
 <title>${escapeHTML(user.username)}'s Profile</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; justify-content: flex-start; align-items: stretch; }
-    #profile-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; gap: 12px; }
-    #profile-topbar-left { font-size: 0.95em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-    #profile-topbar-right { position: relative; display: flex; align-items: center; flex-shrink: 0; }
-    #profile-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; white-space: nowrap; }
-    #profile-topbar-right a:hover { text-decoration: underline; }
-    #profile-nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #profile-nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #profile-nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #profile-nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #profile-nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #profile-topbar-right > a { display: none; }
-        #profile-nav-hamburger { display: inline-block; }
-    }
-    #profile-header { width: min(550px, 80vw); margin: 80px auto 0; padding: 0 20px; text-align: center; box-sizing: border-box; }
-    #profile-bio { opacity: 0.75; margin: 8px 0 20px; white-space: pre-wrap; }
-    #profile-posts { width: min(550px, 80vw); margin: 20px auto; padding: 0 20px 40px; overflow-x: hidden; box-sizing: border-box; }
-    #profile-posts img { max-width: 100%; max-height: 550px; }
-    .post { width: 100%; box-sizing: border-box; overflow-x: hidden; word-break: break-word; overflow-wrap: anywhere; }
-    .post-time { font-size: 0.8em; opacity: 0.6; }
-</style>
 </head>
-<body>
+<body class="page-profile">
     <div id="profile-topbar">
         <div id="profile-topbar-left">Logged in as <strong>${sessionUsername}</strong></div>
         <div id="profile-topbar-right">
@@ -4183,26 +3983,8 @@ app.get('/messages', (req, res) => {
 <title>Messages</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; justify-content: flex-start; align-items: stretch; }
-    #msg-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #msg-topbar-left { font-size: 0.95em; }
-    #msg-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #msg-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #msg-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #inbox { max-width: 600px; width: 100%; margin: 80px auto 40px; padding: 0 20px; box-sizing: border-box; }
-    #inbox h2 { margin-bottom: 20px; }
-</style>
 </head>
-<body>
+<body class="page-messages">
     <div id="msg-topbar">
         <div id="msg-topbar-left">Logged in as <strong>${me}</strong></div>
         <div id="msg-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -4270,45 +4052,8 @@ app.get('/messages/:username', (req, res) => {
 <title>Chat with ${other}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; justify-content: flex-start; align-items: stretch; }
-    #chat-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; flex-shrink: 0; }
-    #chat-topbar-left { font-size: 0.95em; }
-    #chat-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #chat-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #chat-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #chat-messages { flex: 1; overflow-y: auto; padding: 70px 20px 130px 20px; max-width: 700px; width: 100%; margin: 0 auto; box-sizing: border-box; }
-    #chat-input-bar { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
-    #chat-reply-indicator { font-size: 0.85em; opacity: 0.7; display: none; margin-bottom: 6px; text-align: center; }
-    #chat-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
-    #chat-form-row textarea { text-align: left; flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
-    #chat-file-name { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
-    .chat-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black;
-    cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    animation: slideInFromUp 1s ease-out forwards;  
-    transition: 0.2s;}
-    .chat-action-btn:hover {
-    background-color: white;
-    color: black;
-    }
-    .chat-action-btn.clicked {
-        background-color: black !important;
-        color: white !important;
-    }
-</style>
 </head>
-<body>
+<body class="page-chat">
     <div id="chat-topbar">
         <div id="chat-topbar-left">Chat with <strong><a href="/user/${other}" style="color:white;text-decoration:none;">@${other}</a></strong></div>
         <div id="chat-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -4616,30 +4361,8 @@ app.get('/notifications', (req, res) => {
 <title>Notifications</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; justify-content: flex-start; align-items: stretch; }
-    #notif-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #notif-topbar-left { font-size: 0.95em; }
-    #notif-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #notif-topbar-right a:hover { text-decoration: underline; }
-    #notif-topbar-right a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown a.active { color: white; font-weight: bold; pointer-events: none; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #notif-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #notif-list { max-width: 600px; width: 100%; margin: 80px auto 40px; padding: 0 20px; box-sizing: border-box; }
-    #notif-list h2 { margin-bottom: 20px; }
-    .notif-item:hover { background: rgba(255,255,255,0.06) !important; }
-    .active-filter { background: white !important; color: black !important; }
-</style>
 </head>
-<body>
+<body class="page-notifications">
     <div id="notif-topbar">
         <div id="notif-topbar-left">Logged in as <strong>${me}</strong></div>
         <div id="notif-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -4892,52 +4615,15 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             }).join('');
 
         res.send(`<!DOCTYPE html>
-<html lang="en">
+<html lang="en" class="page-admin">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Admin Dashboard</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    html, body { display: block !important; height: auto !important; min-height: 100vh; margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; }
-    #topbar { position: fixed; top: 0; left: 0; right: 0; display: flex !important; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #topbar a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #topbar a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #content { max-width: 700px; width: 100%; margin: 0 auto; padding: 70px 20px 60px; box-sizing: border-box; }
-    h1 { margin-bottom: 4px; }
-    .panel { border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; padding: 20px; margin-bottom: 24px; }
-    .panel h2 { margin: 0 0 16px; font-size: 1em; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.6; style="color:rgba(255, 255, 255, 0.8);"; }
-    label { display: block; font-size: 0.85em; opacity: 0.7; margin-bottom: 4px; margin-top: 12px; }
-    input[type=text], textarea, select {
-        width: 100%; box-sizing: border-box; background: black; color: white;
-        border: 2px solid white; border-radius: 8px; padding: 8px 10px;
-        font-family: inherit; font-size: inherit;
-    }
-    input[type=text]:focus, textarea:focus, select:focus { border-color: rgb(0,191,255); outline: none; }
-    .action-row { display: flex; gap: 10px; margin-top: 16px; }
-    #result { margin-top: 12px; font-size: 0.9em; min-height: 1.2em; }
-    #result.ok { color: rgb(80,255,160); }
-    #result.err { color: rgb(255,80,80); }
-    #ip-result { margin-top: 12px; font-size: 0.9em; min-height: 1.2em; }
-    #ip-result.ok { color: rgb(80,255,160); }
-    #ip-result.err { color: rgb(255,80,80); }
-    table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
-    th { text-align: left; opacity: 0.5; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.15); }
-    td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,0.07); vertical-align: middle; }
-    tr:last-child td { border-bottom: none; }
-</style>
 </head>
-<body>
+<body class="page-admin">
 <div id="topbar">
     <strong>Admin Dashboard</strong>
     <div id="topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -5482,7 +5168,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             dropdown.classList.remove('open');
             btn.textContent = '☰';
         }
-    }); 
+    });
 </script>
 
 </body>
@@ -5775,7 +5461,7 @@ app.post('/admin/badges/:username', requireAdmin, (req, res) => {
     // Only an existing Owner can grant or revoke the Admin and Owner badges -
     // otherwise any admin could hand out admin (or owner) access to anyone.
     if (req.isHeadAdmin) {
-        if (typeof IsAdmin !== 'undefined') { fields.push('IsAdmin = ?'); values.push(IsAdmin ? 1 : 0); }  
+        if (typeof IsAdmin !== 'undefined') { fields.push('IsAdmin = ?'); values.push(IsAdmin ? 1 : 0); }
     }
     if (req.isOwner) {
         if (typeof IsHeadAdmin !== 'undefined') { fields.push('IsHeadAdmin = ?'); values.push(IsHeadAdmin ? 1 : 0); }
@@ -5872,43 +5558,8 @@ app.get('/groups', (req, res) => {
 <title>Group Chats</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; min-height: 100vh; }
-    #gc-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; }
-    #gc-topbar-right { position: relative; display: flex; align-items: center; }
-    #gc-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #gc-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #gc-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #gc-body { max-width: 600px; margin: 70px auto 0; padding: 24px 20px; }
-    #create-gc-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 32px; padding: 16px; border: 1px solid rgba(255,255,255,0.2); border-radius: 12px; }
-    #create-gc-form input { background: black; color: white; border: 2px solid white; border-radius: 8px; padding: 8px 12px; font-family: inherit; font-size: 0.95em; }
-    #friends-picker-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center; }
-    #friends-picker-modal.open { display:flex; }
-    #friends-picker-box { background: black; border:2px solid white; border-radius:14px; padding:24px; width:340px; max-width:90vw; max-height:80vh; display:flex; flex-direction:column; gap:12px; }
-    #friends-picker-list { overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:8px; }
-    .friend-pick-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid rgba(255,255,255,0.15); border-radius:8px; cursor:pointer; transition:background 0.15s; }
-    .friend-pick-row:hover { background:rgba(255,255,255,0.07); }
-    .friend-pick-row input[type=checkbox] { width:16px; height:16px; accent-color:rgb(0,191,255); flex-shrink:0; cursor:pointer; }
-    #friends-picker-search { background:black; color:white; border:2px solid white; border-radius:8px; padding:6px 10px; font-family:inherit; font-size:0.9em; width:100%; box-sizing:border-box; }
-    #gc-selected-tags { display:flex; flex-wrap:wrap; gap:6px; min-height:28px; }
-    .gc-tag { background:rgba(0,191,255,0.18); border:1px solid rgba(0,191,255,0.5); border-radius:20px; padding:3px 10px; font-size:0.82em; display:flex; align-items:center; gap:6px; }
-    .gc-tag button { background:none; border:none; color:rgb(0,191,255); cursor:pointer; font-size:1em; padding:0; line-height:1; }
-    #gc-add-picker-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center; }
-    #gc-add-picker-modal.open { display:flex; }
-    #gc-add-picker-box { background: black; border:2px solid white; border-radius:14px; padding:24px; width:340px; max-width:90vw; max-height:80vh; display:flex; flex-direction:column; gap:12px; }
-    #gc-add-picker-list { overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:8px; }
-    #gc-add-picker-search { background:black; color:white; border:2px solid white; border-radius:8px; padding:6px 10px; font-family:inherit; font-size:0.9em; width:100%; box-sizing:border-box; }
-</style>
 </head>
-<body>
+<body class="page-groups">
     <div id="gc-topbar">
         <div>Group Chats</div>
         <div id="gc-topbar-right">
@@ -6189,43 +5840,8 @@ app.get('/groups/:id', (req, res) => {
 <title>${escapeHTML(group.name)}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/styles.css">
-<style>
-    body { margin: 0; background: black; color: white; font-family: 'Quicksand', sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-    #gc-chat-topbar { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between; align-items: center; padding: 10px 20px; background: black; border-bottom: 2px solid white; z-index: 100; gap: 12px; }
-    #gc-chat-topbar-right { position: relative; display: flex; align-items: center; }
-    #gc-chat-topbar-right a { color: rgb(0,191,255); text-decoration: none; margin-left: 15px; }
-    #gc-chat-topbar-right a:hover { text-decoration: underline; }
-    #nav-hamburger { display: none; background: none; border: 2px solid white; border-radius: 6px; color: white; font-size: 1.1em; cursor: pointer; padding: 4px 8px; line-height: 1; margin-left: 10px; }
-    #nav-dropdown { display: none; flex-direction: column; position: absolute; top: 100%; right: 0; background: black; border: 2px solid white; border-radius: 10px; padding: 8px 0; min-width: 160px; z-index: 200; }
-    #nav-dropdown a { display: block; color: rgb(0,191,255); text-decoration: none; padding: 8px 18px; white-space: nowrap; margin: 0; }
-    #nav-dropdown a:hover { background: rgba(255,255,255,0.08); text-decoration: underline; }
-    #nav-dropdown.open { display: flex; }
-    @media (max-width: 600px) {
-        #gc-chat-topbar-right > a { display: none; }
-        #nav-hamburger { display: inline-block; }
-    }
-    #gc-members-bar { position: fixed; top: 40px; left: 0; right: 0; background: black; border-bottom: 1px solid rgba(0, 0, 0, 0.15); padding: 6px 20px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; z-index: 99; font-size: 0.82em; }
-    #gc-chat-messages { flex: 1; overflow-y: auto; padding: 110px 20px 130px 20px; max-width: 700px; width: 100%; margin: 0 auto; box-sizing: border-box; }
-    #gc-chat-input-bar { position: fixed; bottom: 0; left: 0; right: 0; background: black; border-top: 2px solid white; padding: 10px 20px; z-index: 100; }
-    #gc-reply-indicator { font-size: 0.85em; opacity: 0.7; display: none; margin-bottom: 6px; text-align: center; }
-    #gc-form-row { display: flex; align-items: center; gap: 10px; width: 100%; }
-    #gc-form-row textarea { text-align: left; flex: 1; height: 44px; resize: none; min-width: 0; background: black; color: white; border: 2px solid white; border-radius: 10px; padding: 8px; font-family: inherit; font-size: inherit; box-sizing: border-box; }
-    #gc-file-name { font-size: 0.78em; opacity: 0.65; text-align: center; margin-top: 4px; }
-    .gc-action-btn { padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; color: white; background-color: black; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: 0.2s; }
-    .gc-action-btn:hover { background-color: rgba(255, 0, 0, 0.48); color: white; }
-    .gc-action-btn.clicked { background-color: black !important; color: white !important; }
-    #add-member-row { display: flex; gap: 8px; align-items: center; padding: 4px 0; }
-    #gc-add-picker-modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,0.75); z-index:9999; align-items:center; justify-content:center; }
-    #gc-add-picker-modal.open { display:flex; }
-    #gc-add-picker-box { background: black; border:2px solid white; border-radius:14px; padding:24px; width:320px; max-width:90vw; max-height:75vh; display:flex; flex-direction:column; gap:12px; }
-    #gc-add-picker-list { overflow-y:auto; flex:1; display:flex; flex-direction:column; gap:8px; }
-    #gc-add-picker-search { background:black; color:white; border:2px solid white; border-radius:8px; padding:6px 10px; font-family:inherit; font-size:0.9em; width:100%; box-sizing:border-box; }
-    .gc-add-friend-row { display:flex; align-items:center; gap:10px; padding:8px 10px; border:1px solid rgba(255,255,255,0.15); border-radius:8px; cursor:pointer; transition:background 0.15s; justify-content:space-between; }
-    .gc-add-friend-row:hover { background:rgba(255,255,255,0.07); }
-    .gt-action-bttn:hover {
-</style>
 </head>
-<body>
+<body class="page-group-chat">
     <div id="gc-chat-topbar">
         <div style="font-weight:bold;">${escapeHTML(group.name)}</div>
         <div id="gc-chat-topbar-right">

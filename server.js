@@ -642,7 +642,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     const fileHTML = renderAttachmentsHTML(getAttachments(post), fileMaxHeight);
     const isOwner = post.username === sessionUsername;
     const canDelete = isOwner || isAdmin;
-    const deleteBtn = canDelete ? `<button class="button post-action-btn" onclick="deletePost(${post.id})">Delete${(!isOwner && isAdmin) ? ' (Admin)' : ''}</button>` : '';
+    const deleteBtn = canDelete ? `<button class="button post-action-btn" onclick="deletePost(${post.id})">Delete${(!isOwner && isAdmin) ? '' : ''}</button>` : '';
     const pinBtn = isAdmin ? `<button class="button post-action-btn" onclick="${post.pinned ? `unpinPost(${post.id})` : `pinPost(${post.id})`}">${post.pinned ? 'Unpin' : 'Pin'}</button>` : '';
     const safeUsername = escapeHTML(post.username);
     const { embedHTML, cleanText } = renderEmbeds(post.content || '');
@@ -670,7 +670,7 @@ function renderPinnedItem(post) {
     const safeContent = escapeHTML((post.content || '').trim());
     const preview = safeContent.length > 140 ? safeContent.slice(0, 140) + '…' : safeContent;
     const previewHTML = preview || '<span style="opacity:0.5;">(attachment)</span>';
-    return `<div class="pinned-item" data-pin-id="${post.id}" style="display:flex;align-items:center;gap:10px;padding:8px 16px;background:rgba(255,180,40,0.08);border-bottom:1px solid rgba(255,180,40,0.25);">
+    return `<div class="pinned-item" data-pin-id="${post.id}" style="display:flex;align-items:center;gap:10px;padding:8px 24px;background:rgba(255,180,40,0.08);border-bottom:1px solid rgba(255,180,40,0.25);">
         <span style="font-size:0.7em;letter-spacing:0.08em;color:var(--pinned-color);font-weight:700;text-transform:uppercase;flex-shrink:0;">Pinned</span>
         <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex-shrink:0;">${escapeHTML(displayName(post.username, post.Nickname))}</a>
         <span style="opacity:0.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${previewHTML}</span>

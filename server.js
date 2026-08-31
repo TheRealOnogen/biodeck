@@ -16,6 +16,57 @@ const PORT = 3000;
 const uploadsDir = path.join(__dirname, 'public', 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
+// ----- CSS theme switcher -----
+// Themes are declared in themes.json (project root) as an array of
+// { name, displayName, file } objects. `name` is the stable id stored on the
+// user's account, `displayName` is what's shown in the dashboard picker, and
+// `file` is a path to the stylesheet relative to public/. themes.json is
+// re-read whenever it changes on disk (checked via mtime) so an admin can
+// add/edit themes without restarting the server.
+const THEMES_FILE = path.join(__dirname, 'themes.json');
+const FALLBACK_THEME = { name: 'default', displayName: 'Default', file: 'styles.css' };
+let themesCache = null;
+let themesCacheMtimeMs = 0;
+
+function loadThemes() {
+    try {
+        const stat = fs.statSync(THEMES_FILE);
+        if (themesCache && stat.mtimeMs === themesCacheMtimeMs) return themesCache;
+        const parsed = JSON.parse(fs.readFileSync(THEMES_FILE, 'utf8'));
+        if (!Array.isArray(parsed)) throw new Error('themes.json must contain a JSON array');
+        const clean = parsed.filter(t => t && typeof t.name === 'string' && t.name.trim()
+            && typeof t.displayName === 'string' && t.displayName.trim()
+            && typeof t.file === 'string' && t.file.trim());
+        if (!clean.some(t => t.name === 'default')) clean.unshift(FALLBACK_THEME);
+        themesCache = clean;
+        themesCacheMtimeMs = stat.mtimeMs;
+        return clean;
+    } catch (e) {
+        console.error('Failed to load themes.json, falling back to the default theme only:', e.message);
+        return [FALLBACK_THEME];
+    }
+}
+
+function getThemeByName(name) {
+    const themes = loadThemes();
+    return themes.find(t => t.name === name)
+        || themes.find(t => t.name === 'default')
+        || themes[0]
+        || FALLBACK_THEME;
+}
+
+// Resolves a theme's `file` to an absolute path inside public/, refusing to
+// serve anything outside that directory (themes.json is admin-edited, but
+// this keeps a typo or bad entry from turning into a path traversal bug).
+function resolveThemeCSSPath(theme) {
+    const publicDir = path.join(__dirname, 'public');
+    const resolved = path.resolve(publicDir, theme.file);
+    if (resolved !== publicDir && !resolved.startsWith(publicDir + path.sep)) {
+        return path.join(publicDir, FALLBACK_THEME.file);
+    }
+    return resolved;
+}
+
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (!req.session || !req.session.userId) return cb(new Error('Unauthorized'));
@@ -781,6 +832,10 @@ db.serialize(() => {
             db.run(`ALTER TABLE User_Data ADD COLUMN DeleteReason TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN email TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN email_verified INTEGER DEFAULT 0`, () => {});
+            // Selected CSS theme (see themes.json / loadThemes()). Stores the
+            // theme's stable `name`, not its display name, so renaming a
+            // theme's displayName in themes.json doesn't orphan anyone's pick.
+            db.run(`ALTER TABLE User_Data ADD COLUMN theme TEXT DEFAULT 'default'`, () => {});
             // Multiple accounts are now allowed to share the same email address,
             // so this is a plain (non-unique) index, kept only for lookup speed.
             // If an older database still has the unique index from before, drop
@@ -972,6 +1027,26 @@ app.use(session({
     }
 }))
 
+// Serves whichever stylesheet is currently active for the visitor. Every
+// page links to /theme.css instead of a fixed /styles.css so switching
+// themes takes effect everywhere without editing each page's <link> tag.
+// Logged-out visitors (and anyone whose saved theme no longer exists) get
+// the default theme.
+app.get('/theme.css', (req, res) => {
+    res.set('Cache-Control', 'no-cache');
+    const sendTheme = (theme) => {
+        res.sendFile(resolveThemeCSSPath(theme), (err) => {
+            if (err && !res.headersSent) {
+                res.sendFile(path.join(__dirname, 'public', FALLBACK_THEME.file));
+            }
+        });
+    };
+    if (!req.session.userId) return sendTheme(getThemeByName('default'));
+    db.get(`SELECT theme FROM User_Data WHERE id = ?`, [req.session.userId], (err, row) => {
+        sendTheme(getThemeByName(err || !row ? 'default' : row.theme));
+    });
+});
+
 function getClientIP(req) {
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) return forwarded.split(',')[0].trim();
@@ -990,7 +1065,7 @@ function checkIPBan(req, res, next) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1022,7 +1097,7 @@ function checkBan(req, res, next) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1047,7 +1122,7 @@ function checkBan(req, res, next) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1069,7 +1144,7 @@ function checkBan(req, res, next) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1296,7 +1371,7 @@ function renderMessagePage(title, heading, bodyHTML) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHTML(title)}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; padding: 30px;">
@@ -1501,7 +1576,7 @@ app.post('/register', async (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1563,7 +1638,7 @@ app.post('/login', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1592,7 +1667,7 @@ app.post('/login', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body>
     <div class="box" style="color: white; height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
@@ -1922,11 +1997,15 @@ app.post('/reset-password', async (req, res) => {
 app.get('/edit', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
 
-    db.get(`SELECT bio, avatar_path, Nickname, email FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+    db.get(`SELECT bio, avatar_path, Nickname, email, theme FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         const bio = (user && user.bio) ? user.bio : '';
         const avatarPath = (user && user.avatar_path) ? user.avatar_path : null;
         const nickname = (user && user.Nickname) ? user.Nickname : '';
         const email = (user && user.email) ? user.email : '';
+        const currentTheme = (user && user.theme) ? user.theme : 'default';
+        const themeOptionsHTML = loadThemes().map(t =>
+            `<option value="${escapeHTML(t.name)}"${t.name === currentTheme ? ' selected' : ''}>${escapeHTML(t.displayName)}</option>`
+        ).join('');
         res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -1934,7 +2013,7 @@ app.get('/edit', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Dashboard</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-edit">
     <div class="box dashboard-box">
@@ -1985,6 +2064,15 @@ app.get('/edit', (req, res) => {
             <div id="email-change-result" style="margin-top:8px;font-size:0.85em;"></div>
             ` : `<button class="button" type="button" onclick="window.location.href='/account/add-email';" style="width:auto;">Add Email</button>`}
         </div>
+        <form action="/edit/theme" method="POST">
+            <div class="dash-field">
+                <label>Theme <span style="opacity:0.4;">(changes how Biodeck looks for you)</span></label>
+                <select class="dash-textarea" style="min-height:unset;" name="theme" id="theme-select">
+                    ${themeOptionsHTML}
+                </select>
+            </div>
+            <button class="button" type="submit" style="width:auto;margin-top:8px;">Save Theme</button>
+        </form>
         <div class="dash-links">
             <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
             <button class="button" style="width:120px;" onclick="window.location.href='/messages';">Messages</button>
@@ -2041,6 +2129,15 @@ app.get('/edit', (req, res) => {
         if (new URLSearchParams(window.location.search).get('bioerror')) {
             const t = document.createElement('div');
             t.textContent = 'Bio too long - 1,000 character limit.';
+            t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+            window.history.replaceState(null, '', '/edit');
+        }
+
+        if (new URLSearchParams(window.location.search).get('themeerror')) {
+            const t = document.createElement('div');
+            t.textContent = 'That theme is not available.';
             t.style.cssText = 'position:fixed;top:20px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:white;padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
@@ -2200,6 +2297,14 @@ app.post('/edit/avatar', (req, res) => {
     });
 });
 
+app.post('/edit/theme', (req, res) => {
+    if (!req.session.userId) return res.redirect('/');
+    const { theme } = req.body;
+    const valid = loadThemes().some(t => t.name === theme);
+    if (!valid) return res.redirect('/edit?themeerror=1');
+    db.run(`UPDATE User_Data SET theme = ? WHERE id = ?`, [theme, req.session.userId], () => res.redirect('/edit'));
+});
+
 // ----- Self-service email change (from the dashboard) -----
 // Step 1: user submits the new address they want. We email a 6-digit code
 // to the CURRENT address on file (not the new one) - this proves whoever
@@ -2303,7 +2408,7 @@ app.get('/feed', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-feed">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
@@ -2853,7 +2958,7 @@ app.get('/following-feed', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Following Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-following-feed">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
@@ -3176,7 +3281,7 @@ app.get('/post/:id', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Post</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-post">
     <div id="feed-wrapper" class="box" style="color: white; animation: none !important;">
@@ -3609,7 +3714,7 @@ app.get('/friends', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Friends</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-friends">
     <div id="friends-topbar">
@@ -3738,7 +3843,7 @@ app.get('/followers', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Followers</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-followers">
     <div id="followers-topbar">
@@ -3834,7 +3939,7 @@ app.get('/user/:username', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHTML(user.username)}'s Profile</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-profile">
     <div id="profile-topbar">
@@ -3982,7 +4087,7 @@ app.get('/messages', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Messages</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-messages">
     <div id="msg-topbar">
@@ -4051,7 +4156,7 @@ app.get('/messages/:username', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Chat with ${other}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-chat">
     <div id="chat-topbar">
@@ -4360,7 +4465,7 @@ app.get('/notifications', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Notifications</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-notifications">
     <div id="notif-topbar">
@@ -4621,7 +4726,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Admin Dashboard</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-admin">
 <div id="topbar">
@@ -5557,7 +5662,7 @@ app.get('/groups', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Group Chats</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-groups">
     <div id="gc-topbar">
@@ -5839,7 +5944,7 @@ app.get('/groups/:id', (req, res) => {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>${escapeHTML(group.name)}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
-<link rel="stylesheet" href="/styles.css">
+<link rel="stylesheet" href="/theme.css">
 </head>
 <body class="page-group-chat">
     <div id="gc-chat-topbar">

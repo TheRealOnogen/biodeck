@@ -363,7 +363,7 @@ function renderMessageBubble(m, me, replyMsg) {
         <div style="max-width:70%;background:${mine ? 'rgba(0,191,255,0.15)' : 'rgba(255,255,255,0.08)'};border:1px solid ${mine ? 'rgba(0,191,255,0.4)' : 'rgba(255,255,255,0.2)'};border-radius:12px;padding:8px 12px;">
             ${senderHeader}
             ${replyBanner}
-            <div style="word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
@@ -604,7 +604,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
                 <span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>
             </div>
         </div>
-        <div class="post-content" style="word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;">${linkifyMentions(safeContent)}</div>
+        <div class="post-content">${linkifyMentions(safeContent)}</div>
         ${embedHTML}
         ${fileHTML}
         <div class="post-actions">
@@ -1947,9 +1947,9 @@ app.get('/edit', (req, res) => {
             </div>
             <form action="/edit/avatar" method="POST" enctype="multipart/form-data" style="display:flex;flex-direction:column;align-items:center;gap:8px;">
                 <input type="file" id="avatar-input" name="avatar" accept="image/*" style="display:none;">
-                <label for="avatar-input" class="button" style="padding:10px;width:160px;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;">Choose Image</label>
+                <label for="avatar-input" class="button" style="width:160px;">Choose Image</label>
                 <span id="avatar-file-name" style="font-size:0.78em;opacity:0.65;">No file chosen</span>
-                <button class="button" type="submit" style="padding:10px;width:160px;">Upload</button>
+                <button class="button" type="submit" style="width:160px;">Upload</button>
             </form>
         </div>
         <form action="/edit/nickname" method="POST">
@@ -1957,14 +1957,14 @@ app.get('/edit', (req, res) => {
                 <label>Nickname <span style="opacity:0.4;">(shown instead of your username - spaces allowed. Your @username stays the same and is the only way people can ping you)</span></label>
                 <input class="dash-textarea" style="min-height:unset;" type="text" name="nickname" id="nickname-input" placeholder="e.g. Cool Guy" maxlength="32" value="${escapeHTML(nickname)}">
             </div>
-            <button class="button" type="submit" style="padding:10px;width: auto;margin-top:8px;">Save Nickname</button>
+            <button class="button" type="submit" style="width: auto;margin-top:8px;">Save Nickname</button>
         </form>
         <form action="/edit/bio" method="POST">
             <div class="dash-field">
                 <label>Bio</label>
                 <textarea class="dash-textarea" name="bio" id="bio-textarea" placeholder="Tell people about yourself..." maxlength="1000">${bio}</textarea>
             </div>
-            <button class="button" type="submit" style="padding:10px;width:120px;margin-top:8px;">Save Bio</button>
+            <button class="button" type="submit" style="width:120px;margin-top:8px;">Save Bio</button>
         </form>
         <div class="dash-field">
             <label>Email</label>
@@ -1972,37 +1972,37 @@ app.get('/edit', (req, res) => {
             ${email ? `
             <div id="email-change-step1">
                 <input class="dash-textarea" style="min-height:unset;" type="text" id="new-email-input" placeholder="New email address" autocomplete="off">
-                <button class="button" type="button" onclick="requestEmailCode()" style="padding:10px;width:auto;margin-top:8px;">Send code to current email</button>
+                <button class="button" type="button" onclick="requestEmailCode()" style="width:auto;margin-top:8px;">Send code to current email</button>
             </div>
             <div id="email-change-step2" style="display:none;margin-top:14px;">
                 <p style="opacity:0.7;margin:0 0 8px;">We sent a code to <span id="email-code-sent-to"></span>. Enter it below to confirm the change to <span id="email-code-new-addr"></span>.</p>
                 <input class="dash-textarea" style="min-height:unset;" type="text" id="email-code-input" placeholder="6-digit code" maxlength="6" autocomplete="off">
                 <div style="display:flex;gap:8px;margin-top:8px;">
-                    <button class="button" type="button" onclick="confirmEmailChange()" style="padding:10px;width:auto;">Confirm change</button>
-                    <button class="button" type="button" onclick="cancelEmailChange()" style="padding:10px;width:auto;">Cancel</button>
+                    <button class="button" type="button" onclick="confirmEmailChange()" style="width:auto;">Confirm change</button>
+                    <button class="button" type="button" onclick="cancelEmailChange()" style="width:auto;">Cancel</button>
                 </div>
             </div>
             <div id="email-change-result" style="margin-top:8px;font-size:0.85em;"></div>
-            ` : `<button class="button" type="button" onclick="window.location.href='/account/add-email';" style="padding:10px;width:auto;">Add Email</button>`}
+            ` : `<button class="button" type="button" onclick="window.location.href='/account/add-email';" style="width:auto;">Add Email</button>`}
         </div>
         <div class="dash-links">
-            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/feed';">Feed</button>
-            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/messages';">Messages</button>
+            <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
+            <button class="button" style="width:120px;" onclick="window.location.href='/messages';">Messages</button>
             <button class="button notif-nav-link" style="padding:10px;width: auto;" onclick="window.location.href='/notifications';">Notifications</button>
-            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/followers';">Followers</button>
-            <button class="button" style="padding:10px;width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
+            <button class="button" style="width:120px;" onclick="window.location.href='/followers';">Followers</button>
+            <button class="button" style="width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
         </div>
         <hr style="border-color:rgba(255,80,80,0.3);margin:26px 0 14px;">
         <div class="dash-field" style="text-align:center;">
             <h3 style="color:rgb(255, 0, 0);margin-bottom:4px;">Danger Zone</h3>
             <p style="opacity:0.6;font-size:0.82em;">Deleting your account is <strong>permanent</strong>. It removes your posts, DMs, group chat messages and memberships, follows, friends, friend requests, and notifications from the database. There is no way to undo this or recover your data afterward.</p>
-            <button class="button" type="button" onclick="openDeleteAccountBox()" style="padding:10px;width:auto;">Delete My Account</button>
+            <button class="button" type="button" onclick="openDeleteAccountBox()" style="width:auto;">Delete My Account</button>
             <div id="delete-account-box" style="display:none;margin-top:14px;text-align:left;">
                 <label>Enter your password to confirm</label>
                 <input class="dash-textarea" style="min-height:unset;" type="password" id="delete-account-password" placeholder="Current password" autocomplete="current-password">
                 <div style="display:flex;gap:8px;margin-top:8px;justify-content:center;">
-                    <button class="button" type="button" onclick="confirmDeleteAccount()" style="padding:10px;width:auto;">Permanently Delete Everything</button>
-                    <button class="button" type="button" onclick="closeDeleteAccountBox()" style="padding:10px;width:auto;">Cancel</button>
+                    <button class="button" type="button" onclick="confirmDeleteAccount()" style="width:auto;">Permanently Delete Everything</button>
+                    <button class="button" type="button" onclick="closeDeleteAccountBox()" style="width:auto;">Cancel</button>
                 </div>
                 <div id="delete-account-result" style="margin-top:8px;font-size:0.85em;text-align:center;"></div>
             </div>
@@ -2350,7 +2350,7 @@ app.get('/feed', (req, res) => {
         <div id="post-form-container">
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <div id="post-form-row">
-                    <textarea class="box" name="content" id="post-content" placeholder="What's on your mind?" style="background-color:black;color:white;font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
+                    <textarea class="box" name="content" id="post-content" placeholder="What's on your mind?" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
                     <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
                     <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Post</button>
@@ -3221,7 +3221,7 @@ app.get('/post/:id', (req, res) => {
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <input type="hidden" name="reply_to" value="${rootPost.id}">
                 <div id="post-form-row">
-                    <textarea class="box" name="content" id="post-content" placeholder="Write a reply…" style="background-color:black;color:white;font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
+                    <textarea class="box" name="content" id="post-content" placeholder="Write a reply…" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
                     <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
                     <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Reply</button>
@@ -3810,14 +3810,14 @@ app.get('/user/:username', (req, res) => {
                         const fileHTML = renderAttachmentsHTML(getAttachments(post), 300);
                         return `<div class="post" style="border:1px solid rgba(255,255,255,0.2);border-radius:10px;padding:10px;margin-bottom:14px;text-align:left;">
                             <span class="post-time" data-ts="${post.created_at ? post.created_at.replace(' ', 'T') + 'Z' : ''}" style="font-size:0.8em;opacity:0.6;"></span>
-                            <div style="margin-top:4px;word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;">${escapeHTML(post.content)}</div>
+                            <div class="post-content" style="margin-top:4px;">${escapeHTML(post.content)}</div>
                             ${fileHTML}
                         </div>`;
                     }).join('');
 
-                    const dmBtn = isOwnProfile ? '' : `<a href="/messages/${escapeHTML(profileUsername)}" class="button" style="padding:10px;width:120px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">Message</a>`;
-                    const followBtn = isOwnProfile ? '' : `<a id="follow-btn" class="button" onclick="toggleFollow()" style="padding:10px;width:120px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">${isFollowing ? 'Unfollow' : 'Follow'}</a>`;
-                    const friendBtnHTML = isOwnProfile ? '' : `<a id="friend-btn" class="button" onclick="toggleFriend()" style="padding:10px;width:140px;text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">${
+                    const dmBtn = isOwnProfile ? '' : `<a href="/messages/${escapeHTML(profileUsername)}" class="button" style="width:120px;text-decoration:none;">Message</a>`;
+                    const followBtn = isOwnProfile ? '' : `<a id="follow-btn" class="button" onclick="toggleFollow()" style="width:120px;text-decoration:none;">${isFollowing ? 'Unfollow' : 'Follow'}</a>`;
+                    const friendBtnHTML = isOwnProfile ? '' : `<a id="friend-btn" class="button" onclick="toggleFriend()" style="width:140px;text-decoration:none;">${
                         friendStatus === 'friends' ? 'Unfriend' :
                         friendStatus === 'sent' ? 'Cancel Request' :
                         friendStatus === 'received' ? 'Accept Request' :
@@ -4078,7 +4078,7 @@ app.get('/messages/:username', (req, res) => {
         <form action="/messages/${other}/send" method="POST" enctype="multipart/form-data" id="chat-form">
             <input type="hidden" name="reply_to" id="chat-reply-to-input" value="">
             <div id="chat-form-row">
-                <textarea class="box" name="content" id="chat-content" placeholder="Message @${other}..." style="background-color:black;color:white;font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
+                <textarea class="box" name="content" id="chat-content" placeholder="Message @${other}..." style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
                 <input type="file" id="chat-attachment" name="attachments" multiple style="display:none;">
                 <label for="chat-attachment" class="button chat-action-btn" style="display:inline-flex;align-items:center;justify-content:center;cursor:pointer;">Browse</label>
                 <button class="button chat-action-btn" type="submit">Send</button>
@@ -5519,7 +5519,7 @@ function renderGCMessageBubble(m, me, replyMsg) {
         <div style="max-width:70%;background:${mine ? 'rgba(0,191,255,0.15)' : 'rgba(255,255,255,0.08)'};border:1px solid ${mine ? 'rgba(0,191,255,0.4)' : 'rgba(255,255,255,0.2)'};border-radius:12px;padding:8px 12px;">
             ${senderLabel}
             ${replyBanner}
-            <div style="word-break:break-word;overflow-wrap:break-word;white-space:pre-wrap;">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
@@ -5598,7 +5598,7 @@ app.get('/groups', (req, res) => {
             </div>
             <div id="gc-selected-tags"></div>
             <div id="gc-create-result" style="font-size:0.85em;min-height:1em;"></div>
-            <button class="button" onclick="createGC()" style="width:140px;padding:10px;">Create Group</button>
+            <button class="button" onclick="createGC()" style="width:140px;">Create Group</button>
         </div>
         <h3 style="opacity:0.6;margin:0 0 12px;">Your Groups</h3>
         ${groupsHTML || '<p style="opacity:0.4;">No group chats yet.</p>'}
@@ -5864,7 +5864,7 @@ app.get('/groups/:id', (req, res) => {
         <span style="opacity:0.5;flex-shrink:0;">Members:</span>
         ${membersListHTML}
         <div id="add-member-row">
-            <button class="button" onclick="openGCAddPicker()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important; box-sizing: border-box !important; border: 5px solid white; margin: 0; text-align: center; border-radius: 15px; cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: 0.2s;">+ Add Friends</button>
+            <button class="button" onclick="openGCAddPicker()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;box-sizing: border-box !important;">+ Add Friends</button>
             <button class="button gc-action-btn" onclick="leaveGroup()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;border-color:rgb(255,80,80);color:rgb(255,80,80);" id="leave-gc-btn">Leave</button>
             <span id="add-member-result" style="font-size:0.8em;"></span>
         </div>
@@ -5886,10 +5886,10 @@ app.get('/groups/:id', (req, res) => {
         <form action="/groups/${groupId}/send" method="POST" enctype="multipart/form-data" id="gc-form">
             <input type="hidden" name="reply_to" id="gc-reply-to-input" value="">
             <div id="gc-form-row">
-                <textarea class="box" name="content" id="gc-content" placeholder="Message ${escapeHTML(group.name)}…" style="background-color:black;color:white;font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
+                <textarea class="box" name="content" id="gc-content" placeholder="Message ${escapeHTML(group.name)}…" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
                 <input type="file" id="gc-attachment" name="attachments" multiple style="display:none;">
-                <label for="gc-attachment" class="button" style="cursor:pointer;padding: 0 !important; height: 35px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important;">Browse</label>
-                <button class="button" style="padding: 0 !important; height: 44px !important; width: 70px !important; font-size: 0.85em !important; line-height: 1 !important;" type="submit">Send</button>
+                <label for="gc-attachment" class="button" style="padding: 0 !important;height: 35px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;">Browse</label>
+                <button class="button" style="padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;" type="submit">Send</button>
             </div>
             <div id="gc-file-name">No file chosen</div>
             <div id="gc-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 4000</div>

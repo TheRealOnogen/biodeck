@@ -641,7 +641,7 @@ body.page-following-feed .post-actions {
 }
 body.page-following-feed .post-action-btn {
   padding: 0 !important;
-  height: 44px !important;
+  height: 25px !important;
   width: 70px !important;
   font-size: 0.85em !important;
   line-height: 1 !important;
@@ -817,7 +817,7 @@ body.page-post .post-actions {
 }
 body.page-post .post-action-btn {
   padding: 0 !important;
-  height: 44px !important;
+  height: 25px !important;
   width: 70px !important;
   font-size: 0.85em !important;
   line-height: 1 !important;

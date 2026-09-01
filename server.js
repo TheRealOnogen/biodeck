@@ -244,8 +244,12 @@ const USER_EVENTS_SCRIPT = `<script>
                 + '<h3>Reason: ' + reason + '</h3><br><br>'
                 + '<button type=\\"button\\" class=\\"button\\" style=\\"width:150px\\" onclick=\\"window.location.href=\\'/\\'\\">Go to homepage</button>';
         } else {
+            var expiryLine = d.expiresAt
+                ? ('<h3>Ban Expires: ' + new Date(d.expiresAt).toLocaleString() + '</h3><br><br>')
+                : '';
             inner = '<h1>The ban hammer has struck you</h1><br>'
                 + '<h3>Ban Reason: ' + reason + '</h3><br><br>'
+                + expiryLine
                 + '<button type=\\"button\\" class=\\"button\\" style=\\"width:150px\\" onclick=\\"window.location.href=\\'/\\'\\">Go to homepage</button>';
         }
         document.body.innerHTML = '';
@@ -830,6 +834,10 @@ db.serialize(() => {
             db.run(`ALTER TABLE User_Data ADD COLUMN Nickname TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeleted INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN DeleteReason TEXT DEFAULT NULL`, () => {});
+            // Optional expiry timestamp (ISO string) for timed bans. NULL means the
+            // ban is permanent - checkBan/checkBanStatus treat a past timestamp as
+            // an expired ban and auto-clear IsBanned/BanReason/BanExpiresAt.
+            db.run(`ALTER TABLE User_Data ADD COLUMN BanExpiresAt TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN email TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN email_verified INTEGER DEFAULT 0`, () => {});
             // Selected CSS theme (see themes.json / loadThemes()). Stores the
@@ -1081,7 +1089,7 @@ function checkIPBan(req, res, next) {
 function checkBan(req, res, next) {
     if (!req.session.userId) return next();
 
-    db.get(`SELECT IsBanned, BanReason, IsDeleted, DeleteReason, IsAdmin, IsOwner, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+    db.get(`SELECT IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsAdmin, IsOwner, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         if (err) return next();
         // No row at all means the account was permanently deleted (hard
         // delete removes the row entirely, unlike the soft delete which
@@ -1133,8 +1141,16 @@ function checkBan(req, res, next) {
 </body>
 </html>`);
             });
+        } else if (user.IsBanned == 1 && user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
+            // Timed ban has expired - clear it (and email the user) instead of
+            // showing a stale ban screen.
+            clearExpiredBan(req.session.userId);
+            next();
         } else if (user.IsBanned == 1) {
             const reason = escapeHTML(user.BanReason || 'No reason provided');
+            const expiryLine = user.BanExpiresAt
+                ? `<h3>Ban Expires: ${escapeHTML(new Date(user.BanExpiresAt).toLocaleString())}</h3><br><br>`
+                : '';
             req.session.destroy(() => {
                 res.clearCookie('connect.sid');
                 return res.send(`<!DOCTYPE html>
@@ -1150,6 +1166,7 @@ function checkBan(req, res, next) {
     <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${reason}</h3><br><br>
+        ${expiryLine}
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
@@ -1273,11 +1290,13 @@ function sendVerifyEmail(toEmail, username, verifyLink) {
 }
 
 // ----- Account moderation emails (ban / unban / delete / permanent delete) -----
-function sendAccountBannedEmail(toEmail, username, reason) {
+function sendAccountBannedEmail(toEmail, username, reason, expiresAt) {
     const subject = 'Your Biodeck account has been banned';
     const cleanReason = reason || 'No reason provided';
-    const text = `Hi ${username},\n\nYour Biodeck account has been banned.\n\nReason: ${cleanReason}\n\nIf you believe this is a mistake, contact an administrator.`;
-    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has been banned.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+    const expiryText = expiresAt ? `\n\nThis ban expires: ${new Date(expiresAt).toLocaleString()}` : '';
+    const expiryHtml = expiresAt ? `<p><strong>Expires:</strong> ${escapeHTML(new Date(expiresAt).toLocaleString())}</p>` : '';
+    const text = `Hi ${username},\n\nYour Biodeck account has been banned.\n\nReason: ${cleanReason}${expiryText}\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has been banned.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p>${expiryHtml}<p>If you believe this is a mistake, contact an administrator.</p>`;
 
     if (!mailTransporter) {
         console.log(`[account banned] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
@@ -1304,6 +1323,25 @@ function sendAccountUnbannedEmail(toEmail, username) {
         to: toEmail,
         subject, text, html
     }).catch(err => console.error('Failed to send account unbanned email:', err.message));
+}
+
+// Sent when a timed ban expires on its own (as opposed to an admin manually
+// unbanning via sendAccountUnbannedEmail above) - worded to make clear this
+// wasn't a manual admin action.
+function sendBanExpiredEmail(toEmail, username) {
+    const subject = 'Your Biodeck ban has expired';
+    const text = `Hi ${username},\n\nThe temporary ban on your Biodeck account has expired and your access has been restored. You can log back in whenever you're ready.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>The temporary ban on your Biodeck account has expired and your access has been restored. You can log back in whenever you're ready.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[ban expired] SMTP not configured - would have emailed ${toEmail}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send ban expired email:', err.message));
 }
 
 // Sent for the soft delete (admin resets the profile and marks IsDeleted, but
@@ -1461,12 +1499,16 @@ app.get('/api/check-ban-status', (req, res) => {
         if (!req.session || !req.session.userId) {
             return res.json({ banned: false });
         }
-        db.get(`SELECT IsBanned, BanReason, IsDeleted, DeleteReason FROM User_Data WHERE id = ?`, [req.session.userId], (err2, user) => {
+        db.get(`SELECT IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason FROM User_Data WHERE id = ?`, [req.session.userId], (err2, user) => {
             if (!err2 && user && user.IsDeleted == 1) {
                 return res.json({ banned: true, type: 'deleted', reason: user.DeleteReason || 'No reason provided' });
             }
             if (!err2 && user && user.IsBanned == 1) {
-                return res.json({ banned: true, type: 'account', reason: user.BanReason || 'No reason provided' });
+                if (user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
+                    clearExpiredBan(req.session.userId);
+                    return res.json({ banned: false });
+                }
+                return res.json({ banned: true, type: 'account', reason: user.BanReason || 'No reason provided', expiresAt: user.BanExpiresAt || null });
             }
             res.json({ banned: false });
         });
@@ -1658,8 +1700,16 @@ app.post('/login', (req, res) => {
 </body>
 </html>`);
                 }
+                if (user.IsBanned && user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
+                    // Timed ban has expired - clear it (and email the user) and let the login proceed.
+                    clearExpiredBan(user.id);
+                    user.IsBanned = 0;
+                }
                 if (user.IsBanned) {
                     const reason = user.BanReason || 'No reason provided';
+                    const expiryLine = user.BanExpiresAt
+                        ? `<h3>Ban Expires: ${escapeHTML(new Date(user.BanExpiresAt).toLocaleString())}</h3><br><br>`
+                        : '';
                     return res.status(401).send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -1673,6 +1723,7 @@ app.post('/login', (req, res) => {
     <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${escapeHTML(reason)}</h3><br><br>
+        ${expiryLine}
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
     <script>
@@ -3002,8 +3053,8 @@ app.get('/following-feed', (req, res) => {
                 <div id="post-form-row">
                     <textarea name="content" id="post-content" placeholder="What's on your mind?" maxlength="1000"></textarea>
                     <input type="file" name="attachments" id="attachment" multiple style="display:none;">
-                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
-                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Post</button>
+                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
+                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Post</button>
                 </div>
                 <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
@@ -3328,8 +3379,8 @@ app.get('/post/:id', (req, res) => {
                 <div id="post-form-row">
                     <textarea class="box" name="content" id="post-content" placeholder="Write a reply…" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
-                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 25px; padding: 10px;">Browse</label>
-                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 25px;">Reply</button>
+                    <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
+                    <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Reply</button>
                 </div>
                 <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
@@ -4659,7 +4710,7 @@ function requireHeadAdmin(req, res, next) {
 }
 
 app.get('/admin/dashboard', requireAdmin, (req, res) => {
-    db.all(`SELECT username, Nickname, IsBanned, BanReason, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
+    db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
         if (err) return res.status(500).send('DB error');
         const userRows = (users || []).map(u => {
             const badges = [
@@ -4674,7 +4725,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 ? `<button class="button" style="font-size:0.75em;padding:2px 8px;margin-left:6px;" onclick="prefillIPBan('${escapeHTML(u.last_ip)}')">IP Ban</button>`
                 : '';
             const nicknameSuffix = (u.Nickname && u.Nickname.trim()) ? ` <span style="opacity:0.5;font-weight:400;">(${escapeHTML(u.Nickname.trim())})</span>` : '';
-            const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') : '');
+            const banExpirySuffix = (u.IsBanned && u.BanExpiresAt) ? ` (until ${escapeHTML(new Date(u.BanExpiresAt).toLocaleString())})` : '';
+            const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') + banExpirySuffix : '');
             return `<tr>
                 <td><a href="/user/${escapeHTML(u.username)}" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
                 <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${badges || '<span style="opacity:0.4;">-</span>'}</td>
@@ -4765,6 +4817,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <input style="border-radius: 20px; height: 30px;" type="text" id="target-username" placeholder="e.g. testuser" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
         <input style="border-radius: 20px; height: 30px;" type="text" id="ban-reason" placeholder="e.g. Spamming" maxlength="500">
+        <label>Duration <span style="opacity:0.4;">(optional, ignored for unban - blank = permanent)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="ban-duration" placeholder="e.g. 45s, 30m, 6h, 3d, 2w, 1y" maxlength="20">
         <label>Action</label>
         <select id="action">
             <option value="ban">Ban</option>
@@ -5089,6 +5143,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     async function submitAction() {
         const username = document.getElementById('target-username').value.trim();
         const reason = document.getElementById('ban-reason').value.trim();
+        const duration = document.getElementById('ban-duration').value.trim();
         const action = document.getElementById('action').value;
         const resultEl = document.getElementById('result');
 
@@ -5101,7 +5156,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const res = await fetch('/admin/' + action + '/' + encodeURIComponent(username), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: action === 'ban' ? JSON.stringify({ reason }) : '{}'
+                body: action === 'ban' ? JSON.stringify({ reason, duration }) : '{}'
             });
             const data = await res.json();
             if (!res.ok) {
@@ -5110,10 +5165,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             } else {
                 resultEl.className = 'ok';
                 resultEl.textContent = action === 'ban'
-                    ? '@' + username + ' has been banned.'
+                    ? '@' + username + ' has been banned' + (data.expiresAt ? ' until ' + new Date(data.expiresAt).toLocaleString() : ' permanently') + '.'
                     : '@' + username + ' has been unbanned.';
                 document.getElementById('target-username').value = '';
                 document.getElementById('ban-reason').value = '';
+                document.getElementById('ban-duration').value = '';
                 setTimeout(() => location.reload(), 1200);
             }
         } catch (e) {
@@ -5283,28 +5339,73 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     });
 });
 
+// Parses a ban duration like "30m", "6h", "3d", "2w", or a bare number
+// (treated as minutes). Returns milliseconds, or null if the string doesn't
+// parse / isn't positive - callers should treat null as a bad request.
+function parseBanDuration(str) {
+    const s = String(str).trim().toLowerCase();
+    if (!s) return null;
+    const match = s.match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d|w|y)?$/);
+    if (!match) return null;
+    const amount = parseFloat(match[1]);
+    if (!isFinite(amount) || amount <= 0) return null;
+    const unitMs = {
+        s: 1000,
+        m: 60 * 1000,
+        h: 60 * 60 * 1000,
+        d: 24 * 60 * 60 * 1000,
+        w: 7 * 24 * 60 * 60 * 1000,
+        y: 365 * 24 * 60 * 60 * 1000
+    };
+    const unit = match[2] || 'm';
+    return Math.round(amount * unitMs[unit]);
+}
+
+// Clears an expired timed ban and emails the user that access has been
+// restored. Called from every place that notices BanExpiresAt is in the past
+// (the checkBan middleware, /api/check-ban-status, and /login) so the
+// notification goes out no matter which path first catches the expiry.
+function clearExpiredBan(userId) {
+    db.run(`UPDATE User_Data SET IsBanned = 0, BanReason = NULL, BanExpiresAt = NULL WHERE id = ?`, [userId], (err) => {
+        if (err) return;
+        db.get(`SELECT username, email FROM User_Data WHERE id = ?`, [userId], (err2, row) => {
+            if (!err2 && row && row.email) sendBanExpiredEmail(row.email, row.username);
+        });
+    });
+}
+
 app.post('/admin/ban/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
     const reason = (req.body.reason || 'Banned by admin').substring(0, 500);
     if (target === req.session.userUsername) return res.status(400).json({ error: 'cannot ban yourself' });
-    db.run(`UPDATE User_Data SET IsBanned = 1, BanReason = ? WHERE username = ?`, [reason, target], function(err) {
+
+    // Optional duration field (e.g. "30m", "6h", "3d", "2w"). Left blank/omitted
+    // means a permanent ban, matching the existing behavior.
+    let expiresAt = null;
+    if (req.body.duration && String(req.body.duration).trim()) {
+        const ms = parseBanDuration(req.body.duration);
+        if (ms === null) return res.status(400).json({ error: 'invalid duration - use e.g. 45s, 30m, 6h, 3d, 2w, 1y' });
+        expiresAt = new Date(Date.now() + ms).toISOString();
+    }
+
+    db.run(`UPDATE User_Data SET IsBanned = 1, BanReason = ?, BanExpiresAt = ? WHERE username = ?`, [reason, expiresAt, target], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
-        logAudit('account_banned', req.session.userUsername, target, reason);
+        logAudit('account_banned', req.session.userUsername, target, expiresAt ? `${reason} (until ${expiresAt})` : reason);
         // Push ban event to any open SSE streams for this user, and email them
         db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err2, row) => {
             if (!err2 && row) {
-                userBus.emit(`user:${row.id}`, { event: 'banned', type: 'account', reason });
-                if (row.email) sendAccountBannedEmail(row.email, target, reason);
+                userBus.emit(`user:${row.id}`, { event: 'banned', type: 'account', reason, expiresAt });
+                if (row.email) sendAccountBannedEmail(row.email, target, reason, expiresAt);
             }
         });
-        res.json({ ok: true, banned: true, username: target });
+        res.json({ ok: true, banned: true, username: target, expiresAt });
     });
 });
 
 app.post('/admin/unban/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
-    db.run(`UPDATE User_Data SET IsBanned = 0, BanReason = NULL WHERE username = ?`, [target], function(err) {
+    db.run(`UPDATE User_Data SET IsBanned = 0, BanReason = NULL, BanExpiresAt = NULL WHERE username = ?`, [target], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
         logAudit('account_unbanned', req.session.userUsername, target, null);

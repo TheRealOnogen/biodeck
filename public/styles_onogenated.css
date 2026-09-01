@@ -641,7 +641,7 @@ body.page-following-feed .post-actions {
 }
 body.page-following-feed .post-action-btn {
   padding: 0 !important;
-  height: 44px !important;
+  height: 25px !important;
   width: 70px !important;
   font-size: 0.85em !important;
   line-height: 1 !important;
@@ -659,7 +659,7 @@ body.page-following-feed .post-action-btn {
   transition: 0.2s;
 }
 body.page-following-feed .post-action-btn:hover {
-  background-color: white;
+  background-color: rgb(0, 41, 99);
   color: rgb(0, 17, 41);
 }
 body.page-following-feed .post-action-btn.clicked {
@@ -817,7 +817,7 @@ body.page-post .post-actions {
 }
 body.page-post .post-action-btn {
   padding: 0 !important;
-  height: 44px !important;
+  height: 25px !important;
   width: 70px !important;
   font-size: 0.85em !important;
   line-height: 1 !important;
@@ -835,7 +835,7 @@ body.page-post .post-action-btn {
   transition: 0.2s;
 }
 body.page-post .post-action-btn:hover {
-  background-color: white;
+  background-color: rgb(0, 41, 99);
   color: rgb(0, 17, 41);
 }
 body.page-post .post-action-btn.clicked {

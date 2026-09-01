@@ -18,5 +18,10 @@
   "name": "onogenated",
   "displayName": "Biodeck Onogenated",
   "file": "styles_onogenated.css"
+  },
+  {
+  "name": "nostalgia",
+  "displayName": "Nostalgia",
+  "file": "styles_nostalgia.css"
   }
 ]

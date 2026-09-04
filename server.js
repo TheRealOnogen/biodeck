@@ -1,3 +1,11 @@
+// for all who enter here
+// this code holds up with hopes and dreams
+// even AI doesn't fully understand it
+// if you decide to edit this and spend time suffering
+// please leave your name below
+
+// Onogen
+
 require('dotenv').config({ path: 'vars.env' });
 const express = require('express');
 const Database = require('better-sqlite3');

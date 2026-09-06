@@ -1789,7 +1789,7 @@ app.post('/register', async (req, res) => {
         const gateEnabled = registrationGateEnabled;
         const initialIsBanned = gateEnabled ? 1 : 0;
         const initialBanReason = gateEnabled
-            ? "Account creation is currently disabled, please contact therealonogen or rtx3080ti0415 on discord to activate your account, a message was also sent to admins"
+            ? "Account creation is currently disabled, please contact biodecksupport@gmail.com to activate your account, a message was also sent to admins"
             : null;
 
         db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, 0, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {

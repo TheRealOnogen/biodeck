@@ -562,6 +562,38 @@ function logAudit(action, actor, target, details) {
         (err) => { if (err) console.error('Audit log insert error:', err.message); });
 }
 
+// Account-standing thresholds, based on the number of currently-active
+// (non-expired) warnings. Expired warnings never count here even though
+// they stay visible in the warnings list.
+const STANDING_LEVELS = [
+    { min: 20, label: 'Severely at risk', color: 'var(--danger-strong-color)' },
+    { min: 10, label: 'At risk', color: 'var(--danger-color)' },
+    { min: 1, label: 'Be careful', color: 'var(--warning-color, #d9a441)' },
+    { min: 0, label: 'All good', color: 'var(--success-color)' }
+];
+function getStanding(activeWarningCount) {
+    const level = STANDING_LEVELS.find(l => activeWarningCount >= l.min);
+    return { count: activeWarningCount, label: level.label, color: level.color };
+}
+
+// A warning counts toward standing until its expires_at passes. NULL
+// expires_at means the warning never expires - same "compare as JS Date"
+// approach used for BanExpiresAt elsewhere in this file otherwise, so it
+// stays consistent regardless of exact ISO string format.
+function isWarningActive(w) {
+    if (!w.expires_at) return true;
+    return new Date(w.expires_at).getTime() > Date.now();
+}
+
+// Fetches every warning for a user (active and expired alike - callers that
+// only need the active count/standing should filter with isWarningActive).
+function getWarningsForUser(username, cb) {
+    db.all(`SELECT id, username, reason, issued_by, created_at, expires_at FROM Warnings WHERE username = ? ORDER BY created_at DESC`, [username], (err, rows) => {
+        if (err) return cb(err);
+        cb(null, rows || []);
+    });
+}
+
 // Extra usernames to DM on every new registration, on top of the user with
 // id 1. Local text file, single line, comma-separated, e.g.: Onogen,rtx
 // Missing file just means "no extra targets" - not an error.
@@ -998,6 +1030,55 @@ db.serialize(() => {
                 details TEXT DEFAULT NULL,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
+            // Account-standing warnings. expires_at is optional - NULL means
+            // the warning never expires and counts toward standing forever.
+            // When a warning DOES expire, it stops counting toward standing
+            // but the row is kept forever so the full history still shows
+            // up in the warnings list. Admins can also revoke a warning
+            // early (see /admin/warnings/:id/revoke), which just sets
+            // expires_at to now rather than deleting the row, for the same
+            // "keep history" reason.
+            db.run(`CREATE TABLE IF NOT EXISTS Warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                reason TEXT DEFAULT NULL,
+                issued_by TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at TEXT DEFAULT NULL
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_warnings_username ON Warnings(username)`);
+            // Migration: CREATE TABLE IF NOT EXISTS above is a no-op on a
+            // Warnings table that already existed from before never-expiring
+            // warnings were added (when expires_at was NOT NULL) - it does
+            // NOT relax that constraint on an existing table. Detect the
+            // stale constraint and rebuild the table (preserving all rows)
+            // so inserting a NULL expires_at stops failing with a db error.
+            try {
+                const warningsCols = sqliteDb.prepare(`PRAGMA table_info(Warnings)`).all();
+                const expiresCol = warningsCols.find(c => c.name === 'expires_at');
+                if (expiresCol && expiresCol.notnull) {
+                    console.log('Migrating Warnings.expires_at to allow NULL (never-expiring warnings)...');
+                    sqliteDb.exec(`
+                        ALTER TABLE Warnings RENAME TO Warnings_migrate_tmp;
+                        CREATE TABLE Warnings (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            username TEXT NOT NULL,
+                            reason TEXT DEFAULT NULL,
+                            issued_by TEXT NOT NULL,
+                            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                            expires_at TEXT DEFAULT NULL
+                        );
+                        INSERT INTO Warnings (id, username, reason, issued_by, created_at, expires_at)
+                            SELECT id, username, reason, issued_by, created_at, expires_at FROM Warnings_migrate_tmp;
+                        DROP TABLE Warnings_migrate_tmp;
+                        CREATE INDEX IF NOT EXISTS idx_warnings_username ON Warnings(username);
+                    `);
+                    stmtCache.clear(); // old cached statements point at the dropped table object
+                    console.log('Warnings migration complete.');
+                }
+            } catch (migrateErr) {
+                console.error('Warnings NOT NULL migration check failed:', migrateErr.message);
+            }
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -1389,6 +1470,45 @@ function sendAccountPermanentlyDeletedEmail(toEmail, username, reason) {
         to: toEmail,
         subject, text, html
     }).catch(err => console.error('Failed to send account permanently deleted email:', err.message));
+}
+
+// Sent when an admin issues a warning against an account's standing.
+function sendWarningEmail(toEmail, username, reason, expiresAt) {
+    const subject = 'You have received a warning on Biodeck';
+    const cleanReason = reason || 'No reason provided';
+    const expiryText = expiresAt ? `\n\nThis warning expires: ${new Date(expiresAt).toLocaleString()}` : '\n\nThis warning does not expire.';
+    const expiryHtml = expiresAt ? `<p><strong>Expires:</strong> ${escapeHTML(new Date(expiresAt).toLocaleString())}</p>` : `<p><strong>Expires:</strong> Never</p>`;
+    const text = `Hi ${username},\n\nYour Biodeck account has received a warning.\n\nReason: ${cleanReason}${expiryText}\n\nEnough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has received a warning.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p>${expiryHtml}<p>Enough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[warning issued] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send warning email:', err.message));
+}
+
+// Sent when a warning is manually revoked early by an admin. Naturally
+// expired warnings do NOT trigger this - only an explicit revoke action.
+function sendWarningRevokedEmail(toEmail, username, reason) {
+    const subject = 'A warning on your Biodeck account has been removed';
+    const cleanReason = reason || 'No reason provided';
+    const text = `Hi ${username},\n\nA warning on your Biodeck account has been removed by an administrator and no longer counts toward your account standing.\n\nOriginal reason: ${cleanReason}\n\nIf you have questions, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>A warning on your Biodeck account has been removed by an administrator and no longer counts toward your account standing.</p><p><strong>Original reason:</strong> ${escapeHTML(cleanReason)}</p><p>If you have questions, contact an administrator.</p>`;
+
+    if (!mailTransporter) {
+        console.log(`[warning revoked] SMTP not configured - would have emailed ${toEmail}`);
+        return Promise.resolve();
+    }
+    return mailTransporter.sendMail({
+        from: process.env.SMTP_FROM || process.env.SMTP_USER,
+        to: toEmail,
+        subject, text, html
+    }).catch(err => console.error('Failed to send warning revoked email:', err.message));
 }
 
 // Invalidates any outstanding verification links for the user, creates a new
@@ -2079,6 +2199,8 @@ app.get('/edit', (req, res) => {
         <h1>Dashboard</h1>
         <p style="opacity:0.6;">@${req.session.userUsername}</p>
         <div class="dash-field" style="text-align:center;">
+        </div>
+        <div class="dash-field" style="text-align:center;">
             <label>Profile Picture</label>
             <div style="display:flex;justify-content:center;margin-bottom:10px;">
                 ${renderAvatarHTML(avatarPath, req.session.userUsername, 84)}
@@ -2130,14 +2252,15 @@ app.get('/edit', (req, res) => {
                     ${themeOptionsHTML}
                 </select>
             </div>
-            <button class="button" type="submit" style="width:auto;margin-top:8px;">Save Theme</button>
+            <button class="button" type="submit" style="width:auto;margin-top:8px;margin-bottom:8px;">Save Theme</button>
         </form>
         <div class="dash-links">
-            <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
-            <button class="button" style="width:120px;" onclick="window.location.href='/messages';">Messages</button>
-            <button class="button notif-nav-link" style="padding:10px;width: auto;" onclick="window.location.href='/notifications';">Notifications</button>
-            <button class="button" style="width:120px;" onclick="window.location.href='/followers';">Followers</button>
-            <button class="button" style="width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
+                <button class="button" style="width:120px;" onclick="window.location.href='/standing';">Standing</button>
+                <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
+                <button class="button" style="width:120px;" onclick="window.location.href='/messages';">Messages</button>
+                <button class="button notif-nav-link" style="padding:10px;width: auto;" onclick="window.location.href='/notifications';">Notifications</button>
+                <button class="button" style="width:120px;" onclick="window.location.href='/followers';">Followers</button>
+                <button class="button" style="width:120px;" onclick="window.location.href='/user/${req.session.userUsername}';">My Profile</button>
         </div>
         <hr style="border-color:rgba(255,80,80,0.3);margin:26px 0 14px;">
         <div class="dash-field" style="text-align:center;">
@@ -2298,6 +2421,63 @@ ${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
 
 </body>
 </html>`);
+    });
+});
+
+app.get('/standing', (req, res) => {
+    if (!req.session.userId) return res.redirect('/');
+
+    db.get(`SELECT avatar_path FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+        const avatarPath = (user && user.avatar_path) ? user.avatar_path : null;
+        getWarningsForUser(req.session.userUsername, (errW, warnings) => {
+            warnings = warnings || [];
+            const activeCount = warnings.filter(isWarningActive).length;
+            const standing = getStanding(activeCount);
+            const warningRowsHTML = warnings.map(w => {
+                const active = isWarningActive(w);
+                const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+                return `<tr>
+                    <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(w.reason || '')}</td>
+                    <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at).toLocaleString())}</td>
+                    <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${w.expires_at ? escapeHTML(new Date(w.expires_at).toLocaleString()) : 'Never'}</td>
+                    <td>${statusHtml}</td>
+                </tr>`;
+            }).join('');
+            res.send(`<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Account Standing</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body class="page-edit">
+    <div class="box dashboard-box">
+        <div style="display:flex;justify-content:center;margin-bottom:10px;">
+            ${renderAvatarHTML(avatarPath, req.session.userUsername, 84)}
+        </div>
+        <h2 style="margin:0 0 14px;">@${escapeHTML(req.session.userUsername)}</h2>
+        <div style="margin-bottom:18px;">
+            <div style="opacity:0.6;font-size:0.85em;margin-bottom:4px;">Account Standing</div>
+            <div style="font-size:1.3em;color:${standing.color};font-weight:700;">${escapeHTML(standing.label)}</div>
+            <div style="opacity:0.6;font-size:0.85em;margin-top:2px;">${standing.count} active warning${standing.count === 1 ? '' : 's'}</div>
+        </div>
+        <div style="text-align:left;">
+            <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Warnings</div>
+            ${warnings.length ? `
+            <table>
+                <thead><tr><th>Reason</th><th>Issued</th><th>Expires</th><th>Status</th></tr></thead>
+                <tbody>${warningRowsHTML}</tbody>
+            </table>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
+        </div>
+        <div class="dash-links">
+            <button class="button" style="width:auto;" onclick="window.location.href='/edit';">Back to dashboard</button>
+        </div>
+    </div>
+</body>
+</html>`);
+        });
     });
 });
 
@@ -4720,6 +4900,13 @@ function requireHeadAdmin(req, res, next) {
 app.get('/admin/dashboard', requireAdmin, (req, res) => {
     db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
         if (err) return res.status(500).send('DB error');
+        db.all(`SELECT username, expires_at FROM Warnings`, [], (errW, allWarnings) => {
+        // Active-warning counts per username, computed in JS (same
+        // expires-as-Date approach used everywhere else for expiry checks).
+        const activeWarningCounts = {};
+        (allWarnings || []).forEach(w => {
+            if (isWarningActive(w)) activeWarningCounts[w.username] = (activeWarningCounts[w.username] || 0) + 1;
+        });
         const userRows = (users || []).map(u => {
             const badges = [
                 u.IsOwner ? '<span style="color:var(--gold-color);font-weight:700;">Owner</span>' : '',
@@ -4735,10 +4922,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const nicknameSuffix = (u.Nickname && u.Nickname.trim()) ? ` <span style="opacity:0.5;font-weight:400;">(${escapeHTML(u.Nickname.trim())})</span>` : '';
             const banExpirySuffix = (u.IsBanned && u.BanExpiresAt) ? ` (until ${escapeHTML(new Date(u.BanExpiresAt).toLocaleString())})` : '';
             const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') + banExpirySuffix : '');
+            const standing = getStanding(activeWarningCounts[u.username] || 0);
+            const standingBtn = `<button class="button" style="font-size:0.72em;padding:2px 8px;margin-left:6px;" onclick="prefillWarnUsername('${escapeHTML(u.username)}')">Warn</button>`;
             return `<tr>
                 <td><a href="/user/${escapeHTML(u.username)}" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
                 <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${badges || '<span style="opacity:0.4;">-</span>'}</td>
                 <td style="font-size:0.8em;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${statusReason}</td>
+                <td style="font-size:0.85em;white-space:nowrap; word-break: break-word; overflow-wrap: break-word"><span style="color:${standing.color};font-weight:700;">${escapeHTML(standing.label)}</span> <span style="opacity:0.5;">(${standing.count})</span>${standingBtn}</td>
                 <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${u.last_ip ? escapeHTML(u.last_ip) : '<span style="opacity:0.3;">-</span>'}${ipBtn}</td>
             </tr>`;
         }).join('');
@@ -4760,7 +4950,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 registration_gate_enabled: 'Registration Gate ON',
                 registration_gate_disabled: 'Registration Gate OFF',
                 ip_banned: 'IP Banned',
-                ip_unbanned: 'IP Unbanned'
+                ip_unbanned: 'IP Unbanned',
+                warning_issued: 'Warning Issued',
+                warning_revoked: 'Warning Revoked'
             };
             const IP_ACTIONS = new Set(['ip_banned', 'ip_unbanned']);
             const auditRows = (auditEntries || []).map(a => {
@@ -4943,11 +5135,42 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     </div>
 
     <div class="panel">
+        <h2>Issue Warning</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Warnings affect account standing: <strong>0</strong> = All good, <strong>1-9</strong> = Be careful, <strong>10-19</strong> = At risk, <strong>20+</strong> = Severely at risk. Once a warning expires it stops counting toward standing but stays in the user's warnings list. Leave the expiration blank to have it never expire.</p>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-username" placeholder="e.g. testuser" autocomplete="off">
+        <label>Reason <span style="opacity:0.4;">(required)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-reason" placeholder="e.g. Harassment in DMs" maxlength="500">
+        <label>Expires In <span style="opacity:0.4;">(optional, e.g. 45s, 30m, 6h, 3d, 2w, 1y - blank = never expires)</span></label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-duration" placeholder="e.g. 2w" maxlength="20">
+        <div class="action-row">
+            <button class="button" id="warn-submit-btn" onclick="submitWarn()" style="width:140px;">Issue Warning</button>
+        </div>
+        <div id="warn-result"></div>
+    </div>
+
+    <div class="panel">
+        <h2>View / Manage Warnings</h2>
+        <label>Username</label>
+        <input style="border-radius: 20px; height: 30px;" type="text" id="warnings-lookup-username" placeholder="e.g. testuser" autocomplete="off">
+        <div class="action-row">
+            <button class="button" onclick="loadWarnings()" style="width:140px;">Load</button>
+        </div>
+        <div id="warnings-standing" style="margin:10px 0;"></div>
+        <table>
+            <thead><tr><th>Reason</th><th>Issued By</th><th>Issued</th><th>Expires</th><th>Status</th><th></th></tr></thead>
+            <tbody id="warnings-table">
+                <tr><td colspan="6" style="opacity:0.4;">Load a user to see their warnings.</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div class="panel">
         <h2>All Users</h2>
         <table>
-            <thead><tr><th>Username</th><th>Badges</th><th>Ban Reason</th><th>Last IP</th></tr></thead>
+            <thead><tr><th>Username</th><th>Badges</th><th>Ban Reason</th><th>Standing</th><th>Last IP</th></tr></thead>
             <tbody id="user-table">
-                ${userRows || '<tr><td colspan="4" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No users found.</td></tr>'}
+                ${userRows || '<tr><td colspan="5" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No users found.</td></tr>'}
             </tbody>
         </table>
     </div>
@@ -5288,6 +5511,102 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         }
     }
 
+    function escClient(str) {
+        const d = document.createElement('div');
+        d.textContent = str == null ? '' : String(str);
+        return d.innerHTML;
+    }
+
+    async function submitWarn() {
+        const username = document.getElementById('warn-username').value.trim();
+        const reason = document.getElementById('warn-reason').value.trim();
+        const duration = document.getElementById('warn-duration').value.trim();
+        const resultEl = document.getElementById('warn-result');
+
+        if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Username is required.'; return; }
+        if (!reason) { resultEl.className = 'err'; resultEl.textContent = 'A reason is required.'; return; }
+
+        resultEl.className = ''; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/warn/' + encodeURIComponent(username), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason, duration })
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                resultEl.className = 'err';
+                resultEl.textContent = 'Error: ' + (data.error || res.status);
+            } else {
+                resultEl.className = 'ok';
+                resultEl.textContent = '@' + username + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + ').';
+                document.getElementById('warn-username').value = '';
+                document.getElementById('warn-reason').value = '';
+                document.getElementById('warn-duration').value = '';
+                setTimeout(() => location.reload(), 1200);
+            }
+        } catch (e) {
+            resultEl.className = 'err';
+            resultEl.textContent = 'Network error.';
+        }
+    }
+
+    function prefillWarnUsername(username) {
+        document.getElementById('warn-username').value = username;
+        document.getElementById('warn-username').focus();
+        document.getElementById('warn-username').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function renderStandingLine(standing) {
+        return '<strong>' + standing.label + '</strong> <span style="opacity:0.6;">(' + standing.count + ' active warning' + (standing.count === 1 ? '' : 's') + ')</span>';
+    }
+
+    async function loadWarnings() {
+        const username = document.getElementById('warnings-lookup-username').value.trim();
+        const standingEl = document.getElementById('warnings-standing');
+        const tableEl = document.getElementById('warnings-table');
+        if (!username) { standingEl.className = 'err'; standingEl.textContent = 'Enter a username.'; return; }
+        standingEl.className = ''; standingEl.textContent = 'Loading...';
+        tableEl.innerHTML = '<tr><td colspan="6" style="opacity:0.4;">Loading...</td></tr>';
+        try {
+            const res = await fetch('/admin/warnings/' + encodeURIComponent(username));
+            const data = await res.json();
+            if (!res.ok) { standingEl.className = 'err'; standingEl.textContent = 'Error: ' + (data.error || res.status); tableEl.innerHTML = '<tr><td colspan="6" style="opacity:0.4;">-</td></tr>'; return; }
+            standingEl.className = '';
+            standingEl.innerHTML = '@' + escClient(username) + ' standing: ' + renderStandingLine(data.standing);
+            if (!data.warnings.length) {
+                tableEl.innerHTML = '<tr><td colspan="6" style="opacity:0.4;">No warnings on record.</td></tr>';
+                return;
+            }
+            tableEl.innerHTML = data.warnings.map(w => {
+                const statusHtml = w.active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+                const revokeBtn = w.active ? '<button class="button" style="font-size:0.72em;padding:2px 8px;" onclick="revokeWarning(' + w.id + ')">Revoke</button>' : '';
+                return '<tr>' +
+                    '<td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">' + escClient(w.reason) + '</td>' +
+                    '<td style="font-size:0.85em;">' + escClient(w.issued_by) + '</td>' +
+                    '<td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">' + new Date(w.created_at).toLocaleString() + '</td>' +
+                    '<td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">' + (w.expires_at ? new Date(w.expires_at).toLocaleString() : 'Never') + '</td>' +
+                    '<td>' + statusHtml + '</td>' +
+                    '<td>' + revokeBtn + '</td>' +
+                '</tr>';
+            }).join('');
+        } catch (e) {
+            standingEl.className = 'err'; standingEl.textContent = 'Network error.';
+        }
+    }
+
+    async function revokeWarning(id) {
+        if (!confirm('Revoke this warning early? It will stop counting toward standing but stay listed.')) return;
+        try {
+            const res = await fetch('/admin/warnings/' + id + '/revoke', { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok) { alert('Error: ' + (data.error || res.status)); return; }
+            loadWarnings();
+        } catch (e) {
+            alert('Network error.');
+        }
+    }
+
     function prefillIPBan(ip) {
         document.getElementById('target-ip').value = ip;
         document.getElementById('ip-action').value = 'ipban';
@@ -5344,6 +5663,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 </html>`);
         });
         });
+    });
     });
 });
 
@@ -5421,6 +5741,75 @@ app.post('/admin/unban/:username', requireAdmin, (req, res) => {
             if (!err2 && row && row.email) sendAccountUnbannedEmail(row.email, target);
         });
         res.json({ ok: true, banned: false, username: target });
+    });
+});
+
+// Issues a warning against an account's standing. Unlike bans, an
+// expiration is REQUIRED - warnings are meant to fade, not stick around
+// forever - so `duration` must parse to a positive amount (e.g. 30m, 6h,
+// 3d, 2w, 1y).
+// Optional expiration: blank/omitted duration means the warning never
+// expires (expiresAt stays null and it counts toward standing forever). A
+// non-blank duration must still parse to a valid positive amount.
+app.post('/admin/warn/:username', requireAdmin, (req, res) => {
+    const target = req.params.username;
+    const reason = (req.body.reason || '').trim().substring(0, 500);
+    if (!reason) return res.status(400).json({ error: 'a reason is required' });
+    let expiresAt = null;
+    if (req.body.duration && String(req.body.duration).trim()) {
+        const ms = parseBanDuration(req.body.duration);
+        if (ms === null) return res.status(400).json({ error: 'invalid expiration - use e.g. 45s, 30m, 6h, 3d, 2w, 1y, or leave blank to never expire' });
+        expiresAt = new Date(Date.now() + ms).toISOString();
+    }
+
+    db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err, user) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!user) return res.status(404).json({ error: 'user not found' });
+        db.run(`INSERT INTO Warnings (username, reason, issued_by, expires_at) VALUES (?, ?, ?, ?)`,
+            [target, reason, req.session.userUsername, expiresAt], function(err2) {
+                if (err2) return res.status(500).json({ error: 'db error' });
+                logAudit('warning_issued', req.session.userUsername, target, expiresAt ? `${reason} (expires ${expiresAt})` : `${reason} (never expires)`);
+                if (user.email) sendWarningEmail(user.email, target, reason, expiresAt);
+                getWarningsForUser(target, (err3, warnings) => {
+                    const activeCount = err3 ? null : warnings.filter(isWarningActive).length;
+                    res.json({ ok: true, id: this.lastID, username: target, expiresAt, standing: activeCount === null ? null : getStanding(activeCount) });
+                });
+            });
+    });
+});
+
+// Lists every warning (active + expired) for a user, plus their current
+// standing. Expired warnings are included so history isn't lost, each
+// flagged with `active: false`.
+app.get('/admin/warnings/:username', requireAdmin, (req, res) => {
+    const target = req.params.username;
+    getWarningsForUser(target, (err, warnings) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        const decorated = warnings.map(w => ({ ...w, active: isWarningActive(w) }));
+        const activeCount = decorated.filter(w => w.active).length;
+        res.json({ username: target, standing: getStanding(activeCount), warnings: decorated });
+    });
+});
+
+// Manually expires a warning early (pulls expires_at back to now) instead
+// of deleting it, so it stops affecting standing but still shows up in the
+// warnings list, same as a naturally-expired one.
+app.post('/admin/warnings/:id/revoke', requireAdmin, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid warning id' });
+    db.get(`SELECT id, username, reason, expires_at FROM Warnings WHERE id = ?`, [id], (err, warning) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!warning) return res.status(404).json({ error: 'warning not found' });
+        if (!isWarningActive(warning)) return res.status(400).json({ error: 'warning is already expired' });
+        const now = new Date().toISOString();
+        db.run(`UPDATE Warnings SET expires_at = ? WHERE id = ?`, [now, id], (err2) => {
+            if (err2) return res.status(500).json({ error: 'db error' });
+            logAudit('warning_revoked', req.session.userUsername, warning.username, `warning #${id}`);
+            db.get(`SELECT email FROM User_Data WHERE username = ?`, [warning.username], (err3, row) => {
+                if (!err3 && row && row.email) sendWarningRevokedEmail(row.email, warning.username, warning.reason);
+            });
+            res.json({ ok: true, id });
+        });
     });
 });
 

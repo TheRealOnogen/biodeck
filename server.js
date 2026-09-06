@@ -409,6 +409,52 @@ function renderAvatarHTML(avatarPath, username, size) {
     return `<div style="width:${size}px;height:${size}px;min-width:${size}px;border-radius:50%;background:rgba(255,255,255,0.12);border:1px solid rgba(255,255,255,0.2);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:${Math.round(size * 0.45)}px;">${initial}</div>`;
 }
 
+// Renders just the avatar (+ username heading) shown above the ban/delete
+// notice message on those screens.
+function renderAvatarBlockHTML(avatarPath, username) {
+    return `<div style="display:flex;justify-content:center;margin-bottom:10px;">
+            ${renderAvatarHTML(avatarPath, username || '?', 84)}
+        </div>
+        ${username ? `<h2 style="margin:0 0 14px;">@${escapeHTML(username)}</h2>` : ''}`;
+}
+
+// Renders the "Account Standing" block shown below the ban/delete message
+// and reason, mirroring the /standing page but with the standing forced to
+// "Banned"/"Deleted" instead of a warning-count-based level, since a banned
+// or deleted account's standing isn't meaningfully "All good"/"At risk"/etc.
+// anymore.
+function renderStandingBlockHTML(status) {
+    const color = status === 'Deleted' ? 'var(--gray-color)' : 'var(--danger-color)';
+    return `<div style="margin:18px 0;">
+        <div style="opacity:0.6;font-size:0.85em;margin-bottom:4px;">Account Standing</div>
+        <div style="font-size:1.3em;color:${color};font-weight:700;">${status}</div>
+    </div>`;
+}
+
+// Renders the same warnings table used on the /standing page, so the
+// ban/delete notice screens can show a user's warning history too.
+function renderWarningsTableHTML(warnings) {
+    warnings = warnings || [];
+    const rows = warnings.map(w => {
+        const active = isWarningActive(w);
+        const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+        return `<tr>
+            <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(w.reason || '')}</td>
+            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at).toLocaleString())}</td>
+            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${w.expires_at ? escapeHTML(new Date(w.expires_at).toLocaleString()) : 'Never'}</td>
+            <td>${statusHtml}</td>
+        </tr>`;
+    }).join('');
+    return `<div style="text-align:left;">
+        <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Warnings</div>
+        ${warnings.length ? `
+        <table>
+            <thead><tr><th>Reason</th><th>Issued</th><th>Expires</th><th>Status</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
+    </div>`;
+}
+
 function renderMessageBubble(m, me, replyMsg) {
     const mine = m.from_user === me;
     const fileHTML = renderAttachmentsHTML(getAttachments(m), 260, '260px');
@@ -1178,16 +1224,19 @@ function checkIPBan(req, res, next) {
 function checkBan(req, res, next) {
     if (!req.session.userId) return next();
 
-    db.get(`SELECT IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsAdmin, IsOwner, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+    db.get(`SELECT IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsAdmin, IsOwner, IsHeadAdmin, avatar_path FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         if (err) return next();
         // No row at all means the account was permanently deleted (hard
         // delete removes the row entirely, unlike the soft delete which
         // keeps it with IsDeleted = 1). Treat it the same way as a soft
         // delete for any session that's still logged in elsewhere.
         if (!user) {
-            req.session.destroy(() => {
-                res.clearCookie('connect.sid');
-                return res.send(`<!DOCTYPE html>
+            const goneUsername = req.session.userUsername;
+            getWarningsForUser(goneUsername, (errW, warnings) => {
+                const warningsHTML = renderWarningsTableHTML(warnings);
+                req.session.destroy(() => {
+                    res.clearCookie('connect.sid');
+                    return res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
 <meta charset="UTF-8">
@@ -1195,14 +1244,31 @@ function checkBan(req, res, next) {
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    html, body {
+        height: auto !important;
+        min-height: 100% !important;
+        overflow-y: auto !important;
+    }
+    body {
+        margin: 0 !important;
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+    }
+</style>
 </head>
 <body>
-    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; margin: 40px auto; overflow-y: visible;">
+        ${renderAvatarBlockHTML(null, goneUsername)}
         <h1>Your account has been deleted</h1><br>
+        ${renderStandingBlockHTML('Deleted')}
+        ${warningsHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
 </html>`);
+                });
             });
             return;
         }
@@ -1210,9 +1276,13 @@ function checkBan(req, res, next) {
         req.isHeadAdmin = !!(user.IsHeadAdmin || user.IsOwner);
         if (user.IsDeleted == 1) {
             const reason = escapeHTML(user.DeleteReason || 'No reason provided');
-            req.session.destroy(() => {
-                res.clearCookie('connect.sid');
-                return res.send(`<!DOCTYPE html>
+            const deletedUsername = req.session.userUsername;
+            const deletedAvatarPath = user.avatar_path;
+            getWarningsForUser(deletedUsername, (errW, warnings) => {
+                const warningsHTML = renderWarningsTableHTML(warnings);
+                req.session.destroy(() => {
+                    res.clearCookie('connect.sid');
+                    return res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
 <meta charset="UTF-8">
@@ -1220,15 +1290,32 @@ function checkBan(req, res, next) {
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    html, body {
+        height: auto !important;
+        min-height: 100% !important;
+        overflow-y: auto !important;
+    }
+    body {
+        margin: 0 !important;
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+    }
+</style>
 </head>
 <body>
-    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; margin: 40px auto; overflow-y: visible;">
+        ${renderAvatarBlockHTML(deletedAvatarPath, deletedUsername)}
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${reason}</h3><br><br>
+        ${renderStandingBlockHTML('Deleted')}
+        ${warningsHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
 </html>`);
+                });
             });
         } else if (user.IsBanned == 1 && user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
             // Timed ban has expired - clear it (and email the user) instead of
@@ -1240,9 +1327,13 @@ function checkBan(req, res, next) {
             const expiryLine = user.BanExpiresAt
                 ? `<h3>Ban Expires: ${escapeHTML(new Date(user.BanExpiresAt).toLocaleString())}</h3><br><br>`
                 : '';
-            req.session.destroy(() => {
-                res.clearCookie('connect.sid');
-                return res.send(`<!DOCTYPE html>
+            const bannedUsername = req.session.userUsername;
+            const bannedAvatarPath = user.avatar_path;
+            getWarningsForUser(bannedUsername, (errW, warnings) => {
+                const warningsHTML = renderWarningsTableHTML(warnings);
+                req.session.destroy(() => {
+                    res.clearCookie('connect.sid');
+                    return res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
 <meta charset="UTF-8">
@@ -1250,16 +1341,33 @@ function checkBan(req, res, next) {
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    html, body {
+        height: auto !important;
+        min-height: 100% !important;
+        overflow-y: auto !important;
+    }
+    body {
+        margin: 0 !important;
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+    }
+</style>
 </head>
 <body>
-    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; margin: 40px auto; overflow-y: visible;">
+        ${renderAvatarBlockHTML(bannedAvatarPath, bannedUsername)}
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${reason}</h3><br><br>
         ${expiryLine}
+        ${renderStandingBlockHTML('Banned')}
+        ${warningsHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
 </html>`);
+                });
             });
         } else {
             next();
@@ -1801,6 +1909,8 @@ app.post('/login', (req, res) => {
             if (match) {
                 if (user.IsDeleted) {
                     const reason = user.DeleteReason || 'No reason provided';
+                    const deletedWarnings = await new Promise((resolve) => getWarningsForUser(user.username, (e, w) => resolve(w || [])));
+                    const deletedWarningsHTML = renderWarningsTableHTML(deletedWarnings);
                     return res.status(401).send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -1809,11 +1919,27 @@ app.post('/login', (req, res) => {
 <title>Account Deleted</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    html, body {
+        height: auto !important;
+        min-height: 100% !important;
+        overflow-y: auto !important;
+    }
+    body {
+        margin: 0 !important;
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+    }
+</style>
 </head>
 <body>
-    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; margin: 40px auto; overflow-y: visible;">
+        ${renderAvatarBlockHTML(user.avatar_path, user.username)}
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${escapeHTML(reason)}</h3><br><br>
+        ${renderStandingBlockHTML('Deleted')}
+        ${deletedWarningsHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
     <script>
@@ -1838,6 +1964,8 @@ app.post('/login', (req, res) => {
                     const expiryLine = user.BanExpiresAt
                         ? `<h3>Ban Expires: ${escapeHTML(new Date(user.BanExpiresAt).toLocaleString())}</h3><br><br>`
                         : '';
+                    const bannedWarnings = await new Promise((resolve) => getWarningsForUser(user.username, (e, w) => resolve(w || [])));
+                    const bannedWarningsHTML = renderWarningsTableHTML(bannedWarnings);
                     return res.status(401).send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -1846,12 +1974,28 @@ app.post('/login', (req, res) => {
 <title>Banned</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    html, body {
+        height: auto !important;
+        min-height: 100% !important;
+        overflow-y: auto !important;
+    }
+    body {
+        margin: 0 !important;
+        display: flex !important;
+        align-items: flex-start !important;
+        justify-content: center !important;
+    }
+</style>
 </head>
 <body>
-    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box;">
+    <div class="box" style="color: var(--text-color); height: auto; width: 500px; max-width: 90vw; word-break: break-word; overflow-wrap: break-word; box-sizing: border-box; margin: 40px auto; overflow-y: visible;">
+        ${renderAvatarBlockHTML(user.avatar_path, user.username)}
         <h1>The ban hammer has struck you</h1><br>
         <h3>Ban Reason: ${escapeHTML(reason)}</h3><br><br>
         ${expiryLine}
+        ${renderStandingBlockHTML('Banned')}
+        ${bannedWarningsHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
     <script>
@@ -4979,6 +5123,22 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 <title>Admin Dashboard</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+<style>
+    /* Force wide tables (like All Users) to scroll horizontally inside their
+       own panel instead of overflowing past it, regardless of anything
+       theme.css sets on .panel/table. */
+    .table-scroll-wrap {
+        display: block !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
+    .table-scroll-wrap > table {
+        width: max-content !important;
+        min-width: 100% !important;
+    }
+</style>
 </head>
 <body class="page-admin">
 <div id="topbar">
@@ -5157,33 +5317,39 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             <button class="button" onclick="loadWarnings()" style="width:140px;">Load</button>
         </div>
         <div id="warnings-standing" style="margin:10px 0;"></div>
+        <div class="table-scroll-wrap">
         <table>
             <thead><tr><th>Reason</th><th>Issued By</th><th>Issued</th><th>Expires</th><th>Status</th><th></th></tr></thead>
             <tbody id="warnings-table">
                 <tr><td colspan="6" style="opacity:0.4;">Load a user to see their warnings.</td></tr>
             </tbody>
         </table>
+        </div>
     </div>
 
     <div class="panel">
         <h2>All Users</h2>
+        <div class="table-scroll-wrap">
         <table>
             <thead><tr><th>Username</th><th>Badges</th><th>Ban Reason</th><th>Standing</th><th>Last IP</th></tr></thead>
             <tbody id="user-table">
                 ${userRows || '<tr><td colspan="5" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No users found.</td></tr>'}
             </tbody>
         </table>
+        </div>
     </div>
 
     <div class="panel">
         <h2>Audit Log</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Most recent 150 events - account creations, bans/unbans, deletions, and registration gate changes.</p>
+        <div class="table-scroll-wrap">
         <table>
             <thead><tr><th>Time</th><th>Action</th><th>Actor</th><th>Target</th><th>Details</th></tr></thead>
             <tbody id="audit-table">
                 ${auditRows || '<tr><td colspan="5" style="opacity:0.4; word-break: break-word; overflow-wrap: break-word">No audit events yet.</td></tr>'}
             </tbody>
         </table>
+        </div>
     </div>
 </div>
 

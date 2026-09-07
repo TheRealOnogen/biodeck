@@ -182,6 +182,10 @@ function broadcastDMDelete(fromUser, toUser, msgId) {
     dmBus.emit(`${fromUser}::${toUser}`, { event: 'delete', id: msgId });
     dmBus.emit(`${toUser}::${fromUser}`, { event: 'delete', id: msgId });
 }
+function broadcastDMEdit(fromUser, toUser, row, replyMsg) {
+    dmBus.emit(`${fromUser}::${toUser}`, { event: 'edit', html: renderMessageBubble(row, fromUser, replyMsg), id: row.id });
+    dmBus.emit(`${toUser}::${fromUser}`, { event: 'edit', html: renderMessageBubble(row, toUser, replyMsg), id: row.id });
+}
 
 function broadcastGCMessage(groupId, fromUser, row, replyMsg, memberUsernames) {
     const htmlForSender = renderGCMessageBubble(row, fromUser, replyMsg);
@@ -194,6 +198,14 @@ function broadcastGCMessage(groupId, fromUser, row, replyMsg, memberUsernames) {
 function broadcastGCDelete(groupId, msgId, memberUsernames) {
     memberUsernames.forEach(u => {
         gcBus.emit(`${groupId}::${u}`, { event: 'delete', id: msgId });
+    });
+}
+function broadcastGCEdit(groupId, fromUser, row, replyMsg, memberUsernames) {
+    const htmlForSender = renderGCMessageBubble(row, fromUser, replyMsg);
+    const htmlForOthers = renderGCMessageBubble(row, `\u0000${fromUser}`, replyMsg); // sentinel "me" that never matches a real username
+    gcBus.emit(`${groupId}::${fromUser}`, { event: 'edit', html: htmlForSender, id: row.id });
+    memberUsernames.filter(u => u !== fromUser).forEach(u => {
+        gcBus.emit(`${groupId}::${u}`, { event: 'edit', html: htmlForOthers, id: row.id });
     });
 }
 
@@ -478,17 +490,21 @@ function renderMessageBubble(m, me, replyMsg) {
     const replyBanner = replyMsg
         ? `<div class="msg-reply-banner" style="font-size:0.78em;opacity:0.6;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
         : '';
+    const editLink = mine ? `<a href="#" onclick="editMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
+    const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderHeader}
             ${replyBanner}
-            <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
+                ${editLink}
                 ${deleteLink}
+                ${editedMarker}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
         </div>
@@ -744,24 +760,27 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     const isOwner = post.username === sessionUsername;
     const canDelete = isOwner || isAdmin;
     const deleteBtn = canDelete ? `<button class="button post-action-btn" onclick="deletePost(${post.id})">Delete${(!isOwner && isAdmin) ? '' : ''}</button>` : '';
+    const editBtn = isOwner ? `<button class="button post-action-btn" onclick="editPost(${post.id})">Edit</button>` : '';
     const pinBtn = isAdmin ? `<button class="button post-action-btn" onclick="${post.pinned ? `unpinPost(${post.id})` : `pinPost(${post.id})`}">${post.pinned ? 'Unpin' : 'Pin'}</button>` : '';
     const safeUsername = escapeHTML(post.username);
     const { embedHTML, cleanText } = renderEmbeds(post.content || '');
     const safeContent = escapeHTML(cleanText);
     const avatarHTML = renderAvatarHTML(post.avatar_path, post.username, 32);
+    const editedMarker = post.edited ? `<span style="opacity:0.6;font-size:0.8em;margin-left:6px;">(edited)</span>` : '';
     return `<div class="post-header" style="display:flex;align-items:flex-start;gap:8px;">
             <a href="/user/${safeUsername}" style="flex-shrink:0;">${avatarHTML}</a>
             <div style="display:flex;flex-direction:column;min-width:0;">
                 <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;">${renderNameWithHandle(post.username, post.Nickname, { isVerified: post.IsVerified })}</a>
-                <span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>
+                <span><span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>${editedMarker}</span>
             </div>
         </div>
-        <div class="post-content">${linkifyMentions(safeContent)}</div>
+        <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${linkifyMentions(safeContent)}</div>
         ${embedHTML}
         ${fileHTML}
         <div class="post-actions">
             <a href="/post/${post.id}" class="button post-action-btn reply-count-btn" data-post-id="${post.id}" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">${(post.reply_count || 0)} Replies</a>
             ${pinBtn}
+            ${editBtn}
             ${deleteBtn}
         </div>`;
 }
@@ -922,6 +941,9 @@ db.serialize(() => {
             db.run(`ALTER TABLE Messages ADD COLUMN file_name TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE Messages ADD COLUMN files_json TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE Messages ADD COLUMN reply_to INTEGER DEFAULT NULL`, () => {});
+            // Set to 1 the first time a message's content is changed via
+            // /messages/:username/edit/:id, so bubbles can show "(edited)".
+            db.run(`ALTER TABLE Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsOwner INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeveloper INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsSupporter INTEGER DEFAULT 0`, () => {});
@@ -1006,6 +1028,9 @@ db.serialize(() => {
             db.run(`ALTER TABLE Posts ADD COLUMN reply_to INTEGER DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE Posts ADD COLUMN pinned INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE Posts ADD COLUMN files_json TEXT DEFAULT NULL`, () => {});
+            // Set to 1 the first time a post/reply's content is changed via
+            // /feed/edit/:id, so it can show an "(edited)" marker.
+            db.run(`ALTER TABLE Posts ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
             db.run(`CREATE TABLE IF NOT EXISTS Follows (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 follower_username TEXT NOT NULL,
@@ -1072,6 +1097,9 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN files_json TEXT DEFAULT NULL`, () => {});
+            // Set to 1 the first time a group message's content is changed via
+            // /groups/:id/edit/:msgId, so it can show an "(edited)" marker.
+            db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
             // Generic key/value store for small admin-configurable settings
             // (e.g. the registration gate toggle below).
             db.run(`CREATE TABLE IF NOT EXISTS Settings (
@@ -2954,6 +2982,71 @@ app.get('/feed', (req, res) => {
         function unpinPost(id) {
             fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
         }
+        const postEditOriginal = {};
+        function editPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (!el || el.dataset.editing) return;
+            postEditOriginal[id] = el.innerHTML;
+            el.dataset.editing = '1';
+            const raw = el.getAttribute('data-raw') || '';
+            el.innerHTML = '';
+            const ta = document.createElement('textarea');
+            ta.className = 'box';
+            ta.maxLength = 1000;
+            ta.style.cssText = 'width:100%;box-sizing:border-box;font-family:inherit;font-size:inherit;padding:6px;resize:vertical;';
+            ta.value = raw;
+            el.appendChild(ta);
+            const actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;gap:10px;font-size:0.85em;';
+            const saveLink = document.createElement('a');
+            saveLink.href = '#'; saveLink.className = 'button'; saveLink.textContent = 'Save'; saveLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            saveLink.onclick = (e) => { e.preventDefault(); saveEditPost(id, ta.value); };
+            const cancelLink = document.createElement('a');
+            cancelLink.href = '#'; cancelLink.className = 'button'; cancelLink.textContent = 'Cancel'; cancelLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            cancelLink.onclick = (e) => { e.preventDefault(); cancelEditPost(id); };
+            actions.appendChild(saveLink);
+            actions.appendChild(cancelLink);
+            el.appendChild(actions);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditPost(id, ta.value); }
+                else if (e.key === 'Escape') cancelEditPost(id);
+            });
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+        function cancelEditPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (el && postEditOriginal[id] !== undefined) {
+                el.innerHTML = postEditOriginal[id];
+                delete el.dataset.editing;
+                delete postEditOriginal[id];
+            }
+        }
+        function saveEditPost(id, content) {
+            if (!content || !content.trim()) return;
+            fetch('/feed/edit/' + id, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+                if (!ok) { showPostError((d && d.error) || 'Failed to edit post.'); return; }
+                delete postEditOriginal[id];
+                const wrapper = document.getElementById('post-' + id);
+                if (wrapper && d && d.html) {
+                    wrapper.innerHTML = d.html;
+                    wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                        el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                    });
+                }
+            }).catch(() => showPostError('Network error - edit not saved.'));
+        }
+        function showPostError(message) {
+            const t = document.createElement('div');
+            t.textContent = message;
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+        }
         let lastPostId = (() => {
             const posts = document.querySelectorAll('.post[id^="post-"]');
             let max = ${newestPostId};
@@ -3024,10 +3117,37 @@ app.get('/feed', (req, res) => {
                 .catch(() => {});
         }
 
+        function pollEdits() {
+            const ids = [];
+            document.querySelectorAll('.post[id^="post-"]').forEach(el => {
+                ids.push(parseInt(el.id.replace('post-', '')));
+            });
+            if (!ids.length) return;
+            fetch('/feed/edits?' + ids.map(id => 'id=' + id).join('&'))
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !data.posts) return;
+                    Object.keys(data.posts).forEach(id => {
+                        const contentEl = document.getElementById('post-content-' + id);
+                        if (contentEl && contentEl.dataset.editing) return;
+                        if (contentEl && contentEl.getAttribute('data-raw') === data.posts[id].raw) return;
+                        const wrapper = document.getElementById('post-' + id);
+                        if (wrapper) {
+                            wrapper.innerHTML = data.posts[id].html;
+                            wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                                el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                            });
+                        }
+                    });
+                })
+                .catch(() => {});
+        }
+
         setInterval(pollFeed, 4000);
         setInterval(pollDeletions, 5000);
         setInterval(pollReplyCounts, 5000);
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); } });
+        setInterval(pollEdits, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); pollEdits(); } });
 
         const searchInput = document.getElementById('feed-search-input');
         const searchClear = document.getElementById('feed-search-clear');
@@ -3239,6 +3359,25 @@ app.post('/feed/delete/:id', (req, res) => {
     });
 });
 
+app.post('/feed/edit/:id', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const postId = parseInt(req.params.id);
+    const { content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'Post cannot be empty.' });
+    if (content.length > MAX_POST_LENGTH) return res.status(400).json({ error: `Post too long - ${MAX_POST_LENGTH} character limit.` });
+    db.get(`SELECT username FROM Posts WHERE id = ?`, [postId], (err, post) => {
+        if (err || !post) return res.status(404).json({ error: 'Post not found.' });
+        if (post.username !== req.session.userUsername) return res.status(403).json({ error: 'You can only edit your own posts.' });
+        db.run(`UPDATE Posts SET content = ?, edited = 1 WHERE id = ?`, [content.trim(), postId], (err2) => {
+            if (err2) { console.error('Post edit error:', err2.message); return res.status(500).json({ error: 'Failed to edit post.' }); }
+            db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err3, row) => {
+                if (err3 || !row) return res.json({ ok: true });
+                res.json({ ok: true, html: renderFeedPost(row, req.session.userUsername, 350, req.isAdmin) });
+            });
+        });
+    });
+});
+
 app.get('/feed/exists', (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
     let ids = req.query.id;
@@ -3268,6 +3407,31 @@ app.get('/feed/reply-counts', (req, res) => {
             intIds.forEach(id => counts[id] = 0);
             (rows || []).forEach(r => counts[r.post_id] = r.cnt);
             res.json({ counts });
+        }
+    );
+});
+
+// Lets clients poll for posts that have been edited since they were first rendered,
+// so people other than the editor see the new content without a full page refresh.
+// Returns the raw content (for a cheap client-side "did this change?" check) plus a
+// freshly rendered card, but only for posts that are currently marked edited.
+app.get('/feed/edits', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    let ids = req.query.id;
+    if (!ids) return res.json({ posts: {} });
+    if (!Array.isArray(ids)) ids = [ids];
+    const intIds = ids.map(Number).filter(Boolean);
+    if (!intIds.length) return res.json({ posts: {} });
+    db.all(
+        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id IN (${intIds.map(() => '?').join(',')}) AND edited = 1`,
+        intIds,
+        (err, rows) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            const posts = {};
+            (rows || []).forEach(row => {
+                posts[row.id] = { raw: row.content || '', html: renderFeedPost(row, req.session.userUsername, 350, req.isAdmin) };
+            });
+            res.json({ posts });
         }
     );
 });
@@ -3442,6 +3606,71 @@ app.get('/following-feed', (req, res) => {
             btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
         });
 
+        const postEditOriginal = {};
+        function editPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (!el || el.dataset.editing) return;
+            postEditOriginal[id] = el.innerHTML;
+            el.dataset.editing = '1';
+            const raw = el.getAttribute('data-raw') || '';
+            el.innerHTML = '';
+            const ta = document.createElement('textarea');
+            ta.className = 'box';
+            ta.maxLength = 1000;
+            ta.style.cssText = 'width:100%;box-sizing:border-box;font-family:inherit;font-size:inherit;padding:6px;resize:vertical;';
+            ta.value = raw;
+            el.appendChild(ta);
+            const actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;gap:10px;font-size:0.85em;';
+            const saveLink = document.createElement('a');
+            saveLink.href = '#'; saveLink.className = 'button'; saveLink.textContent = 'Save'; saveLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            saveLink.onclick = (e) => { e.preventDefault(); saveEditPost(id, ta.value); };
+            const cancelLink = document.createElement('a');
+            cancelLink.href = '#'; cancelLink.className = 'button'; cancelLink.textContent = 'Cancel'; cancelLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            cancelLink.onclick = (e) => { e.preventDefault(); cancelEditPost(id); };
+            actions.appendChild(saveLink);
+            actions.appendChild(cancelLink);
+            el.appendChild(actions);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditPost(id, ta.value); }
+                else if (e.key === 'Escape') cancelEditPost(id);
+            });
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+        function cancelEditPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (el && postEditOriginal[id] !== undefined) {
+                el.innerHTML = postEditOriginal[id];
+                delete el.dataset.editing;
+                delete postEditOriginal[id];
+            }
+        }
+        function saveEditPost(id, content) {
+            if (!content || !content.trim()) return;
+            fetch('/feed/edit/' + id, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+                if (!ok) { showPostError((d && d.error) || 'Failed to edit post.'); return; }
+                delete postEditOriginal[id];
+                const wrapper = document.getElementById('post-' + id);
+                if (wrapper && d && d.html) {
+                    wrapper.innerHTML = d.html;
+                    wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                        el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                    });
+                }
+            }).catch(() => showPostError('Network error - edit not saved.'));
+        }
+        function showPostError(message) {
+            const t = document.createElement('div');
+            t.textContent = message;
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+        }
         function deletePost(id) {
             fetch('/feed/delete/' + id, { method: 'POST' }).then(r => {
                 if (r.ok) {
@@ -3528,10 +3757,37 @@ app.get('/following-feed', (req, res) => {
                 .catch(() => {});
         }
 
+        function pollEdits() {
+            const ids = [];
+            document.querySelectorAll('.post[id^="post-"]').forEach(el => {
+                ids.push(parseInt(el.id.replace('post-', '')));
+            });
+            if (!ids.length) return;
+            fetch('/feed/edits?' + ids.map(id => 'id=' + id).join('&'))
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !data.posts) return;
+                    Object.keys(data.posts).forEach(id => {
+                        const contentEl = document.getElementById('post-content-' + id);
+                        if (contentEl && contentEl.dataset.editing) return;
+                        if (contentEl && contentEl.getAttribute('data-raw') === data.posts[id].raw) return;
+                        const wrapper = document.getElementById('post-' + id);
+                        if (wrapper) {
+                            wrapper.innerHTML = data.posts[id].html;
+                            wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                                el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                            });
+                        }
+                    });
+                })
+                .catch(() => {});
+        }
+
         setInterval(pollFeed, 4000);
         setInterval(pollDeletions, 5000);
         setInterval(pollReplyCounts, 5000);
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); } });
+        setInterval(pollEdits, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); pollEdits(); } });
 
         let oldestPostId = ${oldestPostId};
         let hasMore = ${hasMoreInitial ? 'true' : 'false'};
@@ -3787,6 +4043,73 @@ app.get('/post/:id', (req, res) => {
 
         const ROOT_ID = ${rootPost.id};
 
+        const postEditOriginal = {};
+        function editPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (!el || el.dataset.editing) return;
+            postEditOriginal[id] = el.innerHTML;
+            el.dataset.editing = '1';
+            const raw = el.getAttribute('data-raw') || '';
+            el.innerHTML = '';
+            const ta = document.createElement('textarea');
+            ta.className = 'box';
+            ta.maxLength = 1000;
+            ta.style.cssText = 'width:100%;box-sizing:border-box;font-family:inherit;font-size:inherit;padding:6px;resize:vertical;';
+            ta.value = raw;
+            el.appendChild(ta);
+            const actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;gap:10px;font-size:0.85em;';
+            const saveLink = document.createElement('a');
+            saveLink.href = '#'; saveLink.className = 'button'; saveLink.textContent = 'Save'; saveLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            saveLink.onclick = (e) => { e.preventDefault(); saveEditPost(id, ta.value); };
+            const cancelLink = document.createElement('a');
+            cancelLink.href = '#'; cancelLink.className = 'button'; cancelLink.textContent = 'Cancel'; cancelLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            cancelLink.onclick = (e) => { e.preventDefault(); cancelEditPost(id); };
+            actions.appendChild(saveLink);
+            actions.appendChild(cancelLink);
+            el.appendChild(actions);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditPost(id, ta.value); }
+                else if (e.key === 'Escape') cancelEditPost(id);
+            });
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+        function cancelEditPost(id) {
+            const el = document.getElementById('post-content-' + id);
+            if (el && postEditOriginal[id] !== undefined) {
+                el.innerHTML = postEditOriginal[id];
+                delete el.dataset.editing;
+                delete postEditOriginal[id];
+            }
+        }
+        function saveEditPost(id, content) {
+            if (!content || !content.trim()) return;
+            fetch('/feed/edit/' + id, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+                if (!ok) { showPostError((d && d.error) || 'Failed to edit post.'); return; }
+                delete postEditOriginal[id];
+                // Root post uses a different wrapper id than replies.
+                const wrapper = document.getElementById('post-' + id) || document.getElementById('root-post-' + id);
+                if (wrapper && d && d.html) {
+                    wrapper.innerHTML = d.html;
+                    wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                        el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                    });
+                }
+            }).catch(() => showPostError('Network error - edit not saved.'));
+        }
+        function showPostError(message) {
+            const t = document.createElement('div');
+            t.textContent = message;
+            t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
+            document.body.appendChild(t);
+            setTimeout(() => t.remove(), 4000);
+        }
+
         function deletePost(id) {
             fetch('/feed/delete/' + id, { method: 'POST' }).then(r => {
                 if (!r.ok) return;
@@ -3876,9 +4199,37 @@ app.get('/post/:id', (req, res) => {
                 .catch(() => {});
         }
 
+        function pollEdits() {
+            const ids = [ROOT_ID];
+            document.querySelectorAll('.post[id^="post-"]').forEach(el => {
+                ids.push(parseInt(el.id.replace('post-', '')));
+            });
+            if (!ids.length) return;
+            fetch('/feed/edits?' + ids.map(id => 'id=' + id).join('&'))
+                .then(r => r.ok ? r.json() : null)
+                .then(data => {
+                    if (!data || !data.posts) return;
+                    Object.keys(data.posts).forEach(id => {
+                        const contentEl = document.getElementById('post-content-' + id);
+                        if (contentEl && contentEl.dataset.editing) return;
+                        if (contentEl && contentEl.getAttribute('data-raw') === data.posts[id].raw) return;
+                        // Root post uses a different wrapper id than replies.
+                        const wrapper = document.getElementById('post-' + id) || document.getElementById('root-post-' + id);
+                        if (wrapper) {
+                            wrapper.innerHTML = data.posts[id].html;
+                            wrapper.querySelectorAll('.post-time[data-ts]').forEach(el => {
+                                el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
+                            });
+                        }
+                    });
+                })
+                .catch(() => {});
+        }
+
         setInterval(pollReplies, 4000);
         setInterval(pollDeletions, 5000);
-        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollReplies(); pollDeletions(); } });
+        setInterval(pollEdits, 5000);
+        document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollReplies(); pollDeletions(); pollEdits(); } });
 
         let oldestReplyId = ${oldestReplyId};
         let hasMore = ${hasMoreInitial ? 'true' : 'false'};
@@ -4619,6 +4970,17 @@ app.get('/messages/:username', (req, res) => {
             const el = document.querySelector('.chat-msg-row[data-id="' + id + '"]');
             if (el) el.remove();
         }
+        function replaceMessage(id, html) {
+            if (!html) return;
+            const el = document.querySelector('.chat-msg-row[data-id="' + id + '"]');
+            if (!el) { appendNewMessage(id, html); return; }
+            el.outerHTML = html;
+            const newEl = document.querySelector('.chat-msg-row[data-id="' + id + '"]');
+            if (newEl) newEl.querySelectorAll('[data-ts]').forEach(e => {
+                const ts = e.getAttribute('data-ts');
+                if (ts) e.textContent = new Date(ts).toLocaleString('en-GB');
+            });
+        }
 
         // --- Live updates over Server-Sent Events (push, not polling) ---
         let chatStream = null;
@@ -4641,6 +5003,12 @@ app.get('/messages/:username', (req, res) => {
                 try {
                     const data = JSON.parse(e.data);
                     removeMessage(data.id);
+                } catch (err) {}
+            });
+            chatStream.addEventListener('edit', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    replaceMessage(data.id, data.html);
                 } catch (err) {}
             });
             chatStream.onerror = () => {
@@ -4689,6 +5057,58 @@ app.get('/messages/:username', (req, res) => {
             fetch('/messages/${other}/delete/' + id, { method: 'POST' }).then(r => {
                 if (r.ok) removeMessage(id);
             });
+        }
+        const msgEditOriginal = {};
+        function editMessage(id) {
+            const el = document.getElementById('msg-content-' + id);
+            if (!el || el.dataset.editing) return;
+            msgEditOriginal[id] = el.innerHTML;
+            el.dataset.editing = '1';
+            const raw = el.getAttribute('data-raw') || '';
+            el.innerHTML = '';
+            const ta = document.createElement('textarea');
+            ta.className = 'box';
+            ta.maxLength = 4000;
+            ta.style.cssText = 'width:100%;box-sizing:border-box;font-family:inherit;font-size:inherit;padding:6px;resize:vertical;';
+            ta.value = raw;
+            el.appendChild(ta);
+            const actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;gap:10px;font-size:0.85em;';
+            const saveLink = document.createElement('a');
+            saveLink.href = '#'; saveLink.className = 'button'; saveLink.textContent = 'Save'; saveLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            saveLink.onclick = (e) => { e.preventDefault(); saveEditMessage(id, ta.value); };
+            const cancelLink = document.createElement('a');
+            cancelLink.href = '#'; cancelLink.className = 'button'; cancelLink.textContent = 'Cancel'; cancelLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            cancelLink.onclick = (e) => { e.preventDefault(); cancelEditMessage(id); };
+            actions.appendChild(saveLink);
+            actions.appendChild(cancelLink);
+            el.appendChild(actions);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditMessage(id, ta.value); }
+                else if (e.key === 'Escape') cancelEditMessage(id);
+            });
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+        function cancelEditMessage(id) {
+            const el = document.getElementById('msg-content-' + id);
+            if (el && msgEditOriginal[id] !== undefined) {
+                el.innerHTML = msgEditOriginal[id];
+                delete el.dataset.editing;
+                delete msgEditOriginal[id];
+            }
+        }
+        function saveEditMessage(id, content) {
+            if (!content || !content.trim()) return;
+            fetch('/messages/${other}/edit/' + id, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+                if (!ok) { showChatError((d && d.error) || 'Failed to edit message.'); return; }
+                delete msgEditOriginal[id];
+                // The bubble itself is refreshed via the 'edit' SSE event.
+            }).catch(() => showChatError('Network error - edit not saved.'));
         }
         function showChatError(message) {
             const t = document.createElement('div');
@@ -4840,6 +5260,34 @@ app.post('/messages/:username/delete/:id', (req, res) => {
             if (err2) { console.error('Message delete error:', err2.message); return res.status(500).end(); }
             broadcastDMDelete(msg.from_user, msg.to_user, msgId);
             res.status(200).end();
+        });
+    });
+});
+
+app.post('/messages/:username/edit/:id', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const me = req.session.userUsername;
+    const msgId = parseInt(req.params.id);
+    const { content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'Message cannot be empty.' });
+    if (content.length > MAX_MSG_LENGTH) return res.status(400).json({ error: `Message too long - ${MAX_MSG_LENGTH} character limit.` });
+    db.get(`SELECT from_user, to_user, reply_to FROM Messages WHERE id = ?`, [msgId], (err, msg) => {
+        if (err || !msg) return res.status(404).json({ error: 'Message not found.' });
+        if (msg.from_user !== me) return res.status(403).json({ error: 'You can only edit your own messages.' });
+        db.run(`UPDATE Messages SET content = ?, edited = 1 WHERE id = ?`, [content.trim(), msgId], (err2) => {
+            if (err2) { console.error('Message edit error:', err2.message); return res.status(500).json({ error: 'Failed to edit message.' }); }
+            db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [msgId], (err3, row) => {
+                if (err3 || !row) return res.json({ ok: true });
+                const finish = (replyMsg) => {
+                    broadcastDMEdit(msg.from_user, msg.to_user, row, replyMsg);
+                    res.json({ ok: true });
+                };
+                if (row.reply_to) {
+                    db.get(`SELECT * FROM Messages WHERE id = ?`, [row.reply_to], (err4, replyRow) => finish(replyRow || null));
+                } else {
+                    finish(null);
+                }
+            });
         });
     });
 });
@@ -6303,17 +6751,21 @@ function renderGCMessageBubble(m, me, replyMsg) {
         <a href="/user/${escapeHTML(m.from_user)}" style="flex-shrink:0;">${avatarHTML}</a>
         <a href="/user/${escapeHTML(m.from_user)}" class="${mine ? 'msg-sender-mine' : 'msg-sender-other'}" style="text-decoration:none;font-weight:700;font-size:0.75em;">${renderNameWithHandle(m.from_user, m.Nickname, { isVerified: m.IsVerified })}</a>
     </div>`;
+    const editLink = mine ? `<a href="#" onclick="editGCMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
+    const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderLabel}
             ${replyBanner}
-            <div class="post-content">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${linkifyMentions(escapeHTML(cleanText))}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setGCReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
+                ${editLink}
                 ${deleteLink}
+                ${editedMarker}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
         </div>
@@ -6372,7 +6824,7 @@ app.get('/groups', (req, res) => {
             <div id="friends-picker-list"><p style="opacity:0.4;text-align:center;">Loading…</p></div>
             <div style="display:flex;gap:8px;justify-content:flex-end;">
                 <button class="button" onclick="closeFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;">Cancel</button>
-                <button class="button" onclick="confirmFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;background:rgba(0, 0, 0, 0.15);border-color:rgb(255, 255, 255);color:var(--text-color);">Done</button>
+                <button class="button" onclick="confirmFriendsPicker()" style="padding:6px 16px;width:auto;height:auto;">Done</button>
             </div>
         </div>
     </div>
@@ -6381,7 +6833,7 @@ app.get('/groups', (req, res) => {
         <div id="create-gc-form">
             <h3 style="margin:0 0 8px;">New Group Chat</h3>
             <input style="height: 25px;" type="text" id="gc-name" placeholder="Group name" maxlength="80">
-            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;height: 25px;">
+            <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
                 <button class="button" type="button" onclick="openFriendsPicker()" style="padding:7px 14px;width:auto;height:auto;font-size:0.9em;">+ Add Friends</button>
                 <span style="font-size:0.82em;opacity:0.5;" id="gc-selected-count">No friends selected</span>
             </div>
@@ -6712,6 +7164,16 @@ app.get('/groups/:id', (req, res) => {
             const el = gcMsgs.querySelector('.chat-msg-row[data-id="' + id + '"]');
             if (el) el.remove();
         }
+        function replaceGCMessage(id, html) {
+            const el = gcMsgs.querySelector('.chat-msg-row[data-id="' + id + '"]');
+            if (!el) { appendGCMessage(id, html); return; }
+            el.outerHTML = html;
+            const newEl = gcMsgs.querySelector('.chat-msg-row[data-id="' + id + '"]');
+            if (newEl) newEl.querySelectorAll('[data-ts]').forEach(e => {
+                const ts = e.getAttribute('data-ts');
+                if (ts) e.textContent = new Date(ts).toLocaleString('en-GB');
+            });
+        }
 
         // --- Live updates over Server-Sent Events (push, not polling) ---
         let gcStream = null;
@@ -6733,6 +7195,12 @@ app.get('/groups/:id', (req, res) => {
                 try {
                     const data = JSON.parse(e.data);
                     removeGCMessage(data.id);
+                } catch (err) {}
+            });
+            gcStream.addEventListener('edit', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    replaceGCMessage(data.id, data.html);
                 } catch (err) {}
             });
             gcStream.onerror = () => {
@@ -6781,6 +7249,58 @@ app.get('/groups/:id', (req, res) => {
             fetch('/groups/${groupId}/delete/' + id, { method: 'POST' }).then(r => {
                 if (r.ok) removeGCMessage(id);
             });
+        }
+        const msgGCEditOriginal = {};
+        function editGCMessage(id) {
+            const el = document.getElementById('gc-msg-content-' + id);
+            if (!el || el.dataset.editing) return;
+            msgGCEditOriginal[id] = el.innerHTML;
+            el.dataset.editing = '1';
+            const raw = el.getAttribute('data-raw') || '';
+            el.innerHTML = '';
+            const ta = document.createElement('textarea');
+            ta.className = 'box';
+            ta.maxLength = 4000;
+            ta.style.cssText = 'width:100%;box-sizing:border-box;font-family:inherit;font-size:inherit;padding:6px;resize:vertical;';
+            ta.value = raw;
+            el.appendChild(ta);
+            const actions = document.createElement('div');
+            actions.style.cssText = 'margin-top:4px;display:flex;gap:10px;font-size:0.85em;';
+            const saveLink = document.createElement('a');
+            saveLink.href = '#'; saveLink.className = 'button'; saveLink.textContent = 'Save'; saveLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            saveLink.onclick = (e) => { e.preventDefault(); saveEditGCMessage(id, ta.value); };
+            const cancelLink = document.createElement('a');
+            cancelLink.href = '#'; cancelLink.className = 'button'; cancelLink.textContent = 'Cancel'; cancelLink.style.cssText = 'width:auto;height:auto;padding:4px 14px;font-size:0.85em;text-decoration:none;';
+            cancelLink.onclick = (e) => { e.preventDefault(); cancelEditGCMessage(id); };
+            actions.appendChild(saveLink);
+            actions.appendChild(cancelLink);
+            el.appendChild(actions);
+            ta.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); saveEditGCMessage(id, ta.value); }
+                else if (e.key === 'Escape') cancelEditGCMessage(id);
+            });
+            ta.focus();
+            ta.setSelectionRange(ta.value.length, ta.value.length);
+        }
+        function cancelEditGCMessage(id) {
+            const el = document.getElementById('gc-msg-content-' + id);
+            if (el && msgGCEditOriginal[id] !== undefined) {
+                el.innerHTML = msgGCEditOriginal[id];
+                delete el.dataset.editing;
+                delete msgGCEditOriginal[id];
+            }
+        }
+        function saveEditGCMessage(id, content) {
+            if (!content || !content.trim()) return;
+            fetch('/groups/${groupId}/edit/' + id, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ content })
+            }).then(r => r.json().then(d => ({ ok: r.ok, d }))).then(({ ok, d }) => {
+                if (!ok) { showGCError((d && d.error) || 'Failed to edit message.'); return; }
+                delete msgGCEditOriginal[id];
+                // The bubble itself is refreshed via the 'edit' SSE event.
+            }).catch(() => showGCError('Network error - edit not saved.'));
         }
         function showGCError(message) {
             const t = document.createElement('div');
@@ -7025,6 +7545,38 @@ app.post('/groups/:id/delete/:msgId', (req, res) => {
             db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (err3, memberRows) => {
                 broadcastGCDelete(groupId, msgId, (memberRows || []).map(r => r.username));
                 res.status(200).end();
+            });
+        });
+    });
+});
+
+app.post('/groups/:id/edit/:msgId', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id);
+    const msgId = parseInt(req.params.msgId);
+    const { content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ error: 'Message cannot be empty.' });
+    if (content.length > MAX_MSG_LENGTH) return res.status(400).json({ error: `Message too long - ${MAX_MSG_LENGTH} character limit.` });
+    db.get(`SELECT from_user, reply_to FROM Group_Chat_Messages WHERE id = ? AND group_id = ?`, [msgId, groupId], (err, msg) => {
+        if (err || !msg) return res.status(404).json({ error: 'Message not found.' });
+        if (msg.from_user !== me) return res.status(403).json({ error: 'You can only edit your own messages.' });
+        db.run(`UPDATE Group_Chat_Messages SET content = ?, edited = 1 WHERE id = ?`, [content.trim(), msgId], (err2) => {
+            if (err2) { console.error('GC message edit error:', err2.message); return res.status(500).json({ error: 'Failed to edit message.' }); }
+            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [msgId], (err3, row) => {
+                if (err3 || !row) return res.json({ ok: true });
+                db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (err4, memberRows) => {
+                    const members = (memberRows || []).map(r => r.username);
+                    const finish = (replyMsg) => {
+                        broadcastGCEdit(groupId, me, row, replyMsg, members);
+                        res.json({ ok: true });
+                    };
+                    if (row.reply_to) {
+                        db.get(`SELECT * FROM Group_Chat_Messages WHERE id = ?`, [row.reply_to], (err5, replyRow) => finish(replyRow || null));
+                    } else {
+                        finish(null);
+                    }
+                });
             });
         });
     });

@@ -44,6 +44,10 @@ body {
   margin: 0;
   text-align: center;
 }
+textarea.box {
+  background-color: white;
+  color: var(--text-color);
+}
 .button {
   width: 80px;
   height: 20px;
@@ -94,6 +98,9 @@ body {
   color: var(--danger-color);
 }
 .msg-reply-link {
+  color: var(--accent-color);
+}
+.msg-edit-link {
   color: var(--accent-color);
 }
 .msg-bubble-mine {

@@ -1571,8 +1571,8 @@ body.page-notifications .notif-item:hover {
   background: rgba(255, 255, 255, 0.06) !important;
 }
 body.page-notifications .active-filter {
-  background: white !important;
-  color: rgb(0, 17, 41) !important;
+  background: rgb(0, 17, 41) !important;
+  color: white !important;
 }
 
 /* ===== /admin/dashboard ===== */

@@ -300,18 +300,29 @@ function displayName(username, nickname) {
     return (nickname && nickname.trim()) ? nickname.trim() : username;
 }
 
+// Small blue checkmark badge shown right next to a username, wherever a
+// username is displayed (profile, feed, messages, notifications, admin
+// panel, etc). Purely presentational - just pass a truthy/falsy
+// IsVerified value in, no escaping needed since it emits fixed markup.
+function renderVerifiedBadge(isVerified) {
+    if (!isVerified) return '';
+    return `<svg viewBox="0 0 22 22" width="15" height="15" style="display:inline-block;vertical-align:middle;flex-shrink:0;margin-left:3px;" aria-label="Verified account" role="img"><title>Verified account</title><circle cx="11" cy="11" r="11" fill="var(--accent-color, #1d9bf0)"></circle><path d="M6.3 11.3l3.1 3.1 6.3-6.7" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"></path></svg>`;
+}
+
 // Renders "Nickname" with a smaller "@username" next to it when a nickname is
 // set, or just "@username" when it isn't. `username` is used verbatim as the
 // link target/handle (already expected to be a safe identifier); `nickname`
-// is escaped since it's free-form user text.
+// is escaped since it's free-form user text. Pass `opts.isVerified` to show
+// the checkmark badge right after the displayed name.
 function renderNameWithHandle(username, nickname, opts = {}) {
     const safeUsername = escapeHTML(username);
+    const badge = renderVerifiedBadge(opts.isVerified);
     const hasNickname = nickname && nickname.trim();
     if (!hasNickname) {
-        return `<span style="${opts.nameStyle || ''}">@${safeUsername}</span>`;
+        return `<span style="${opts.nameStyle || ''}">@${safeUsername}${badge}</span>`;
     }
     const safeNickname = escapeHTML(nickname.trim());
-    return `<span style="${opts.nameStyle || ''}">${safeNickname}</span><span style="opacity:0.5;font-size:0.85em;margin-left:5px;${opts.handleStyle || ''}">@${safeUsername}</span>`;
+    return `<span style="${opts.nameStyle || ''}">${safeNickname}${badge}</span><span style="opacity:0.5;font-size:0.85em;margin-left:5px;${opts.handleStyle || ''}">@${safeUsername}</span>`;
 }
 
 function renderEmbeds(text) {
@@ -462,7 +473,7 @@ function renderMessageBubble(m, me, replyMsg) {
     const avatarHTML = renderAvatarHTML(m.avatar_path, m.from_user, 28);
     const senderHeader = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
                 <a href="/user/${escapeHTML(m.from_user)}" style="flex-shrink:0;">${avatarHTML}</a>
-                <a href="/user/${escapeHTML(m.from_user)}" class="msg-sender-name" style="text-decoration:none;font-weight:bold;font-size:0.8em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
+                <a href="/user/${escapeHTML(m.from_user)}" class="msg-sender-name" style="text-decoration:none;font-weight:bold;font-size:0.8em;">${renderNameWithHandle(m.from_user, m.Nickname, { isVerified: m.IsVerified })}</a>
             </div>`;
     const replyBanner = replyMsg
         ? `<div class="msg-reply-banner" style="font-size:0.78em;opacity:0.6;padding-left:8px;margin-bottom:4px;">> replying to <strong>${escapeHTML(replyMsg.from_user)}</strong>: ${escapeHTML((replyMsg.content || '').substring(0,60))}${(replyMsg.content || '').length > 60 ? '...' : ''}</div>`
@@ -568,7 +579,7 @@ function sendSystemDM(toUsername, content) {
             if (err) { console.error('System DM insert error:', err.message); return; }
             const newId = this.lastID;
             createNotification({ username: toUsername, type: 'dm', actor_username: 'System', message_id: newId, content_preview: content.slice(0, 140) });
-            db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
+            db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
                 if (err2 || !row) return;
                 broadcastDMMessage('System', toUsername, row, null);
             });
@@ -690,7 +701,7 @@ function linkifyMentions(escapedText) {
 const NOTIF_ICONS = { reply: '>', dm: '>', friend_request: '+', friend_accept: '✓', friend_decline: '×', mention_post: '@', mention_dm: '@', mention_gc: '@' };
 
 function notifText(n) {
-    const actor = `<a href="/user/${escapeHTML(n.actor_username)}" style="color:var(--text-color);font-weight:bold;text-decoration:none;">${escapeHTML(displayName(n.actor_username, n.actor_nickname))}</a>`;
+    const actor = `<a href="/user/${escapeHTML(n.actor_username)}" style="color:var(--text-color);font-weight:bold;text-decoration:none;">${escapeHTML(displayName(n.actor_username, n.actor_nickname))}${renderVerifiedBadge(n.actor_verified)}</a>`;
     switch (n.type) {
         case 'reply': return `${actor} replied to your post`;
         case 'dm': return `${actor} sent you a message`;
@@ -741,7 +752,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     return `<div class="post-header" style="display:flex;align-items:flex-start;gap:8px;">
             <a href="/user/${safeUsername}" style="flex-shrink:0;">${avatarHTML}</a>
             <div style="display:flex;flex-direction:column;min-width:0;">
-                <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;">${renderNameWithHandle(post.username, post.Nickname)}</a>
+                <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;">${renderNameWithHandle(post.username, post.Nickname, { isVerified: post.IsVerified })}</a>
                 <span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>
             </div>
         </div>
@@ -762,7 +773,7 @@ function renderPinnedItem(post) {
     const previewHTML = preview || '<span style="opacity:0.5;">(attachment)</span>';
     return `<div class="pinned-item" data-pin-id="${post.id}" style="display:flex;align-items:center;gap:10px;padding:8px 24px;background:rgba(255,180,40,0.08);border-bottom:1px solid rgba(255,180,40,0.25);">
         <span style="font-size:0.7em;letter-spacing:0.08em;color:var(--pinned-color);font-weight:700;text-transform:uppercase;flex-shrink:0;">Pinned</span>
-        <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex-shrink:0;">${escapeHTML(displayName(post.username, post.Nickname))}</a>
+        <a href="/user/${safeUsername}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex-shrink:0;">${escapeHTML(displayName(post.username, post.Nickname))}${renderVerifiedBadge(post.IsVerified)}</a>
         <span style="opacity:0.8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;">${previewHTML}</span>
         <a href="#" onclick="dismissPin(${post.id});return false;" title="Hide this pin" style="color:var(--text-dimmer-color);text-decoration:none;font-weight:700;flex-shrink:0;padding:0 4px;">✕</a>
     </div>`;
@@ -916,6 +927,10 @@ db.serialize(() => {
             db.run(`ALTER TABLE User_Data ADD COLUMN IsSupporter INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsAdmin INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsHeadAdmin INTEGER DEFAULT 0`, () => {});
+            // Verified badge (blue checkmark) - toggled by admins from the
+            // admin dashboard's Manage Badges panel, shown next to the
+            // username everywhere a username is rendered.
+            db.run(`ALTER TABLE User_Data ADD COLUMN IsVerified INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN avatar_path TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN Nickname TEXT DEFAULT NULL`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeleted INTEGER DEFAULT 0`, () => {});
@@ -1814,7 +1829,7 @@ app.post('/register', async (req, res) => {
                         [gcContent], function (errGC) {
                             if (errGC) { console.error('Activation notice insert error:', errGC.message); return; }
                             const gcMsgId = this.lastID;
-                            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
+                            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
                                 if (errRow || !row) return;
                                 db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = 1`, (errMem, memberRows) => {
                                     const members = (memberRows || []).map(r => r.username);
@@ -2770,10 +2785,10 @@ app.post('/account/email/confirm', (req, res) => {
 app.get('/feed', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.pinned = 1 ORDER BY Posts.created_at DESC`, [], (pinErr, pinnedPosts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.pinned = 1 ORDER BY Posts.created_at DESC`, [], (pinErr, pinnedPosts) => {
         const pinnedHTML = (pinnedPosts || []).map(renderPinnedItem).join('');
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username ORDER BY Posts.created_at DESC LIMIT 10`, [], (err, posts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username ORDER BY Posts.created_at DESC LIMIT 10`, [], (err, posts) => {
         if (err) { console.error(err); return res.status(500).send('Error loading feed'); }
 
         const sessionUsername = req.session.userUsername;
@@ -3263,7 +3278,7 @@ app.get('/feed/search', (req, res) => {
     if (!q) return res.json({ html: '' });
     const like = '%' + q + '%';
     db.all(
-        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE (Posts.content LIKE ? OR Posts.username LIKE ?) AND Posts.reply_to IS NULL ORDER BY Posts.created_at DESC LIMIT 30`,
+        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE (Posts.content LIKE ? OR Posts.username LIKE ?) AND Posts.reply_to IS NULL ORDER BY Posts.created_at DESC LIMIT 30`,
         [like, like],
         (err, posts) => {
             if (err) return res.status(500).json({ error: 'db error' });
@@ -3280,7 +3295,7 @@ app.get('/feed/older', (req, res) => {
     const beforeId = parseInt(req.query.before) || 0;
     if (!beforeId) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [beforeId], (err, posts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [beforeId], (err, posts) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!posts || !posts.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
@@ -3297,7 +3312,7 @@ app.get('/feed/poll', (req, res) => {
     const sessionUsername = req.session.userUsername;
     const afterId = parseInt(req.query.after) || 0;
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id > ? ORDER BY Posts.created_at DESC`, [afterId], (err, newPosts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id > ? ORDER BY Posts.created_at DESC`, [afterId], (err, newPosts) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!newPosts || !newPosts.length) return res.json({ html: '', lastId: afterId });
 
@@ -3324,7 +3339,7 @@ app.get('/following-feed', (req, res) => {
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
 
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) ORDER BY Posts.created_at DESC LIMIT 10`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) ORDER BY Posts.created_at DESC LIMIT 10`,
             followingList, (err, posts) => {
             if (err) { console.error(err); return res.status(500).send('Error loading feed'); }
 
@@ -3603,7 +3618,7 @@ app.get('/following-feed/poll', (req, res) => {
 
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id > ? ORDER BY Posts.created_at DESC`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id > ? ORDER BY Posts.created_at DESC`,
             [...followingList, afterId], (err, newPosts) => {
             if (err) return res.status(500).json({ error: 'db error' });
             if (!newPosts || !newPosts.length) return res.json({ html: '', lastId: afterId });
@@ -3622,7 +3637,7 @@ app.get('/following-feed/older', (req, res) => {
 
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`,
             [...followingList, beforeId], (err, posts) => {
             if (err) return res.status(500).json({ error: 'db error' });
             if (!posts || !posts.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
@@ -3640,7 +3655,7 @@ app.get('/post/:id', (req, res) => {
     if (!postId) return res.status(404).send('Post not found');
     const sessionUsername = req.session.userUsername;
 
-    db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err, rootPost) => {
+    db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err, rootPost) => {
         if (err) { console.error(err); return res.status(500).send('Error loading post'); }
         if (!rootPost) return res.status(404).send('Post not found');
 
@@ -3649,7 +3664,7 @@ app.get('/post/:id', (req, res) => {
                 ? `<div class="reply-context"><a href="/post/${parentPost.id}" style="color:var(--accent-color);text-decoration:none;">> Replying to @${escapeHTML(parentPost.username)}</a></div>`
                 : `<div class="reply-context" style="opacity:0.4;">> Replying to a deleted post</div>`);
 
-            db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId], (err2, replies) => {
+            db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId], (err2, replies) => {
                 if (err2) { console.error(err2); return res.status(500).send('Error loading replies'); }
 
                 const oldestReplyId = replies.length ? Math.min(...replies.map(p => p.id)) : 0;
@@ -3926,7 +3941,7 @@ app.get('/post/:id/poll', (req, res) => {
     const postId = parseInt(req.params.id);
     const afterId = parseInt(req.query.after) || 0;
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id > ? ORDER BY Posts.created_at DESC`, [postId, afterId], (err, newReplies) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id > ? ORDER BY Posts.created_at DESC`, [postId, afterId], (err, newReplies) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!newReplies || !newReplies.length) return res.json({ html: '', lastId: afterId });
 
@@ -3943,7 +3958,7 @@ app.get('/post/:id/older', (req, res) => {
     const beforeId = parseInt(req.query.before) || 0;
     if (!beforeId) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId, beforeId], (err, replies) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId, beforeId], (err, replies) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!replies || !replies.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
@@ -4054,20 +4069,20 @@ app.get('/friends', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     const me = req.session.userUsername;
 
-    db.all(`SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END as friend_username, User_Data.avatar_path
+    db.all(`SELECT CASE WHEN user_a = ? THEN user_b ELSE user_a END as friend_username, User_Data.avatar_path, User_Data.IsVerified
             FROM Friends LEFT JOIN User_Data ON User_Data.username = CASE WHEN user_a = ? THEN user_b ELSE user_a END
             WHERE user_a = ? OR user_b = ? ORDER BY Friends.created_at DESC`, [me, me, me, me], (err, friends) => {
 
-        db.all(`SELECT Friend_Requests.*, User_Data.avatar_path FROM Friend_Requests LEFT JOIN User_Data ON User_Data.username = Friend_Requests.from_user
+        db.all(`SELECT Friend_Requests.*, User_Data.avatar_path, User_Data.IsVerified FROM Friend_Requests LEFT JOIN User_Data ON User_Data.username = Friend_Requests.from_user
                 WHERE to_user = ? AND status = 'pending' ORDER BY created_at DESC`, [me], (err2, incoming) => {
 
-            db.all(`SELECT Friend_Requests.*, User_Data.avatar_path FROM Friend_Requests LEFT JOIN User_Data ON User_Data.username = Friend_Requests.to_user
+            db.all(`SELECT Friend_Requests.*, User_Data.avatar_path, User_Data.IsVerified FROM Friend_Requests LEFT JOIN User_Data ON User_Data.username = Friend_Requests.to_user
                     WHERE from_user = ? AND status = 'pending' ORDER BY created_at DESC`, [me], (err3, outgoing) => {
 
-                function renderUserRow(username, avatarPath, actionHTML) {
+                function renderUserRow(username, avatarPath, actionHTML, isVerified) {
                     return `<div style="display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
                         <a href="/user/${escapeHTML(username)}" style="flex-shrink:0;">${renderAvatarHTML(avatarPath, username, 40)}</a>
-                        <a href="/user/${escapeHTML(username)}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex:1;">${escapeHTML(username)}</a>
+                        <a href="/user/${escapeHTML(username)}" style="color:var(--text-color);text-decoration:none;font-weight:bold;flex:1;">${escapeHTML(username)}${renderVerifiedBadge(isVerified)}</a>
                         ${actionHTML}
                     </div>`;
                 }
@@ -4075,19 +4090,19 @@ app.get('/friends', (req, res) => {
                 const friendsHTML = (friends || []).map(f =>
                     renderUserRow(f.friend_username, f.avatar_path,
                         `<a href="/messages/${escapeHTML(f.friend_username)}" class="button" style="padding:6px 12px;text-decoration:none;font-size:0.85em;">Message</a>
-                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;height:44px;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);">Unfriend</button>`)
+                         <button class="button" onclick="unfriend('${escapeHTML(f.friend_username)}')" style="padding:6px 12px;font-size:0.85em;height:44px;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);">Unfriend</button>`, f.IsVerified)
                 ).join('');
 
                 const incomingHTML = (incoming || []).map(r =>
                     renderUserRow(r.from_user, r.avatar_path,
                         `<button class="button" onclick="acceptRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(0,191,255,0.15);border-color:rgba(0,191,255,0.6);color:var(--accent-color);width: auto;height: 25px;">Accept</button>
-                         <button class="button" onclick="declineRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.08);border-color:rgba(255,60,60,0.4);color:var(--danger-light-color);width: auto;height: 25px;">Decline</button>`)
+                         <button class="button" onclick="declineRequest('${escapeHTML(r.from_user)}')" style="padding:6px 12px;font-size:0.85em;background:rgba(255,60,60,0.08);border-color:rgba(255,60,60,0.4);color:var(--danger-light-color);width: auto;height: 25px;">Decline</button>`, r.IsVerified)
                 ).join('');
 
                 const outgoingHTML = (outgoing || []).map(r =>
                     renderUserRow(r.to_user, r.avatar_path,
                         `<span style="opacity:0.5;font-size:0.85em;">Pending…</span>
-                         <button class="button" onclick="cancelRequest('${escapeHTML(r.to_user)}')" style="padding:6px 12px;font-size:0.85em;">Cancel</button>`)
+                         <button class="button" onclick="cancelRequest('${escapeHTML(r.to_user)}')" style="padding:6px 12px;font-size:0.85em;">Cancel</button>`, r.IsVerified)
                 ).join('');
 
                 res.send(`<!DOCTYPE html>
@@ -4280,7 +4295,7 @@ app.get('/user/:username', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     const profileUsername = req.params.username;
     const sessionUsername = req.session.userUsername;
-    db.get(`SELECT username, Nickname, bio, IsOwner, IsDeveloper, IsSupporter, IsAdmin, IsHeadAdmin, IsBanned, IsDeleted, avatar_path FROM User_Data WHERE username = ?`, [profileUsername], (err, user) => {
+    db.get(`SELECT username, Nickname, bio, IsOwner, IsDeveloper, IsSupporter, IsAdmin, IsHeadAdmin, IsBanned, IsDeleted, IsVerified, avatar_path FROM User_Data WHERE username = ?`, [profileUsername], (err, user) => {
         if (err || !user) return res.status(404).send('User not found');
         const isOwnProfile = profileUsername === sessionUsername;
         db.get(`SELECT id FROM Follows WHERE follower_username = ? AND following_username = ?`, [sessionUsername, profileUsername], (ferr, followRow) => {
@@ -4346,7 +4361,7 @@ app.get('/user/:username', (req, res) => {
             ${renderAvatarHTML(user.avatar_path, user.username, 100)}
         </div>
         ${(user.IsOwner || user.IsDeveloper || user.IsSupporter || user.IsAdmin || user.IsHeadAdmin || user.IsBanned || user.IsDeleted) ? `<div style="display:flex;gap:8px;justify-content:center;margin-bottom:6px;flex-wrap:wrap;">${user.IsOwner ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--gold-color);font-weight:700;text-transform:uppercase;">Owner</span>' : ''}${user.IsHeadAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--danger-strong-color);font-weight:700;text-transform:uppercase;">Head Admin</span>' : ''}${user.IsAdmin ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--admin-color);font-weight:700;text-transform:uppercase;">Admin</span>' : ''}${user.IsDeveloper ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--accent-color);font-weight:700;text-transform:uppercase;">Developer</span>' : ''}${user.IsSupporter ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--purple-color);font-weight:700;text-transform:uppercase;">Supporter</span>' : ''}${user.IsDeleted ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--gray-color);font-weight:700;text-transform:uppercase;border:1px solid rgb(150,150,150);border-radius:4px;padding:1px 6px;">Deleted</span>' : (user.IsBanned ? '<span style="font-size:0.75em;letter-spacing:0.08em;color:var(--danger-color);font-weight:700;text-transform:uppercase;border:1px solid rgb(255,80,80);border-radius:4px;padding:1px 6px;">Banned</span>' : '')}</div>` : ''}
-        <h1>${user.Nickname && user.Nickname.trim() ? escapeHTML(user.Nickname.trim()) : '@' + escapeHTML(user.username)}</h1>
+        <h1>${user.Nickname && user.Nickname.trim() ? escapeHTML(user.Nickname.trim()) : '@' + escapeHTML(user.username)}${renderVerifiedBadge(user.IsVerified)}</h1>
         ${user.Nickname && user.Nickname.trim() ? `<div style="opacity:0.5;font-size:0.9em;margin-top:-10px;margin-bottom:6px;">@${escapeHTML(user.username)}</div>` : ''}
         <div style="margin-bottom:8px;">${followersLink}</div>
         <div id="profile-bio">${user.bio ? escapeHTML(user.bio) : '<span style="opacity:0.4;">No bio yet.</span>'}</div>
@@ -4527,7 +4542,7 @@ app.get('/messages/:username', (req, res) => {
     const me = req.session.userUsername;
     const other = req.params.username;
     db.run(`UPDATE Messages SET read = 1 WHERE to_user = ? AND from_user = ?`, [me, other]);
-    db.all(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?) ORDER BY created_at ASC`,
+    db.all(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?) ORDER BY created_at ASC`,
         [me, other, other, me], (err, msgs) => {
         const msgMap = {};
         (msgs || []).forEach(m => msgMap[m.id] = m);
@@ -4791,7 +4806,7 @@ app.post('/messages/:username/send', (req, res, next) => {
             createNotification({ username: other, type: 'dm', actor_username: me, message_id: newId, content_preview: preview });
             processMentions(content, me, { type: 'mention_dm', message_id: newId, skipUsernames: [other] });
 
-            db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
+            db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
                 if (err2 || !row) return res.json({ ok: true, id: newId });
                 const finish = (replyMsg) => {
                     broadcastDMMessage(me, other, row, replyMsg);
@@ -4833,7 +4848,7 @@ app.get('/notifications', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     const me = req.session.userUsername;
 
-    db.all(`SELECT Notifications.*, User_Data.Nickname AS actor_nickname FROM Notifications LEFT JOIN User_Data ON Notifications.actor_username = User_Data.username WHERE Notifications.username = ? ORDER BY Notifications.id DESC LIMIT 50`, [me], (err, notifs) => {
+    db.all(`SELECT Notifications.*, User_Data.Nickname AS actor_nickname, User_Data.IsVerified AS actor_verified FROM Notifications LEFT JOIN User_Data ON Notifications.actor_username = User_Data.username WHERE Notifications.username = ? ORDER BY Notifications.id DESC LIMIT 50`, [me], (err, notifs) => {
         if (err) { console.error(err); return res.status(500).send('Error loading notifications'); }
 
         db.run(`UPDATE Notifications SET read = 1 WHERE username = ?`, [me]);
@@ -4991,7 +5006,7 @@ app.get('/notifications/poll', (req, res) => {
     const me = req.session.userUsername;
     const afterId = parseInt(req.query.after) || 0;
 
-    db.all(`SELECT Notifications.*, User_Data.Nickname AS actor_nickname FROM Notifications LEFT JOIN User_Data ON Notifications.actor_username = User_Data.username WHERE Notifications.username = ? AND Notifications.id > ? ORDER BY Notifications.id DESC`, [me, afterId], (err, notifs) => {
+    db.all(`SELECT Notifications.*, User_Data.Nickname AS actor_nickname, User_Data.IsVerified AS actor_verified FROM Notifications LEFT JOIN User_Data ON Notifications.actor_username = User_Data.username WHERE Notifications.username = ? AND Notifications.id > ? ORDER BY Notifications.id DESC`, [me, afterId], (err, notifs) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!notifs || !notifs.length) return res.json({ html: '', lastId: afterId });
         const lastId = Math.max(...notifs.map(n => n.id));
@@ -5042,7 +5057,7 @@ function requireHeadAdmin(req, res, next) {
 }
 
 app.get('/admin/dashboard', requireAdmin, (req, res) => {
-    db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
+    db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, IsVerified, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
         if (err) return res.status(500).send('DB error');
         db.all(`SELECT username, expires_at FROM Warnings`, [], (errW, allWarnings) => {
         // Active-warning counts per username, computed in JS (same
@@ -5058,6 +5073,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 u.IsAdmin ? '<span style="color:var(--admin-color);font-weight:700;">Admin</span>' : '',
                 u.IsDeveloper ? '<span style="color:var(--accent-color);font-weight:700;">Dev</span>' : '',
                 u.IsSupporter ? '<span style="color:var(--purple-color);font-weight:700;">Supporter</span>' : '',
+                u.IsVerified ? '<span style="color:var(--accent-color, #1d9bf0);font-weight:700;">Verified</span>' : '',
                 u.IsDeleted ? '<span style="color:var(--gray-color);font-weight:700;">Deleted</span>' : (u.IsBanned ? '<span style="color:var(--danger-color);font-weight:700;">Banned</span>' : ''),
             ].filter(Boolean).join(' ');
             const ipBtn = u.last_ip
@@ -5283,6 +5299,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             ${req.isHeadAdmin ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-admin" style="width:auto;"> Admin</label>` : ''}
             <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-supporter" style="width:auto;"> Supporter</label>
             <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-developer" style="width:auto;"> Developer</label>
+            <label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-verified" style="width:auto;"> Verified</label>
             ${req.isOwner ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-owner" style="width:auto;"> Owner</label>` : ''}
         </div>
         ${!req.isOwner ? `<p style="opacity:0.4;font-size:0.78em;margin-top:6px;">Only Owners and Head Admins can grant or revoke the Admin badge.</p>` : ''}
@@ -5498,6 +5515,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             document.getElementById('badge-headadmin') && (document.getElementById('badge-headadmin').checked = !!data.IsHeadAdmin);
             document.getElementById('badge-supporter').checked = !!data.IsSupporter;
             document.getElementById('badge-developer').checked = !!data.IsDeveloper;
+            document.getElementById('badge-verified').checked = !!data.IsVerified;
             const ownerBox = document.getElementById('badge-owner');
             if (ownerBox) ownerBox.checked = !!data.IsOwner;
             resultEl.className = 'ok'; resultEl.textContent = 'Loaded badges for @' + username + '.';
@@ -5515,7 +5533,8 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         const headadminBox = document.getElementById('badge-headadmin');
         const body = {
             IsSupporter: document.getElementById('badge-supporter').checked,
-            IsDeveloper: document.getElementById('badge-developer').checked
+            IsDeveloper: document.getElementById('badge-developer').checked,
+            IsVerified: document.getElementById('badge-verified').checked
         };
         if (adminBox) body.IsAdmin = adminBox.checked;
         if (ownerBox) body.IsHeadAdmin = headadminBox.checked;
@@ -6211,7 +6230,7 @@ app.get('/admin/ipbans', requireAdmin, (req, res) => {
 
 app.get('/admin/badges/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
-    db.get(`SELECT IsOwner, IsHeadAdmin, IsAdmin, IsDeveloper, IsSupporter FROM User_Data WHERE username = ?`, [target], (err, user) => {
+    db.get(`SELECT IsOwner, IsHeadAdmin, IsAdmin, IsDeveloper, IsSupporter, IsVerified FROM User_Data WHERE username = ?`, [target], (err, user) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!user) return res.status(404).json({ error: 'user not found' });
         res.json(user);
@@ -6220,12 +6239,13 @@ app.get('/admin/badges/:username', requireAdmin, (req, res) => {
 
 app.post('/admin/badges/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
-    const { IsAdmin, IsHeadAdmin, IsSupporter, IsDeveloper, IsOwner } = req.body;
+    const { IsAdmin, IsHeadAdmin, IsSupporter, IsDeveloper, IsOwner, IsVerified } = req.body;
 
     const fields = [];
     const values = [];
     fields.push('IsSupporter = ?'); values.push(IsSupporter ? 1 : 0);
     fields.push('IsDeveloper = ?'); values.push(IsDeveloper ? 1 : 0);
+    fields.push('IsVerified = ?'); values.push(IsVerified ? 1 : 0);
 
     // Only an existing Owner can grant or revoke the Admin and Owner badges -
     // otherwise any admin could hand out admin (or owner) access to anyone.
@@ -6281,7 +6301,7 @@ function renderGCMessageBubble(m, me, replyMsg) {
     const avatarHTML = renderAvatarHTML(m.avatar_path, m.from_user, 28);
     const senderLabel = `<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px;">
         <a href="/user/${escapeHTML(m.from_user)}" style="flex-shrink:0;">${avatarHTML}</a>
-        <a href="/user/${escapeHTML(m.from_user)}" class="${mine ? 'msg-sender-mine' : 'msg-sender-other'}" style="text-decoration:none;font-weight:700;font-size:0.75em;">${renderNameWithHandle(m.from_user, m.Nickname)}</a>
+        <a href="/user/${escapeHTML(m.from_user)}" class="${mine ? 'msg-sender-mine' : 'msg-sender-other'}" style="text-decoration:none;font-weight:700;font-size:0.75em;">${renderNameWithHandle(m.from_user, m.Nickname, { isVerified: m.IsVerified })}</a>
     </div>`;
     const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
@@ -6590,7 +6610,7 @@ app.get('/groups/:id', (req, res) => {
         db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (err2, memberRow) => {
             if (!memberRow) return res.status(403).sendFile(path.join(__dirname, 'group_access_denied.html'));
             db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ? ORDER BY joined_at ASC`, [groupId], (err3, members) => {
-                db.all(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE group_id = ? ORDER BY created_at ASC`, [groupId], (err4, msgs) => {
+                db.all(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE group_id = ? ORDER BY created_at ASC`, [groupId], (err4, msgs) => {
                     const msgMap = {};
                     (msgs || []).forEach(m => msgMap[m.id] = m);
                     const msgsHTML = (msgs || []).map(m => renderGCMessageBubble(m, me, m.reply_to ? msgMap[m.reply_to] : null)).join('');
@@ -6966,7 +6986,7 @@ app.post('/groups/:id/send', (req, res, next) => {
                 if (err2) return res.status(500).json({ error: 'Failed to send message.' });
                 const newId = this.lastID;
 
-                db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [newId], (err3, row) => {
+                db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [newId], (err3, row) => {
                     if (err3 || !row) return res.json({ ok: true, id: newId });
                     db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (err4, memberRows) => {
                         const members = (memberRows || []).map(r => r.username);

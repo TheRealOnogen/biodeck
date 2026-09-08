@@ -18,6 +18,10 @@ const fs = require('fs');
 const crypto = require('crypto');
 let nodemailer;
 try { nodemailer = require('nodemailer'); } catch (e) { nodemailer = null; }
+let ImapClient;
+try { ImapClient = require('imap'); } catch (e) { ImapClient = null; }
+let simpleParser;
+try { ({ simpleParser } = require('mailparser')); } catch (e) { simpleParser = null; }
 const app = express();
 const PORT = 3000;
 
@@ -1193,6 +1197,13 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_support_ticket_replies_ticket ON Support_Ticket_Replies(ticket_id)`);
+            // is_customer distinguishes a reply the customer emailed in (picked up
+            // by the inbound mail poller) from one an admin typed on the ticket
+            // page. admin_username is still populated for customer replies (with
+            // their display name) so older code paths that assume it's set keep
+            // working - is_customer is what the UI actually branches on.
+            db.run(`ALTER TABLE Support_Ticket_Replies ADD COLUMN is_customer INTEGER DEFAULT 0`, () => {});
+            db.run(`ALTER TABLE Support_Ticket_Replies ADD COLUMN customer_email TEXT DEFAULT NULL`, () => {});
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -1467,6 +1478,120 @@ if (nodemailer && process.env.SMTP_HOST && process.env.SMTP_USER && process.env.
     console.warn('SMTP not configured (set SMTP_HOST, SMTP_USER, SMTP_PASS) - password reset emails will be logged to the console instead of sent.');
 }
 
+// ----- Inbound support email -----
+// Polls an IMAP mailbox so replies (and brand new emails) sent to the support
+// address turn into ticket activity automatically, instead of only being
+// reachable through the /support web form.
+//   IMAP_HOST, IMAP_PORT (default 993), IMAP_USER, IMAP_PASS - mailbox creds
+//   IMAP_TLS - 'false' to disable TLS (default on)
+//   SUPPORT_INBOX_POLL_MS - how often to check, in ms (default 60000)
+// Needs `npm install imap mailparser`; without them (or without the env vars)
+// this feature just stays off and everything else keeps working as before.
+const SUPPORT_INBOX_POLL_MS = parseInt(process.env.SUPPORT_INBOX_POLL_MS || '60000', 10);
+
+// Mail clients paste the entire prior message back into a reply (Gmail's
+// "On <date> <person> wrote:" block, Outlook's "-----Original Message-----",
+// or plain "> quoted" lines). We only want what the customer actually typed,
+// so cut the body off at the first line that looks like the start of a quote.
+function stripEmailQuote(text) {
+    if (!text) return text;
+    const lines = text.split(/\r?\n/);
+    let cutoff = lines.length;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (/^on .{3,150}\bwrote:$/i.test(line) || /^-{2,}\s*original message\s*-{2,}$/i.test(line) || /^from:\s*.+$/i.test(line) || line.startsWith('>')) {
+            cutoff = i;
+            break;
+        }
+    }
+    return lines.slice(0, cutoff).join('\n').trim();
+}
+
+function processInboundSupportEmail(mail) {
+    const fromEntry = mail.from && mail.from.value && mail.from.value[0];
+    const fromAddr = fromEntry ? fromEntry.address : null;
+    if (!fromAddr) return;
+    const fromName = (fromEntry.name || fromAddr).trim();
+
+    // Never let our own outgoing address turn into a ticket/reply - stops a
+    // feedback loop if this mailbox is used for both sending and receiving.
+    const ourAddr = (process.env.SMTP_FROM || process.env.SMTP_USER || '').toLowerCase();
+    if (ourAddr && fromAddr.toLowerCase() === ourAddr) return;
+
+    const subject = (mail.subject || '(no subject)').trim();
+    const body = stripEmailQuote((mail.text || '').trim()) || '(empty message)';
+    const match = subject.match(/\[Ticket #(\d+)\]/i);
+
+    if (match) {
+        const ticketId = parseInt(match[1], 10);
+        db.get(`SELECT id, username, status FROM Support_Tickets WHERE id = ?`, [ticketId], (err, ticket) => {
+            if (err || !ticket) return; // unrecognized ticket tag - drop it silently
+            db.run(`INSERT INTO Support_Ticket_Replies (ticket_id, admin_username, message, is_customer, customer_email) VALUES (?, ?, ?, 1, ?)`,
+                [ticketId, fromName, body, fromAddr], (err2) => {
+                    if (err2) return console.error('Failed to store inbound reply:', err2.message);
+                    logAudit('support_ticket_customer_reply', fromName, ticket.username, `ticket #${ticketId} (via email)`);
+                    if (ticket.status !== 'open') {
+                        db.run(`UPDATE Support_Tickets SET status = 'open' WHERE id = ?`, [ticketId], () => {});
+                    }
+                });
+        });
+        return;
+    }
+
+    // No recognizable ticket tag - treat it as a brand new ticket.
+    db.run(`INSERT INTO Support_Tickets (username, email, subject, message) VALUES (?, ?, ?, ?)`,
+        [fromName, fromAddr, subject, body], function (err) {
+            if (err) return console.error('Failed to create ticket from inbound email:', err.message);
+            logAudit('support_ticket_submitted_by_email', fromName, fromName, `#${this.lastID}: ${subject}`);
+        });
+}
+
+function pollSupportInbox() {
+    const imap = new ImapClient({
+        user: process.env.IMAP_USER,
+        password: process.env.IMAP_PASS,
+        host: process.env.IMAP_HOST,
+        port: parseInt(process.env.IMAP_PORT || '993', 10),
+        tls: process.env.IMAP_TLS !== 'false',
+        tlsOptions: { rejectUnauthorized: false }
+    });
+
+    imap.once('error', err => console.error('Support inbox IMAP error:', err.message));
+
+    imap.once('ready', () => {
+        imap.openBox('INBOX', false, (err) => {
+            if (err) { console.error('Support inbox open error:', err.message); return imap.end(); }
+            imap.search(['UNSEEN'], (err, uids) => {
+                if (err) { console.error('Support inbox search error:', err.message); return imap.end(); }
+                if (!uids || uids.length === 0) return imap.end();
+
+                const pending = [];
+                const fetcher = imap.fetch(uids, { bodies: '', markSeen: true });
+                fetcher.on('message', msg => {
+                    let buffer = '';
+                    msg.on('body', stream => { stream.on('data', chunk => { buffer += chunk.toString('utf8'); }); });
+                    msg.once('end', () => {
+                        pending.push(simpleParser(buffer).then(processInboundSupportEmail).catch(err => console.error('Support inbox parse error:', err.message)));
+                    });
+                });
+                fetcher.once('error', err => console.error('Support inbox fetch error:', err.message));
+                fetcher.once('end', () => { Promise.allSettled(pending).finally(() => imap.end()); });
+            });
+        });
+    });
+
+    imap.connect();
+}
+
+if (ImapClient && simpleParser && process.env.IMAP_HOST && process.env.IMAP_USER && process.env.IMAP_PASS) {
+    pollSupportInbox();
+    setInterval(pollSupportInbox, SUPPORT_INBOX_POLL_MS);
+} else if (!ImapClient || !simpleParser) {
+    console.warn('imap/mailparser not installed (run `npm install imap mailparser`) - inbound emails will not be turned into support tickets.');
+} else {
+    console.warn('IMAP not configured (set IMAP_HOST, IMAP_USER, IMAP_PASS) - inbound emails will not be turned into support tickets.');
+}
+
 function sendPasswordResetEmail(toEmail, username, resetLink) {
     const subject = 'Reset your Biodeck password';
     const text = `Hi ${username},\n\nA password reset was requested for your Biodeck account. If this was you, click the link below to choose a new password. This link expires in 1 hour and can only be used once.\n\n${resetLink}\n\nIf you didn't request this, you can safely ignore this email - your password will not change.`;
@@ -1687,35 +1812,14 @@ function sendWarningRevokedEmail(toEmail, username, reason) {
     }).catch(err => console.error('Failed to send warning revoked email:', err.message));
 }
 
-// ----- Support ticket notification email -----
-// Sent to SUPPORT_NOTIFY_EMAIL (falling back to SMTP_FROM/SMTP_USER) whenever
-// someone submits the public /support form, so tickets don't just sit
-// silently in the DB waiting for an admin to check.
-function sendSupportTicketNotification(ticket) {
-    const notifyTo = process.env.SUPPORT_NOTIFY_EMAIL || process.env.SMTP_FROM || process.env.SMTP_USER;
-    const subject = `[Biodeck Support] ${ticket.subject}`;
-    const text = `New support ticket #${ticket.id}\n\nAccount username: ${ticket.username}\nContact email: ${ticket.email}\n\n${ticket.message}`;
-    const html = `<p><strong>New support ticket #${ticket.id}</strong></p>
-        <p><strong>Account username:</strong> ${escapeHTML(ticket.username)}<br>
-        <strong>Contact email:</strong> ${escapeHTML(ticket.email)}</p>
-        <p>${escapeHTML(ticket.message).replace(/\n/g, '<br>')}</p>`;
-
-    if (!mailTransporter || !notifyTo) {
-        console.log(`[support ticket] #${ticket.id} from ${ticket.username} <${ticket.email}>: ${ticket.subject}`);
-        return Promise.resolve();
-    }
-    return mailTransporter.sendMail({
-        from: process.env.SMTP_FROM || process.env.SMTP_USER,
-        to: notifyTo,
-        subject, text, html
-    }).catch(err => console.error('Failed to send support ticket notification:', err.message));
-}
-
 // Sent to the submitter's own contact email right after they file a ticket,
 // just to confirm it was received - not a substitute for an actual reply
 // (see sendSupportReplyEmail), which comes later from the admin ticket page.
+// The "[Ticket #N]" tag in the subject is load-bearing: if the customer hits
+// reply, most mail clients keep it in the "Re:" subject, which is how
+// pollSupportInbox() matches an inbound reply back to this ticket.
 function sendSupportTicketConfirmationEmail(ticket) {
-    const subject = `We've received your support ticket - #${ticket.id}`;
+    const subject = `[Ticket #${ticket.id}] We've received your support ticket`;
     const text = `Hello ${ticket.username},\n\nWe've received your support ticket and will review it.\n\nThis is an automated message.`;
     const html = `<p>Hello ${escapeHTML(ticket.username)},</p><p>We've received your support ticket and will review it.</p><p style="opacity:0.6;font-size:0.9em;">This is an automated message.</p>`;
 
@@ -1736,7 +1840,7 @@ function sendSupportTicketConfirmationEmail(ticket) {
 // the person by email - so if SMTP isn't configured this just logs loudly
 // rather than silently pretending it sent.
 function sendSupportReplyEmail(ticket, replyMessage, adminUsername) {
-    const subject = `Re: ${ticket.subject}`;
+    const subject = `Re: [Ticket #${ticket.id}] ${ticket.subject}`;
     const text = `Hi ${ticket.username},\n\nYou recently contacted Biodeck support about "${ticket.subject}" (ticket #${ticket.id}). Here's a reply from our team:\n\n${replyMessage}\n\n---\nYour original message:\n${ticket.message}`;
     const html = `<p>Hi ${escapeHTML(ticket.username)},</p>
         <p>You recently contacted Biodeck support about "${escapeHTML(ticket.subject)}" (ticket #${ticket.id}). Here's a reply from our team:</p>
@@ -2509,7 +2613,6 @@ app.post('/support', (req, res) => {
                 return res.status(500).send(renderSupportForm({ error: 'Something went wrong. Please try again.', values }));
             }
             const ticket = { id: this.lastID, username, email, subject, message };
-            sendSupportTicketNotification(ticket);
             sendSupportTicketConfirmationEmail(ticket);
             logAudit('support_ticket_submitted', username, username, `#${ticket.id}: ${subject}`);
             return res.send(renderMessagePage('Support', 'Message sent',
@@ -6999,11 +7102,17 @@ app.get('/admin/support/:id', requireAdmin, (req, res) => {
         if (err) return res.status(500).send('DB error');
         if (!ticket) return res.status(404).send(renderMessagePage('Not Found', 'Ticket not found', `<h3>That ticket doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/support';">Back to tickets</button>`));
 
-        db.all(`SELECT admin_username, message, created_at FROM Support_Ticket_Replies WHERE ticket_id = ? ORDER BY id ASC`, [id], (err2, replies) => {
-            const repliesHTML = (replies || []).map(r => `<div style="border-top:1px solid rgba(255,255,255,0.1);padding:12px 0;">
-                <div style="font-size:0.78em;opacity:0.5;margin-bottom:4px;">${escapeHTML(r.admin_username)} · ${escapeHTML(r.created_at || '')}</div>
+        db.all(`SELECT admin_username, message, created_at, is_customer, customer_email FROM Support_Ticket_Replies WHERE ticket_id = ? ORDER BY id ASC`, [id], (err2, replies) => {
+            const repliesHTML = (replies || []).map(r => {
+                const isCustomer = !!r.is_customer;
+                const who = isCustomer
+                    ? `${escapeHTML(r.admin_username)} <span style="opacity:0.6;">(customer${r.customer_email ? ' · ' + escapeHTML(r.customer_email) : ''})</span>`
+                    : `${escapeHTML(r.admin_username)} <span style="opacity:0.6;">(admin)</span>`;
+                return `<div style="border-top:1px solid rgba(255,255,255,0.1);${isCustomer ? 'border-left:3px solid var(--warning-color, #d9a441);padding-left:10px;' : ''}padding-top:12px;padding-bottom:12px;">
+                <div style="font-size:0.78em;opacity:0.5;margin-bottom:4px;">${who} · ${escapeHTML(r.created_at || '')}</div>
                 <div style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(r.message)}</div>
-            </div>`).join('');
+            </div>`;
+            }).join('');
 
             let bannerHTML = '';
             if (req.query.sent === '1') bannerHTML = `<p style="color:var(--success-color);font-weight:700;">Reply sent.</p>`;

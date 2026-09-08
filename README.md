@@ -1,4 +1,4 @@
-<h1><div align="center"><img src="Biodeck.png"/></div></h1>
+<h1><div align="center"><img src="public/Ellie.png" style="height:256px;width:auto;"></div></h1>
 
 Biodeck is a kewl website. idek wat to explain
 

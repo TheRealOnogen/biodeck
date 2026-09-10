@@ -1538,12 +1538,27 @@ app.use(session({
 // Logged-out visitors (and anyone whose saved theme no longer exists) get
 // the default theme.
 app.get('/theme.css', (req, res) => {
-    res.set('Cache-Control', 'no-cache');
+    // Deliberately NOT using res.sendFile here. sendFile auto-generates a
+    // weak ETag from the file's size+mtime, and theme CSS files are usually
+    // all deployed at once (same mtime) and can be close enough in byte size
+    // to collide on that ETag. When that happens, switching to a theme whose
+    // file collides with whatever was last cached under this same /theme.css
+    // URL gets wrongly answered with a 304, so the browser keeps rendering
+    // the OLD theme's cached body - which is exactly the "theme doesn't
+    // change until I clear cache" symptom. Reading the file and sending it
+    // directly with no-store sidesteps conditional GET entirely, so there's
+    // never a stale cached body to (mis)validate against.
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
     const sendTheme = (theme) => {
-        res.sendFile(resolveThemeCSSPath(theme), (err) => {
-            if (err && !res.headersSent) {
-                res.sendFile(path.join(__dirname, 'public', FALLBACK_THEME.file));
+        const themePath = resolveThemeCSSPath(theme);
+        fs.readFile(themePath, 'utf8', (err, css) => {
+            if (err) {
+                return fs.readFile(path.join(__dirname, 'public', FALLBACK_THEME.file), 'utf8', (err2, fallbackCss) => {
+                    if (err2) return res.status(500).end();
+                    res.type('text/css').send(fallbackCss);
+                });
             }
+            res.type('text/css').send(css);
         });
     };
     if (!req.session.userId) return sendTheme(getThemeByName('default'));

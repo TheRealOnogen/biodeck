@@ -551,9 +551,10 @@ function renderWarningsTableHTML(warnings) {
     const rows = warnings.map(w => {
         const active = isWarningActive(w);
         const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+        const extrasHtml = getWarningExtras(w, 'html').join('');
         return `<tr>
-            <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(w.reason || '')}</td>
-            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at).toLocaleString())}</td>
+            <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(w.reason || '')}${extrasHtml ? `<div style="font-size:0.85em;margin-top:6px;">${extrasHtml}</div>` : ''}</td>
+            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at.replace(' ','T')+'Z').toLocaleString())}</td>
             <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${w.expires_at ? escapeHTML(new Date(w.expires_at).toLocaleString()) : 'Never'}</td>
             <td>${statusHtml}</td>
         </tr>`;
@@ -561,10 +562,49 @@ function renderWarningsTableHTML(warnings) {
     return `<div style="text-align:left;">
         <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Warnings</div>
         ${warnings.length ? `
+        <style>
+            .table-scroll-wrap { display:block !important; width:100% !important; max-width:100% !important; overflow-x:auto !important; -webkit-overflow-scrolling:touch; }
+            .table-scroll-wrap > table { width:max-content !important; min-width:100% !important; }
+        </style>
+        <div class="table-scroll-wrap">
         <table>
             <thead><tr><th>Reason</th><th>Issued</th><th>Expires</th><th>Status</th></tr></thead>
             <tbody>${rows}</tbody>
-        </table>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
+        </table>
+        </div>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
+    </div>`;
+}
+
+// Lighter-weight version of renderWarningsTableHTML for the /standing page -
+// each reason links out to its own /standing/:id detail page (styled like
+// the admin support ticket / report pages) instead of showing the mute /
+// removed-content extras inline, so the overview table stays scannable and
+// the detail lives one click away.
+function renderWarningsSummaryHTML(warnings) {
+    warnings = warnings || [];
+    const rows = warnings.map(w => {
+        const active = isWarningActive(w);
+        const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+        return `<tr>
+            <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word"><a href="/standing/${w.id}" style="color:var(--text-color);text-decoration:underline;">${escapeHTML(w.reason || '(no reason given)')}</a></td>
+            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at.replace(' ','T')+'Z').toLocaleString())}</td>
+            <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${w.expires_at ? escapeHTML(new Date(w.expires_at).toLocaleString()) : 'Never'}</td>
+            <td>${statusHtml}</td>
+        </tr>`;
+    }).join('');
+    return `<div style="text-align:left;">
+        <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Warnings <span style="opacity:0.7;">(click a reason for details)</span></div>
+        ${warnings.length ? `
+        <style>
+            .table-scroll-wrap { display:block !important; width:100% !important; max-width:100% !important; overflow-x:auto !important; -webkit-overflow-scrolling:touch; }
+            .table-scroll-wrap > table { width:max-content !important; min-width:100% !important; }
+        </style>
+        <div class="table-scroll-wrap">
+        <table>
+            <thead><tr><th>Reason</th><th>Issued</th><th>Expires</th><th>Status</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>
+        </div>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
     </div>`;
 }
 
@@ -753,10 +793,79 @@ function isWarningActive(w) {
 // Fetches every warning for a user (active and expired alike - callers that
 // only need the active count/standing should filter with isWarningActive).
 function getWarningsForUser(username, cb) {
-    db.all(`SELECT id, username, reason, issued_by, created_at, expires_at FROM Warnings WHERE username = ? ORDER BY created_at DESC`, [username], (err, rows) => {
+    db.all(`SELECT id, username, reason, issued_by, created_at, expires_at, mute_chat, removed_content, removed_attachments_json, report_id, account_action FROM Warnings WHERE username = ? ORDER BY created_at DESC`, [username], (err, rows) => {
         if (err) return cb(err);
         cb(null, rows || []);
     });
+}
+
+// True while a warning that has mute_chat set is still active for this
+// user - blocks DM/group-chat sending (see the mute checks in
+// /messages/:username/send and /groups/:id/send) until that specific
+// warning naturally expires or is revoked early. A user can have several
+// muting warnings at once (e.g. one from a fresh report while an older one
+// hasn't expired yet); the mute lasts until the LATEST of them expires,
+// unless any of them never expires, in which case the mute never expires.
+function isUserMuted(username, cb) {
+    db.all(`SELECT expires_at FROM Warnings WHERE username = ? AND mute_chat = 1`, [username], (err, rows) => {
+        if (err) return cb(err);
+        const active = (rows || []).filter(isWarningActive);
+        if (!active.length) return cb(null, null);
+        const neverExpires = active.some(w => !w.expires_at);
+        const expiresAt = neverExpires ? null : active.reduce((latest, w) =>
+            (!latest || new Date(w.expires_at) > new Date(latest)) ? w.expires_at : latest, null);
+        cb(null, { expiresAt });
+    });
+}
+
+// Shared "extras" line(s) for a single warning - shown after the reason on
+// the warning email and anywhere warnings are listed (/standing, the
+// admin warnings lookup, and the ban/delete notice pages). Covers the two
+// optional pieces of context a warning can carry: a chat mute, and (when
+// the warning was issued from the /admin/reports/:id page) a snapshot of
+// the content that got removed.
+function getWarningExtras(w, format, opts) {
+    // format: 'html' or 'text'. opts.activeOnly (default true) hides the
+    // "you can't chat" line once the warning itself has expired/been
+    // revoked, but the removed-content snapshot always shows - it's a
+    // historical record, not tied to whether the warning is still active.
+    const activeOnly = !opts || opts.activeOnly !== false;
+    const stillActive = isWarningActive(w);
+    const attachments = (() => {
+        if (!w.removed_attachments_json) return [];
+        try { return JSON.parse(w.removed_attachments_json) || []; } catch (e) { return []; }
+    })();
+    const parts = [];
+    if (w.account_action) {
+        const label = w.account_action === 'temp_ban' ? 'Your account has been temporarily banned.'
+            : w.account_action === 'perm_ban' ? 'Your account has been permanently banned.'
+            : w.account_action === 'delete' ? 'Your account has been deleted.'
+            : null;
+        if (label) {
+            parts.push(format === 'html'
+                ? `<p style="margin:6px 0;"><strong>${label}</strong></p>`
+                : label);
+        }
+    }
+    if (w.mute_chat && (!activeOnly || stillActive)) {
+        parts.push(format === 'html'
+            ? `<p style="margin:6px 0;"><strong>You're not able to chat or post to the feed until this warning expires${w.expires_at ? ' (' + escapeHTML(new Date(w.expires_at).toLocaleString()) + ')' : ''}.</strong></p>`
+            : `You're not able to chat or post to the feed until this warning expires${w.expires_at ? ' (' + new Date(w.expires_at).toLocaleString() + ')' : ''}.`);
+    }
+    if (w.removed_content !== null && w.removed_content !== undefined) {
+        if (format === 'html') {
+            let html = `<p style="margin:6px 0 2px;">A piece of content has been removed:</p><p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;opacity:0.85;">${escapeHTML(w.removed_content) || '<span style="opacity:0.5;">(no text)</span>'}</p>`;
+            if (attachments.length) html += renderAttachmentsHTML(attachments, 300, '400px');
+            parts.push(html);
+        } else {
+            let text = `A piece of content has been removed:\n${w.removed_content || '(no text)'}`;
+            if (attachments.length) {
+                text += `\n` + attachments.map(a => `- ${a.name}: ${APP_BASE_URL}/uploads/${path.basename(a.path)}`).join('\n');
+            }
+            parts.push(text);
+        }
+    }
+    return parts;
 }
 
 // Extra usernames to DM on every new registration, on top of the user with
@@ -1299,6 +1408,30 @@ db.serialize(() => {
             } catch (migrateErr) {
                 console.error('Warnings NOT NULL migration check failed:', migrateErr.message);
             }
+            // mute_chat: when set, the warned user can't send DMs or group
+            // chat messages until this specific warning expires (see
+            // isUserMuted / the mute checks in /messages/:username/send and
+            // /groups/:id/send). removed_content/removed_attachments_json
+            // are an optional snapshot of the offending message/post, filled
+            // in when a warning is issued from the /admin/reports/:id page
+            // (report_id links back to that report) so the warned user can
+            // still see exactly what got them warned/banned/deleted, in the
+            // warning email and on the /standing page.
+            db.run(`ALTER TABLE Warnings ADD COLUMN mute_chat INTEGER DEFAULT 0`, () => {});
+            db.run(`ALTER TABLE Warnings ADD COLUMN removed_content TEXT DEFAULT NULL`, () => {});
+            db.run(`ALTER TABLE Warnings ADD COLUMN removed_attachments_json TEXT DEFAULT NULL`, () => {});
+            db.run(`ALTER TABLE Warnings ADD COLUMN report_id INTEGER DEFAULT NULL`, () => {});
+            // account_action: set when this warning was issued as the
+            // explanatory warning attached to a ban/delete from
+            // /admin/reports/:id (see issuePreActionWarning / the
+            // /admin/warn route). One of 'temp_ban', 'perm_ban', 'delete', or
+            // NULL for an ordinary warning. Stored separately from `reason`
+            // (the admin's own text) so the "what happened" line in the
+            // "What this affects" section stays accurate even if the account
+            // later gets unbanned or undeleted - the ban/delete state itself
+            // is looked up live elsewhere, this column is just a historical
+            // record of what this warning was issued for.
+            db.run(`ALTER TABLE Warnings ADD COLUMN account_action TEXT DEFAULT NULL`, () => {});
             // Support tickets submitted via the public /support form. Reachable
             // without logging in, but the submitter must still supply the
             // username and email on the account the ticket is about, so
@@ -1924,13 +2057,23 @@ function sendAccountPermanentlyDeletedEmail(toEmail, username, reason) {
 }
 
 // Sent when an admin issues a warning against an account's standing.
-function sendWarningEmail(toEmail, username, reason, expiresAt) {
+// `extras` is optional: { mute_chat, expires_at, removed_content,
+// removed_attachments_json } - same shape as a Warnings row, passed through
+// to getWarningExtras() to render the "you can't chat" / "content removed"
+// sections (activeOnly: false since the warning was just created, so it's
+// active by definition regardless of expires_at).
+function sendWarningEmail(toEmail, username, reason, expiresAt, extras) {
     const subject = 'You have received a warning on Biodeck';
     const cleanReason = reason || 'No reason provided';
     const expiryText = expiresAt ? `\n\nThis warning expires: ${new Date(expiresAt).toLocaleString()}` : '\n\nThis warning does not expire.';
     const expiryHtml = expiresAt ? `<p><strong>Expires:</strong> ${escapeHTML(new Date(expiresAt).toLocaleString())}</p>` : `<p><strong>Expires:</strong> Never</p>`;
-    const text = `Hi ${username},\n\nYour Biodeck account has received a warning.\n\nReason: ${cleanReason}${expiryText}\n\nEnough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.\n\nIf you believe this is a mistake, contact an administrator.`;
-    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has received a warning.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p>${expiryHtml}<p>Enough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.</p><p>If you believe this is a mistake, contact an administrator.</p>`;
+    const extrasRow = extras ? { ...extras, expires_at: expiresAt } : null;
+    const extrasText = extrasRow ? getWarningExtras(extrasRow, 'text', { activeOnly: false }) : [];
+    const extrasHtml = extrasRow ? getWarningExtras(extrasRow, 'html', { activeOnly: false }) : [];
+    const extrasTextBlock = extrasText.length ? `\n\n${extrasText.join('\n\n')}` : '';
+    const extrasHtmlBlock = extrasHtml.length ? extrasHtml.join('') : '';
+    const text = `Hi ${username},\n\nYour Biodeck account has received a warning.\n\nReason: ${cleanReason}${expiryText}${extrasTextBlock}\n\nEnough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.\n\nIf you believe this is a mistake, contact an administrator.`;
+    const html = `<p>Hi ${escapeHTML(username)},</p><p>Your Biodeck account has received a warning.</p><p><strong>Reason:</strong> ${escapeHTML(cleanReason)}</p>${expiryHtml}${extrasHtmlBlock}<p>Enough active warnings can affect your account standing. You can review your standing and warning history from your dashboard.</p><p>If you believe this is a mistake, contact an administrator.</p>`;
 
     if (!mailTransporter) {
         console.log(`[warning issued] SMTP not configured - would have emailed ${toEmail}: ${cleanReason}`);
@@ -3037,16 +3180,7 @@ app.get('/standing', (req, res) => {
             warnings = warnings || [];
             const activeCount = warnings.filter(isWarningActive).length;
             const standing = getStanding(activeCount);
-            const warningRowsHTML = warnings.map(w => {
-                const active = isWarningActive(w);
-                const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
-                return `<tr>
-                    <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(w.reason || '')}</td>
-                    <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${escapeHTML(new Date(w.created_at).toLocaleString())}</td>
-                    <td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">${w.expires_at ? escapeHTML(new Date(w.expires_at).toLocaleString()) : 'Never'}</td>
-                    <td>${statusHtml}</td>
-                </tr>`;
-            }).join('');
+            const warningsHTML = renderWarningsSummaryHTML(warnings);
             res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
@@ -3067,14 +3201,7 @@ app.get('/standing', (req, res) => {
             <div style="font-size:1.3em;color:${standing.color};font-weight:700;">${escapeHTML(standing.label)}</div>
             <div style="opacity:0.6;font-size:0.85em;margin-top:2px;">${standing.count} active warning${standing.count === 1 ? '' : 's'}</div>
         </div>
-        <div style="text-align:left;">
-            <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Warnings</div>
-            ${warnings.length ? `
-            <table>
-                <thead><tr><th>Reason</th><th>Issued</th><th>Expires</th><th>Status</th></tr></thead>
-                <tbody>${warningRowsHTML}</tbody>
-            </table>` : `<p style="opacity:0.4;font-size:0.8em;margin:0;text-align:center;">No warnings on record.</p>`}
-        </div>
+        ${warningsHTML}
         <div class="dash-links">
             <button class="button" style="width:auto;" onclick="window.location.href='/edit';">Back to dashboard</button>
         </div>
@@ -3082,6 +3209,59 @@ app.get('/standing', (req, res) => {
 </body>
 </html>`);
         });
+    });
+});
+
+// Detail page for a single warning, linked from the /standing overview
+// table. Shows the reason plus a plain "What this affects" section (mute
+// and/or removed content, or "None" if the warning doesn't carry either) -
+// kept off the overview table itself so that stays a quick scannable list.
+// Scoped to the logged-in user's own warnings only; an id belonging to
+// someone else (or that doesn't exist) 404s the same way a bad report id
+// does on the admin side.
+app.get('/standing/:id', (req, res) => {
+    if (!req.session.userId) return res.redirect('/');
+    const id = parseInt(req.params.id, 10);
+    const notFound = () => res.status(404).send(renderMessagePage('Not Found', 'Warning not found', `<h3>That warning doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/standing';">Back to standing</button>`));
+    if (!Number.isInteger(id)) return notFound();
+
+    db.get(`SELECT id, username, reason, issued_by, created_at, expires_at, mute_chat, removed_content, removed_attachments_json, report_id, account_action FROM Warnings WHERE id = ?`, [id], (err, warning) => {
+        if (err) return res.status(500).send('DB error');
+        if (!warning || warning.username !== req.session.userUsername) return notFound();
+
+        const active = isWarningActive(warning);
+        const statusHtml = active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
+        const affectsParts = getWarningExtras(warning, 'html');
+        const affectsHtml = affectsParts.length ? affectsParts.join('') : '<p style="opacity:0.6;">None</p>';
+
+        res.send(`<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Warning #${warning.id}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body class="page-edit">
+    <div class="box dashboard-box" style="text-align:left;">
+        <p><a href="/standing" style="color:var(--text-color);opacity:0.6;text-decoration:none;">&lt; Back to standing</a></p>
+        <h2 style="margin:10px 0 4px;">Warning #${warning.id}</h2>
+        <p style="opacity:0.5;font-size:0.85em;margin-top:-2px;">Issued ${escapeHTML(new Date(warning.created_at.replace(' ','T')+'Z').toLocaleString())}</p>
+        <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
+        <p style="font-size:0.9em;"><strong>Reason:</strong></p>
+        <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(warning.reason) || '<span style="opacity:0.4;">(no reason given)</span>'}</p>
+        <p style="font-size:0.9em;"><strong>Expires:</strong> ${warning.expires_at ? escapeHTML(new Date(warning.expires_at).toLocaleString()) : 'Never'}</p>
+        <p style="font-size:0.9em;"><strong>Status:</strong> ${statusHtml}</p>
+        <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
+        <p style="font-size:0.9em;margin-bottom:6px;"><strong>What this affects:</strong></p>
+        ${affectsHtml}
+        <div class="dash-links" style="margin-top:16px;">
+            <button class="button" style="width:auto;" onclick="window.location.href='/standing';">Back to standing</button>
+        </div>
+    </div>
+</body>
+</html>`);
     });
 });
 
@@ -3380,7 +3560,9 @@ app.get('/feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                if (r.url && r.url.includes('posterror')) {
+                if (r.url && r.url.includes('posterror=muted')) {
+                    showPostError("You're not able to post until your warning expires.");
+                } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
                     postContent.value = '';
@@ -3399,8 +3581,9 @@ app.get('/feed', (req, res) => {
         }
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
+            const muted = new URLSearchParams(window.location.search).get('posterror') === 'muted';
             const t = document.createElement('div');
-            t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.textContent = muted ? "You're not able to post until your warning expires." : 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
@@ -3789,6 +3972,9 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
     const replyTo = reply_to ? parseInt(reply_to) : null;
     const backTo = replyTo ? `/post/${replyTo}` : '/feed';
 
+    isUserMuted(req.session.userUsername, (errMute, mute) => {
+        if (!errMute && mute) return res.redirect(`${backTo}?posterror=muted`);
+
     if ((!content || !content.trim()) && !files.length) return res.redirect(backTo);
     if (content && content.length > MAX_POST_LENGTH) return res.redirect(`${backTo}?posterror=1`);
 
@@ -3817,6 +4003,7 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
             return res.redirect(backTo);
         }
     );
+    });
 });
 
 // Returns just the pinned-items strip HTML so the client can refresh it after
@@ -4154,7 +4341,7 @@ app.get('/following-feed', (req, res) => {
         }
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
-            showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
+            showPostError(new URLSearchParams(window.location.search).get('posterror') === 'muted' ? "You're not able to post until your warning expires." : 'Post too long or too many files selected - 1,000 character limit, max 5 files.');
             window.history.replaceState(null, '', '/following-feed');
         }
 
@@ -4171,7 +4358,9 @@ app.get('/following-feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                if (r.url && r.url.includes('posterror')) {
+                if (r.url && r.url.includes('posterror=muted')) {
+                    showPostError("You're not able to post until your warning expires.");
+                } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
                     postContent.value = '';
@@ -4611,8 +4800,9 @@ app.get('/post/:id', (req, res) => {
         });
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
+            const muted = new URLSearchParams(window.location.search).get('posterror') === 'muted';
             const t = document.createElement('div');
-            t.textContent = 'Reply too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.textContent = muted ? "You're not able to reply until your warning expires." : 'Reply too long or too many files selected - 1,000 character limit, max 5 files.';
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
@@ -4632,7 +4822,9 @@ app.get('/post/:id', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                if (r.url && r.url.includes('posterror')) {
+                if (r.url && r.url.includes('posterror=muted')) {
+                    showPostError("You're not able to reply until your warning expires.");
+                } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Reply too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
                     postContent.value = '';
@@ -5908,6 +6100,10 @@ app.post('/messages/:username/send', (req, res, next) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const other = req.params.username;
+    isUserMuted(me, (errMute, mute) => {
+        if (!errMute && mute) {
+            return res.status(403).json({ error: `You're not able to chat until this warning expires${mute.expiresAt ? ' (' + new Date(mute.expiresAt).toLocaleString() + ')' : ''}.`, muted: true, expiresAt: mute.expiresAt });
+        }
     const { content, reply_to } = req.body;
     const files = req.files || [];
     const filesMeta = files.map(f => ({ path: f.path, name: f.originalname }));
@@ -5939,6 +6135,7 @@ app.post('/messages/:username/send', (req, res, next) => {
                 }
             });
         });
+    });
 });
 
 app.post('/messages/:username/mark-read', (req, res) => {
@@ -6514,6 +6711,10 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <input style="border-radius: 20px; height: 30px;" type="text" id="warn-reason" placeholder="e.g. Harassment in DMs" maxlength="500">
         <label>Expires In <span style="opacity:0.4;">(optional, e.g. 45s, 30m, 6h, 3d, 2w, 1y - blank = never expires)</span></label>
         <input style="border-radius: 20px; height: 30px;" type="text" id="warn-duration" placeholder="e.g. 2w" maxlength="20">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.85em;opacity:0.85;margin-top:8px;">
+            <input type="checkbox" id="warn-mute" style="width:auto;height:auto;">
+            Mute user (blocks DMs, group chat, and feed posts/replies) until this warning expires
+        </label>
         <div class="action-row">
             <button class="button" id="warn-submit-btn" onclick="submitWarn()" style="width:140px;">Issue Warning</button>
         </div>
@@ -6920,6 +7121,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         const username = document.getElementById('warn-username').value.trim();
         const reason = document.getElementById('warn-reason').value.trim();
         const duration = document.getElementById('warn-duration').value.trim();
+        const mute = document.getElementById('warn-mute').checked;
         const resultEl = document.getElementById('warn-result');
 
         if (!username) { resultEl.className = 'err'; resultEl.textContent = 'Username is required.'; return; }
@@ -6930,7 +7132,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const res = await fetch('/admin/warn/' + encodeURIComponent(username), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ reason, duration })
+                body: JSON.stringify({ reason, duration, mute })
             });
             const data = await res.json();
             if (!res.ok) {
@@ -6938,10 +7140,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 resultEl.textContent = 'Error: ' + (data.error || res.status);
             } else {
                 resultEl.className = 'ok';
-                resultEl.textContent = '@' + username + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + ').';
+                resultEl.textContent = '@' + username + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + (data.mute ? ', chat muted' : '') + ').';
                 document.getElementById('warn-username').value = '';
                 document.getElementById('warn-reason').value = '';
                 document.getElementById('warn-duration').value = '';
+                document.getElementById('warn-mute').checked = false;
                 setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
@@ -6980,10 +7183,22 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             tableEl.innerHTML = data.warnings.map(w => {
                 const statusHtml = w.active ? '<span style="color:var(--danger-color);font-weight:700;">Active</span>' : '<span style="opacity:0.5;">Expired</span>';
                 const revokeBtn = w.active ? '<button class="button" style="font-size:0.72em;padding:2px 8px;" onclick="revokeWarning(' + w.id + ')">Revoke</button>' : '';
+                let extras = '';
+                if (w.account_action) {
+                    const actionLabel = w.account_action === 'temp_ban' ? 'Your account has been temporarily banned.'
+                        : w.account_action === 'perm_ban' ? 'Your account has been permanently banned.'
+                        : w.account_action === 'delete' ? 'Your account has been deleted.'
+                        : null;
+                    if (actionLabel) extras += '<div style="opacity:0.7;margin-top:4px;"><strong>' + actionLabel + '</strong></div>';
+                }
+                if (w.mute_chat && w.active) extras += '<div style="opacity:0.7;margin-top:4px;">🔇 Muted (chat + feed) until this warning expires</div>';
+                if (w.removed_content !== null && w.removed_content !== undefined) {
+                    extras += '<div style="opacity:0.7;margin-top:4px;">Removed content' + (w.report_id ? ' (report #' + w.report_id + ')' : '') + ': <span style="white-space:pre-wrap;word-break:break-word;">' + (escClient(w.removed_content) || '<span style="opacity:0.5;">(no text)</span>') + '</span></div>';
+                }
                 return '<tr>' +
-                    '<td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">' + escClient(w.reason) + '</td>' +
+                    '<td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">' + escClient(w.reason) + extras + '</td>' +
                     '<td style="font-size:0.85em;">' + escClient(w.issued_by) + '</td>' +
-                    '<td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">' + new Date(w.created_at).toLocaleString() + '</td>' +
+                    '<td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">' + new Date(w.created_at.replace(' ','T')+'Z').toLocaleString() + '</td>' +
                     '<td style="font-size:0.78em;opacity:0.6;white-space:nowrap;">' + (w.expires_at ? new Date(w.expires_at).toLocaleString() : 'Never') + '</td>' +
                     '<td>' + statusHtml + '</td>' +
                     '<td>' + revokeBtn + '</td>' +
@@ -7150,30 +7365,69 @@ app.post('/admin/unban/:username', requireAdmin, (req, res) => {
 // Optional expiration: blank/omitted duration means the warning never
 // expires (expiresAt stays null and it counts toward standing forever). A
 // non-blank duration must still parse to a valid positive amount.
+// Optional `mute` (truthy) blocks the user from sending DMs/group chat
+// messages until this warning expires - see isUserMuted(). Optional
+// `reportId` (used by the /admin/reports/:id quick actions) snapshots that
+// report's content/attachments onto the warning, so the warned user can
+// still see exactly what got them warned in their email and on /standing -
+// this is also how the ban/delete quick actions attach the offending
+// content, by issuing a warning first (see reportBan/reportDeleteAccount).
 app.post('/admin/warn/:username', requireAdmin, (req, res) => {
     const target = req.params.username;
     const reason = (req.body.reason || '').trim().substring(0, 500);
     if (!reason) return res.status(400).json({ error: 'a reason is required' });
+    const muteChat = req.body.mute ? 1 : 0;
     let expiresAt = null;
     if (req.body.duration && String(req.body.duration).trim()) {
         const ms = parseBanDuration(req.body.duration);
         if (ms === null) return res.status(400).json({ error: 'invalid expiration - use e.g. 45s, 30m, 6h, 3d, 2w, 1y, or leave blank to never expire' });
         expiresAt = new Date(Date.now() + ms).toISOString();
     }
+    const reportId = parseInt(req.body.reportId, 10);
+    // accountAction records what this warning was issued alongside (a ban or
+    // an account deletion), if anything - see the account_action column
+    // comment. Only the known values are accepted; anything else (including
+    // omitted, for an ordinary warning) is stored as NULL.
+    const ACCOUNT_ACTIONS = ['temp_ban', 'perm_ban', 'delete'];
+    const accountAction = ACCOUNT_ACTIONS.includes(req.body.accountAction) ? req.body.accountAction : null;
 
     db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err, user) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!user) return res.status(404).json({ error: 'user not found' });
-        db.run(`INSERT INTO Warnings (username, reason, issued_by, expires_at) VALUES (?, ?, ?, ?)`,
-            [target, reason, req.session.userUsername, expiresAt], function(err2) {
-                if (err2) return res.status(500).json({ error: 'db error' });
-                logAudit('warning_issued', req.session.userUsername, target, expiresAt ? `${reason} (expires ${expiresAt})` : `${reason} (never expires)`);
-                if (user.email) sendWarningEmail(user.email, target, reason, expiresAt);
-                getWarningsForUser(target, (err3, warnings) => {
-                    const activeCount = err3 ? null : warnings.filter(isWarningActive).length;
-                    res.json({ ok: true, id: this.lastID, username: target, expiresAt, standing: activeCount === null ? null : getStanding(activeCount) });
+
+        function insertWarning(removedContent, removedAttachmentsJson, linkedReportId) {
+            db.run(`INSERT INTO Warnings (username, reason, issued_by, expires_at, mute_chat, removed_content, removed_attachments_json, report_id, account_action) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [target, reason, req.session.userUsername, expiresAt, muteChat, removedContent, removedAttachmentsJson, linkedReportId || null, accountAction], function(err2) {
+                    if (err2) return res.status(500).json({ error: 'db error' });
+                    logAudit('warning_issued', req.session.userUsername, target, expiresAt ? `${reason} (expires ${expiresAt})` : `${reason} (never expires)`);
+                    if (user.email) {
+                        sendWarningEmail(user.email, target, reason, expiresAt, {
+                            mute_chat: muteChat,
+                            removed_content: removedContent,
+                            removed_attachments_json: removedAttachmentsJson
+                        });
+                    }
+                    getWarningsForUser(target, (err3, warnings) => {
+                        const activeCount = err3 ? null : warnings.filter(isWarningActive).length;
+                        res.json({ ok: true, id: this.lastID, username: target, expiresAt, mute: !!muteChat, standing: activeCount === null ? null : getStanding(activeCount) });
+                    });
                 });
+        }
+
+        if (Number.isInteger(reportId)) {
+            db.get(`SELECT reported_username, content, attachments_json FROM Reports WHERE id = ?`, [reportId], (errR, report) => {
+                // Only attach the snapshot if the report actually matches
+                // this target - an invalid/mismatched reportId just falls
+                // back to a plain warning instead of failing outright.
+                if (!errR && report && report.reported_username === target) {
+                    insertWarning(report.content, report.attachments_json, reportId);
+                } else {
+                    insertWarning(null, null, null);
+                }
             });
+        } else {
+            insertWarning(null, null, null);
+        }
     });
 });
 
@@ -7841,7 +8095,7 @@ ${renderSupportTopbar('Report #' + report.id)}
 
     <div class="panel">
         <h2>Quick Actions <span style="opacity:0.5;font-weight:400;font-size:0.7em;">on @${escapeHTML(report.reported_username)}</span></h2>
-        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Take action against the reported account without leaving this page. Each action also deletes the reported content.</p>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Take action against the reported account without leaving this page. Each action also deletes the reported content. Ban/Delete also issue a permanent warning first (with the reason you give below and a copy of the reported content attached), so the user has something to see explaining what happened.</p>
 
         <div class="report-action-form">
             <h3 style="margin-bottom:8px;">Warn</h3>
@@ -7849,6 +8103,10 @@ ${renderSupportTopbar('Report #' + report.id)}
             <textarea id="warn-reason" rows="2" placeholder="Reason for the warning..."></textarea>
             <label>Expires in <span style="opacity:0.5;">(e.g. 30m, 6h, 3d, 2w - blank never expires)</span></label>
             <input type="text" id="warn-duration" placeholder="Leave blank for permanent">
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+                <input type="checkbox" id="warn-mute" style="width:auto;height:auto;margin:0;">
+                Mute user (blocks DMs, group chat, and feed posts/replies) until this warning expires
+            </label>
             <button type="button" class="button" style="width:auto;padding:8px 16px;" onclick="reportWarn()">Warn User</button>
             <div id="warn-result" class="report-action-result"></div>
         </div>
@@ -7896,6 +8154,7 @@ ${SUPPORT_NAV_SCRIPT}
     async function reportWarn() {
         const reason = document.getElementById('warn-reason').value.trim();
         const duration = document.getElementById('warn-duration').value.trim();
+        const mute = document.getElementById('warn-mute').checked;
         const resultEl = document.getElementById('warn-result');
         if (!reason) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'A reason is required.'; return; }
         resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
@@ -7903,21 +8162,51 @@ ${SUPPORT_NAV_SCRIPT}
             const res = await fetch('/admin/warn/' + encodeURIComponent(reportTargetUsername), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ reason, duration })
+                body: JSON.stringify({ reason, duration, mute, reportId })
             });
             const data = await res.json();
             if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
             resultEl.className = 'report-action-result ok';
-            resultEl.textContent = '@' + reportTargetUsername + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + ').';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + (data.mute ? ', chat muted' : '') + ').';
             await deleteReportedContent(resultEl);
         } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
     }
 
+    // Issues a warning carrying "reason" and this report's content/
+    // attachments before a ban or account deletion goes through - that way
+    // the user still has something (the warning email, and their /standing
+    // page if the account isn't gone for good) that shows exactly what got
+    // them banned/deleted, since the ban/delete emails themselves don't
+    // include the reported content. accountAction ('temp_ban', 'perm_ban',
+    // or 'delete') is stored on the warning itself and shown in its "What
+    // this affects" section - so even after an unban/undelete, the warning
+    // still records what happened, separate from the admin's own reason
+    // text. When called from reportBan(), duration is passed through so the
+    // warning expires alongside the ban instead of outliving it;
+    // reportDeleteAccount() leaves it unset (permanent), since a delete has
+    // no expiry to match. Errors here are surfaced but don't block the
+    // actual ban/delete from proceeding.
+    async function issuePreActionWarning(reason, duration, accountAction) {
+        try {
+            const res = await fetch('/admin/warn/' + encodeURIComponent(reportTargetUsername), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason, duration: duration || '', mute: false, reportId, accountAction })
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) return ' (Could not issue the explanatory warning: ' + (data.error || res.status) + ')';
+        } catch (e) {
+            return ' (Network error issuing the explanatory warning.)';
+        }
+        return '';
+    }
+
     async function reportBan() {
-        const reason = document.getElementById('ban-reason').value.trim();
+        const reason = document.getElementById('ban-reason').value.trim() || 'Banned by admin';
         const duration = document.getElementById('ban-duration').value.trim();
         const resultEl = document.getElementById('ban-result');
         resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
+        const warnNote = await issuePreActionWarning(reason, duration, duration ? 'temp_ban' : 'perm_ban');
         try {
             const res = await fetch('/admin/ban/' + encodeURIComponent(reportTargetUsername), {
                 method: 'POST',
@@ -7925,11 +8214,11 @@ ${SUPPORT_NAV_SCRIPT}
                 body: JSON.stringify({ reason, duration })
             });
             const data = await res.json();
-            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status) + warnNote; return; }
             resultEl.className = 'report-action-result ok';
-            resultEl.textContent = '@' + reportTargetUsername + ' has been banned' + (data.expiresAt ? ' until ' + new Date(data.expiresAt).toLocaleString() : ' permanently') + '.';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been banned' + (data.expiresAt ? ' until ' + new Date(data.expiresAt).toLocaleString() : ' permanently') + '.' + warnNote;
             await deleteReportedContent(resultEl);
-        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
+        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.' + warnNote; }
     }
 
     async function reportDeleteAccount() {
@@ -7938,6 +8227,7 @@ ${SUPPORT_NAV_SCRIPT}
         if (!reason) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'A reason is required.'; return; }
         if (!confirm('This will reset @' + reportTargetUsername + '\\'s avatar, name, and bio, mark the account as deleted, and delete all of its posts. The account stays in the database and the username is kept. Continue?')) return;
         resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
+        const warnNote = await issuePreActionWarning(reason, null, 'delete');
         try {
             const res = await fetch('/admin/delete-account/' + encodeURIComponent(reportTargetUsername), {
                 method: 'POST',
@@ -7945,11 +8235,11 @@ ${SUPPORT_NAV_SCRIPT}
                 body: JSON.stringify({ reason })
             });
             const data = await res.json();
-            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status) + warnNote; return; }
             resultEl.className = 'report-action-result ok';
-            resultEl.textContent = '@' + reportTargetUsername + ' has been deleted.';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been deleted.' + warnNote;
             await deleteReportedContent(resultEl);
-        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
+        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.' + warnNote; }
     }
 <\/script>
 </body>
@@ -8813,6 +9103,10 @@ app.post('/groups/:id/send', (req, res, next) => {
     const groupId = parseInt(req.params.id);
     db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (err, memberRow) => {
         if (!memberRow) return res.status(403).json({ error: 'Not a member of this group.' });
+        isUserMuted(me, (errMute, mute) => {
+        if (!errMute && mute) {
+            return res.status(403).json({ error: `You're not able to chat until this warning expires${mute.expiresAt ? ' (' + new Date(mute.expiresAt).toLocaleString() + ')' : ''}.`, muted: true, expiresAt: mute.expiresAt });
+        }
         const { content, reply_to } = req.body;
         const files = req.files || [];
         const filesMeta = files.map(f => ({ path: f.path, name: f.originalname }));
@@ -8851,6 +9145,7 @@ app.post('/groups/:id/send', (req, res, next) => {
                     });
                 });
             });
+        });
     });
 });
 

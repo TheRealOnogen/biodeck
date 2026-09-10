@@ -246,6 +246,92 @@ const NOTIF_BADGE_SCRIPT = `<script>
 })();
 <\/script>`;
 
+// Shared "Report" button handler for feed posts, DMs, and group chat messages
+// (see reportContent onclick handlers in renderFeedPost/renderMessageBubble/
+// renderGCMessageBubble). Included on every logged-in page alongside
+// NOTIF_BADGE_SCRIPT/USER_EVENTS_SCRIPT.
+//
+// Reported state is locked in two ways so the button can't be spammed:
+//  1. Client-side: dataset.reported is set the instant the button is
+//     clicked (not after the response comes back), so rapid double-clicks
+//     while the request is in flight can't fire a second request.
+//  2. Server-side (authoritative, survives reloads/new sessions/devices):
+//     /report itself rejects a second report of the same content with 409
+//     alreadyReported, and applyReportedState() below calls /api/my-reports
+//     on load (and whenever new content is added to the page) to pre-mark
+//     any "Report" button/link for content this user already reported.
+const REPORT_SCRIPT = `<script>
+function reportContent(type, id, btn) {
+    if (btn && btn.dataset.reported) return;
+    if (btn) {
+        btn.dataset.reported = '1';
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        btn.textContent = 'Reporting…';
+    }
+    fetch('/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ type: type, id: id })
+    }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+      .then(function(res) {
+        if (!res.ok) {
+            if (res.data && res.data.alreadyReported) {
+                if (btn) btn.textContent = 'Reported';
+                return;
+            }
+            alert('Error: ' + (res.data && res.data.error || 'failed to submit report'));
+            if (btn) {
+                delete btn.dataset.reported;
+                btn.disabled = false;
+                btn.style.opacity = '';
+                btn.textContent = 'Report';
+            }
+            return;
+        }
+        if (btn) btn.textContent = 'Reported';
+    }).catch(function() {
+        alert('Network error.');
+        if (btn) {
+            delete btn.dataset.reported;
+            btn.disabled = false;
+            btn.style.opacity = '';
+            btn.textContent = 'Report';
+        }
+    });
+}
+function applyReportedState() {
+    fetch('/api/my-reports').then(function(r) { return r.ok ? r.json() : null; }).then(function(data) {
+        if (!data || !data.reports) return;
+        data.reports.forEach(function(r) {
+            document.querySelectorAll('.report-action[data-report-type="' + r.type + '"][data-report-id="' + r.id + '"]').forEach(function(btn) {
+                if (btn.dataset.reported === '1') return; // already applied - skip so we don't churn the DOM forever
+                btn.dataset.reported = '1';
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.textContent = 'Reported';
+            });
+        });
+    }).catch(function() {});
+}
+(function() {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', applyReportedState);
+    } else {
+        applyReportedState();
+    }
+    // Re-check whenever new content (older posts/messages loaded, new page,
+    // infinite scroll, etc.) is added, so newly-rendered Report buttons for
+    // already-reported content start out disabled too. Debounced since a
+    // batch of new messages arrives as many DOM mutations at once.
+    var reportStateDebounce;
+    new MutationObserver(function() {
+        clearTimeout(reportStateDebounce);
+        reportStateDebounce = setTimeout(applyReportedState, 150);
+    }).observe(document.documentElement, { childList: true, subtree: true });
+})();
+<\/script>`;
+
 // Server-push ban enforcement. The server emits a 'banned' event down this SSE
 // stream when an admin bans the user - no polling, nothing the client can fake.
 const USER_EVENTS_SCRIPT = `<script>
@@ -496,18 +582,20 @@ function renderMessageBubble(m, me, replyMsg) {
         : '';
     const editLink = mine ? `<a href="#" onclick="editMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
+    const reportLink = !mine ? `<a href="#" onclick="reportContent('dm', ${m.id}, this);return false;" class="msg-delete-link report-action" data-report-type="dm" data-report-id="${m.id}" style="text-decoration:none;">Report</a>` : '';
     const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderHeader}
             ${replyBanner}
-            <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${escapeAndLinkify(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
                 ${editLink}
                 ${deleteLink}
+                ${reportLink}
                 ${editedMarker}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
@@ -718,6 +806,44 @@ function linkifyMentions(escapedText) {
     });
 }
 
+// Escapes post/message text for safe rendering while also turning any bare
+// http(s) URLs into real clickable links (and, via linkifyMentions, @handles
+// into profile links). Runs on the *raw* (unescaped) text passed in -
+// candidate URLs are located first, since escapeHTML() would otherwise
+// mangle URL characters (e.g. "&" -> "&amp;") before the URL regex ever
+// saw them. Each URL is escaped individually for its href/display text and
+// spliced back in; everything else is escaped and mention-linkified as
+// before. This is the counterpart to renderEmbeds(), which already pulls
+// known embeddable URLs (YouTube, images, etc.) out of the text - anything
+// left over after that is a "plain" link that just needs to be clickable.
+const BARE_URL_REGEX = /https?:\/\/[^\s<>"']+/g;
+function escapeAndLinkify(text) {
+    if (!text) return '';
+    let result = '';
+    let lastIndex = 0;
+    let match;
+    BARE_URL_REGEX.lastIndex = 0;
+    while ((match = BARE_URL_REGEX.exec(text)) !== null) {
+        let url = match[0];
+        // Trailing punctuation is usually sentence punctuation, not part of
+        // the URL (e.g. "check https://example.com." or "(see https://x.com)").
+        const trailingMatch = url.match(/[.,!?;:'")\]]+$/);
+        let trailing = '';
+        if (trailingMatch) {
+            trailing = trailingMatch[0];
+            url = url.slice(0, -trailing.length);
+        }
+        if (!url) continue;
+        result += linkifyMentions(escapeHTML(text.slice(lastIndex, match.index)));
+        const safeUrl = escapeHTML(url);
+        result += `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer nofollow" style="color:var(--accent-color);word-break:break-all;">${safeUrl}</a>`;
+        result += escapeHTML(trailing);
+        lastIndex = match.index + match[0].length;
+    }
+    result += linkifyMentions(escapeHTML(text.slice(lastIndex)));
+    return result;
+}
+
 const NOTIF_ICONS = { reply: '>', dm: '>', friend_request: '+', friend_accept: '✓', friend_decline: '×', mention_post: '@', mention_dm: '@', mention_gc: '@' };
 
 function notifText(n) {
@@ -766,9 +892,9 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     const deleteBtn = canDelete ? `<button class="button post-action-btn" onclick="deletePost(${post.id})">Delete${(!isOwner && isAdmin) ? '' : ''}</button>` : '';
     const editBtn = isOwner ? `<button class="button post-action-btn" onclick="editPost(${post.id})">Edit</button>` : '';
     const pinBtn = isAdmin ? `<button class="button post-action-btn" onclick="${post.pinned ? `unpinPost(${post.id})` : `pinPost(${post.id})`}">${post.pinned ? 'Unpin' : 'Pin'}</button>` : '';
+    const reportBtn = !isOwner ? `<button class="button post-action-btn report-action" data-report-type="post" data-report-id="${post.id}" onclick="reportContent('post', ${post.id}, this)">Report</button>` : '';
     const safeUsername = escapeHTML(post.username);
     const { embedHTML, cleanText } = renderEmbeds(post.content || '');
-    const safeContent = escapeHTML(cleanText);
     const avatarHTML = renderAvatarHTML(post.avatar_path, post.username, 32);
     const editedMarker = post.edited ? `<span style="opacity:0.6;font-size:0.8em;margin-left:6px;">(edited)</span>` : '';
     return `<div class="post-header" style="display:flex;align-items:flex-start;gap:8px;">
@@ -778,7 +904,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
                 <span><span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>${editedMarker}</span>
             </div>
         </div>
-        <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${linkifyMentions(safeContent)}</div>
+        <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${escapeAndLinkify(cleanText)}</div>
         ${embedHTML}
         ${fileHTML}
         <div class="post-actions">
@@ -786,6 +912,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
             ${pinBtn}
             ${editBtn}
             ${deleteBtn}
+            ${reportBtn}
         </div>`;
 }
 
@@ -1204,6 +1331,29 @@ db.serialize(() => {
             // working - is_customer is what the UI actually branches on.
             db.run(`ALTER TABLE Support_Ticket_Replies ADD COLUMN is_customer INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE Support_Ticket_Replies ADD COLUMN customer_email TEXT DEFAULT NULL`, () => {});
+            // User-submitted reports of a post, DM, or group chat message, filed
+            // via the "Report" button next to that content. content is a
+            // snapshot of the reported text taken at report time, so the report
+            // still makes sense even if the original is later edited or deleted.
+            // source_id points at the original Posts/Messages/Group_Chat_Messages
+            // row (best-effort - it may no longer exist by the time an admin
+            // reviews it).
+            db.run(`CREATE TABLE IF NOT EXISTS Reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reporter_username TEXT NOT NULL,
+                reported_username TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_id INTEGER,
+                content TEXT,
+                status TEXT NOT NULL DEFAULT 'open',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            // Snapshot of the reported message/post's attachments (same
+            // [{path,name}, ...] shape getAttachments() normalizes elsewhere),
+            // so an admin reviewing the report can see any reported image/file
+            // even if the original post/message is edited or deleted later.
+            db.run(`ALTER TABLE Reports ADD COLUMN attachments_json TEXT DEFAULT NULL`, () => {});
+            db.run(`CREATE INDEX IF NOT EXISTS idx_reports_status ON Reports(status)`);
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -2676,7 +2826,7 @@ app.get('/edit', (req, res) => {
         </form>
         <div class="dash-field">
             <label>Email</label>
-            <p style="margin:0 0 10px;opacity:0.8;">${email ? 'Current: ' + escapeHTML(email) : '<span style="opacity:0.5;">No email on file.</span>'}</p>
+            <p id="current-email-display" style="margin:0 0 10px;opacity:0.8;">${email ? 'Current: ' + escapeHTML(email) : '<span style="opacity:0.5;">No email on file.</span>'}</p>
             ${email ? `
             <div id="email-change-step1">
                 <input class="dash-textarea" style="min-height:unset;" type="text" id="new-email-input" placeholder="New email address" autocomplete="off">
@@ -2815,7 +2965,12 @@ app.get('/edit', (req, res) => {
                 const d = await r.json();
                 if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not confirm code.'; return; }
                 resultEl.style.color = 'var(--accent-color)'; resultEl.textContent = 'Email updated!';
-                setTimeout(() => window.location.reload(), 900);
+                document.getElementById('current-email-display').textContent = 'Current: ' + pendingNewEmail;
+                document.getElementById('new-email-input').value = '';
+                codeInput.value = '';
+                document.getElementById('email-change-step2').style.display = 'none';
+                document.getElementById('email-change-step1').style.display = 'block';
+                setTimeout(() => { resultEl.textContent = ''; }, 3000);
             } catch (e) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; }
         }
 
@@ -2866,7 +3021,7 @@ app.get('/edit', (req, res) => {
             window.history.replaceState(null, '', '/edit');
         }
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -3212,6 +3367,37 @@ app.get('/feed', (req, res) => {
             postCounter.style.opacity = len > 3800 ? '1' : '0.5';
         });
 
+        const postForm = document.getElementById('post-form');
+        const postSubmitBtn = postForm.querySelector('button[type="submit"]');
+        postForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            submitPostForm();
+        });
+        async function submitPostForm() {
+            const attachmentInput = document.getElementById('attachment');
+            if (!postContent.value.trim() && !attachmentInput.files.length) return;
+            postSubmitBtn.disabled = true;
+            const fd = new FormData(postForm);
+            try {
+                const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                if (r.url && r.url.includes('posterror')) {
+                    showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
+                } else {
+                    postContent.value = '';
+                    postCounter.textContent = '0 / 1000';
+                    postCounter.style.color = '';
+                    postCounter.style.opacity = '0.5';
+                    attachmentInput.value = '';
+                    document.getElementById('file-name-display').textContent = 'No file chosen';
+                    pollFeed();
+                }
+            } catch (err) {
+                showPostError('Network error - post not sent.');
+            } finally {
+                postSubmitBtn.disabled = false;
+            }
+        }
+
         if (new URLSearchParams(window.location.search).get('posterror')) {
             const t = document.createElement('div');
             t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
@@ -3239,10 +3425,35 @@ app.get('/feed', (req, res) => {
             });
         }
         function pinPost(id) {
-            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) onPinChanged(id, true); });
         }
         function unpinPost(id) {
-            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) onPinChanged(id, false); });
+        }
+        function onPinChanged(id, pinned) {
+            const wrapper = document.getElementById('post-' + id);
+            if (wrapper) {
+                const btn = Array.from(wrapper.querySelectorAll('.post-action-btn')).find(b => b.textContent === 'Pin' || b.textContent === 'Unpin');
+                if (btn) {
+                    btn.textContent = pinned ? 'Unpin' : 'Pin';
+                    btn.setAttribute('onclick', (pinned ? 'unpinPost(' : 'pinPost(') + id + ')');
+                }
+            }
+            fetch('/feed/pinned-bar').then(r => r.ok ? r.text() : null).then(html => {
+                if (html === null) return;
+                let bar = document.getElementById('pinned-bar');
+                if (!html.trim()) {
+                    if (bar) bar.remove();
+                } else if (bar) {
+                    bar.innerHTML = html;
+                } else {
+                    bar = document.createElement('div');
+                    bar.id = 'pinned-bar';
+                    bar.innerHTML = html;
+                    document.getElementById('feed-wrapper').insertBefore(bar, document.getElementById('posts'));
+                }
+                layoutPinnedBar();
+            }).catch(() => {});
         }
         const postEditOriginal = {};
         function editPost(id) {
@@ -3328,9 +3539,9 @@ app.get('/feed', (req, res) => {
                     const temp = document.createElement('div');
                     temp.innerHTML = data.html;
                     const sentinel = document.getElementById('load-more-sentinel');
-                    while (temp.firstChild) {
-                        postsEl.insertBefore(temp.firstChild, postsEl.firstChild);
-                    }
+                    const frag = document.createDocumentFragment();
+                    while (temp.firstChild) frag.appendChild(temp.firstChild);
+                    postsEl.insertBefore(frag, postsEl.firstChild);
                     postsEl.querySelectorAll('.post-time[data-ts]').forEach(el => {
                         if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
                     });
@@ -3533,7 +3744,7 @@ app.get('/feed', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -3606,6 +3817,85 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
             return res.redirect(backTo);
         }
     );
+});
+
+// Returns just the pinned-items strip HTML so the client can refresh it after
+// a pin/unpin action without reloading the whole feed page.
+app.get('/feed/pinned-bar', (req, res) => {
+    if (!req.session.userId) return res.status(401).end();
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.pinned = 1 ORDER BY Posts.created_at DESC`, [], (err, pinnedPosts) => {
+        if (err) return res.status(500).end();
+        res.send((pinnedPosts || []).map(renderPinnedItem).join(''));
+    });
+});
+
+// Unified report endpoint for the "Report" button on feed posts, DMs, and
+// group chat messages. Snapshots the reported content into the Reports
+// table for admin review at /admin/reports. Verifies the reporter actually
+// had access to the content (part of the DM, or a member of the group
+// chat) before filing the report.
+app.post('/report', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const { type, id } = req.body || {};
+    const sourceId = parseInt(id, 10);
+    if (!['post', 'dm', 'gc'].includes(type) || !Number.isInteger(sourceId)) {
+        return res.status(400).json({ error: 'Invalid report.' });
+    }
+    const reporter = req.session.userUsername;
+
+    function fileReport(reportedUsername, content, row) {
+        if (reportedUsername === reporter) return res.status(400).json({ error: "You can't report your own content." });
+        // Authoritative duplicate check - this is what actually makes the
+        // Report button spam-proof (the client just mirrors this so the
+        // button looks disabled without a round trip every time).
+        db.get(`SELECT id FROM Reports WHERE reporter_username = ? AND source_type = ? AND source_id = ?`, [reporter, type, sourceId], (dupErr, existing) => {
+            if (dupErr) { console.error('Report dup-check error:', dupErr.message); return res.status(500).json({ error: 'Failed to submit report.' }); }
+            if (existing) return res.status(409).json({ error: 'You already reported this.', alreadyReported: true });
+            const attachments = getAttachments(row);
+            const attachmentsJson = attachments.length ? JSON.stringify(attachments) : null;
+            db.run(`INSERT INTO Reports (reporter_username, reported_username, source_type, source_id, content, attachments_json) VALUES (?, ?, ?, ?, ?, ?)`,
+                [reporter, reportedUsername, type, sourceId, content || '', attachmentsJson], (err) => {
+                    if (err) { console.error('Report insert error:', err.message); return res.status(500).json({ error: 'Failed to submit report.' }); }
+                    logAudit('content_reported', reporter, reportedUsername, `${type} #${sourceId}`);
+                    res.json({ ok: true });
+                });
+        });
+    }
+
+    if (type === 'post') {
+        db.get(`SELECT username, content, file_path, file_name, files_json FROM Posts WHERE id = ?`, [sourceId], (err, post) => {
+            if (err || !post) return res.status(404).json({ error: 'Post not found.' });
+            fileReport(post.username, post.content, post);
+        });
+    } else if (type === 'dm') {
+        db.get(`SELECT from_user, to_user, content, file_path, file_name, files_json FROM Messages WHERE id = ?`, [sourceId], (err, msg) => {
+            if (err || !msg) return res.status(404).json({ error: 'Message not found.' });
+            if (msg.from_user !== reporter && msg.to_user !== reporter) return res.status(403).json({ error: 'Not your conversation.' });
+            fileReport(msg.from_user, msg.content, msg);
+        });
+    } else if (type === 'gc') {
+        db.get(`SELECT from_user, group_id, content, file_path, file_name, files_json FROM Group_Chat_Messages WHERE id = ?`, [sourceId], (err, msg) => {
+            if (err || !msg) return res.status(404).json({ error: 'Message not found.' });
+            db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [msg.group_id, reporter], (err2, memberRow) => {
+                if (err2 || !memberRow) return res.status(403).json({ error: 'Not a member of that group chat.' });
+                fileReport(msg.from_user, msg.content, msg);
+            });
+        });
+    }
+});
+
+// Returns the logged-in user's own list of already-filed reports (as
+// {type, id} pairs) so the client can permanently grey out "Report"
+// buttons/links for content this user already reported - including on a
+// fresh page load, a different device, or content loaded after the initial
+// page render (pagination, infinite scroll). See applyReportedState() in
+// REPORT_SCRIPT.
+app.get('/api/my-reports', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    db.all(`SELECT source_type, source_id FROM Reports WHERE reporter_username = ?`, [req.session.userUsername], (err, rows) => {
+        if (err) { console.error('my-reports error:', err.message); return res.status(500).json({ error: 'Failed to load reports.' }); }
+        res.json({ reports: (rows || []).map(r => ({ type: r.source_type, id: r.source_id })) });
+    });
 });
 
 app.post('/feed/delete/:id', (req, res) => {
@@ -3821,7 +4111,7 @@ app.get('/following-feed', (req, res) => {
 
         <div id="post-form-container">
             <div id="reply-indicator">> Replying to <span id="reply-to-name"></span> - <a href="#" onclick="clearReply();return false;" style="color:var(--accent-color);">Cancel</a></div>
-            <form action="/feed/post" method="POST" enctype="multipart/form-data">
+            <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <input type="hidden" name="reply_to" id="reply-to-input" value="">
                 <div id="post-form-row">
                     <textarea name="content" id="post-content" placeholder="What's on your mind?" maxlength="1000"></textarea>
@@ -3855,13 +4145,49 @@ app.get('/following-feed', (req, res) => {
             postCounter.style.opacity = len > 900 ? '1' : '0.5';
         });
 
-        if (new URLSearchParams(window.location.search).get('posterror')) {
+        function showPostError(message) {
             const t = document.createElement('div');
-            t.textContent = 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.textContent = message;
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
+        }
+
+        if (new URLSearchParams(window.location.search).get('posterror')) {
+            showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
             window.history.replaceState(null, '', '/following-feed');
+        }
+
+        const postForm = document.getElementById('post-form');
+        const postSubmitBtn = postForm.querySelector('button[type="submit"]');
+        postForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            submitPostForm();
+        });
+        async function submitPostForm() {
+            const attachmentInput = document.getElementById('attachment');
+            if (!postContent.value.trim() && !attachmentInput.files.length) return;
+            postSubmitBtn.disabled = true;
+            const fd = new FormData(postForm);
+            try {
+                const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                if (r.url && r.url.includes('posterror')) {
+                    showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
+                } else {
+                    postContent.value = '';
+                    postCounter.textContent = '0 / 1000';
+                    postCounter.style.color = '';
+                    postCounter.style.opacity = '0.5';
+                    attachmentInput.value = '';
+                    document.getElementById('file-name-display').textContent = 'No file chosen';
+                    clearReply();
+                    pollFeed();
+                }
+            } catch (err) {
+                showPostError('Network error - post not sent.');
+            } finally {
+                postSubmitBtn.disabled = false;
+            }
         }
 
         document.querySelectorAll('.button').forEach(btn => {
@@ -3946,10 +4272,19 @@ app.get('/following-feed', (req, res) => {
             });
         }
         function pinPost(id) {
-            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) togglePinButton(id, true); });
         }
         function unpinPost(id) {
-            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) togglePinButton(id, false); });
+        }
+        function togglePinButton(id, pinned) {
+            const wrapper = document.getElementById('post-' + id);
+            if (!wrapper) return;
+            const btn = Array.from(wrapper.querySelectorAll('.post-action-btn')).find(b => b.textContent === 'Pin' || b.textContent === 'Unpin');
+            if (btn) {
+                btn.textContent = pinned ? 'Unpin' : 'Pin';
+                btn.setAttribute('onclick', (pinned ? 'unpinPost(' : 'pinPost(') + id + ')');
+            }
         }
 
         let lastPostId = (() => {
@@ -3970,7 +4305,9 @@ app.get('/following-feed', (req, res) => {
                     if (noPostsMsg) noPostsMsg.remove();
                     const temp = document.createElement('div');
                     temp.innerHTML = data.html;
-                    while (temp.firstChild) postsEl.insertBefore(temp.firstChild, postsEl.firstChild);
+                    const frag = document.createDocumentFragment();
+                    while (temp.firstChild) frag.appendChild(temp.firstChild);
+                    postsEl.insertBefore(frag, postsEl.firstChild);
                     postsEl.querySelectorAll('.post-time[data-ts]').forEach(el => {
                         if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
                     });
@@ -4121,7 +4458,7 @@ app.get('/following-feed', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -4281,6 +4618,38 @@ app.get('/post/:id', (req, res) => {
             setTimeout(() => t.remove(), 4000);
             window.history.replaceState(null, '', '/post/${rootPost.id}');
         }
+
+        const postForm = document.getElementById('post-form');
+        const postSubmitBtn = postForm.querySelector('button[type="submit"]');
+        postForm.addEventListener('submit', function (e) {
+            e.preventDefault();
+            submitPostForm();
+        });
+        async function submitPostForm() {
+            const attachmentInput = document.getElementById('attachment');
+            if (!postContent.value.trim() && !attachmentInput.files.length) return;
+            postSubmitBtn.disabled = true;
+            const fd = new FormData(postForm);
+            try {
+                const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                if (r.url && r.url.includes('posterror')) {
+                    showPostError('Reply too long or too many files selected - 1,000 character limit, max 5 files.');
+                } else {
+                    postContent.value = '';
+                    postCounter.textContent = '0 / 1000';
+                    postCounter.style.color = '';
+                    postCounter.style.opacity = '0.5';
+                    attachmentInput.value = '';
+                    document.getElementById('file-name-display').textContent = 'No file chosen';
+                    pollReplies();
+                }
+            } catch (err) {
+                showPostError('Network error - reply not sent.');
+            } finally {
+                postSubmitBtn.disabled = false;
+            }
+        }
+
         document.querySelectorAll('.button').forEach(btn => {
             btn.addEventListener('mousedown', () => {
                 btn.classList.add('clicked');
@@ -4390,10 +4759,19 @@ app.get('/post/:id', (req, res) => {
             });
         }
         function pinPost(id) {
-            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/pin/' + id, { method: 'POST' }).then(r => { if (r.ok) togglePinButton(id, true); });
         }
         function unpinPost(id) {
-            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) location.reload(); });
+            fetch('/admin/unpin/' + id, { method: 'POST' }).then(r => { if (r.ok) togglePinButton(id, false); });
+        }
+        function togglePinButton(id, pinned) {
+            const wrapper = document.getElementById('post-' + id);
+            if (!wrapper) return;
+            const btn = Array.from(wrapper.querySelectorAll('.post-action-btn')).find(b => b.textContent === 'Pin' || b.textContent === 'Unpin');
+            if (btn) {
+                btn.textContent = pinned ? 'Unpin' : 'Pin';
+                btn.setAttribute('onclick', (pinned ? 'unpinPost(' : 'pinPost(') + id + ')');
+            }
         }
 
         let lastReplyId = (() => {
@@ -4531,7 +4909,7 @@ app.get('/post/:id', (req, res) => {
             if (nearBottom) loadOlderReplies();
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -4748,15 +5126,15 @@ app.get('/friends', (req, res) => {
         <h2 style="margin-bottom:0;">Friends</h2>
 
         ${(incoming || []).length > 0 ? `
-        <div class="section-title">Incoming Requests <span class="badge">${(incoming || []).length}</span></div>
-        <div id="incoming-list">${incomingHTML}</div>` : ''}
+        <div class="section-title" id="incoming-section-title">Incoming Requests <span class="badge" id="incoming-badge">${(incoming || []).length}</span></div>` : `<div class="section-title" id="incoming-section-title" style="display:none;">Incoming Requests <span class="badge" id="incoming-badge">0</span></div>`}
+        <div id="incoming-list">${incomingHTML}</div>
 
         ${(outgoing || []).length > 0 ? `
-        <div class="section-title">Sent Requests</div>
-        <div id="outgoing-list">${outgoingHTML}</div>` : ''}
+        <div class="section-title" id="outgoing-section-title">Sent Requests</div>` : `<div class="section-title" id="outgoing-section-title" style="display:none;">Sent Requests</div>`}
+        <div id="outgoing-list">${outgoingHTML}</div>
 
-        <div class="section-title">Your Friends <span style="opacity:0.4;font-size:0.8em;font-weight:400;">(${(friends || []).length})</span></div>
-        <div id="friends-list">${friendsHTML || '<p style="opacity:0.4;">No friends yet. Send friend requests from someone\'s profile page.</p>'}</div>
+        <div class="section-title">Your Friends <span style="opacity:0.4;font-size:0.8em;font-weight:400;" id="friends-count">(${(friends || []).length})</span></div>
+        <div id="friends-list">${friendsHTML || '<p id="no-friends-msg" style="opacity:0.4;">No friends yet. Send friend requests from someone\'s profile page.</p>'}</div>
     </div>
 
     <script>
@@ -4764,32 +5142,92 @@ app.get('/friends', (req, res) => {
             btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
         });
 
-        function removeRow(container, username) {
-            const rows = document.querySelectorAll('#' + container + ' > div');
-            rows.forEach(row => {
-                if (row.textContent.includes(username)) row.remove();
+        function findRow(containerId, username) {
+            const container = document.getElementById(containerId);
+            if (!container) return null;
+            return Array.from(container.children).find(row => {
+                const link = row.querySelector('a[href^="/user/"]');
+                return link && link.getAttribute('href') === '/user/' + username;
             });
+        }
+
+        function removeRow(containerId, username) {
+            const row = findRow(containerId, username);
+            if (row) row.remove();
+            updateSectionVisibility();
+        }
+
+        function updateSectionVisibility() {
+            const incomingList = document.getElementById('incoming-list');
+            const incomingTitle = document.getElementById('incoming-section-title');
+            if (incomingList && incomingTitle) {
+                const count = incomingList.children.length;
+                incomingTitle.style.display = count ? '' : 'none';
+                const badge = document.getElementById('incoming-badge');
+                if (badge) badge.textContent = count;
+            }
+            const outgoingList = document.getElementById('outgoing-list');
+            const outgoingTitle = document.getElementById('outgoing-section-title');
+            if (outgoingList && outgoingTitle) {
+                outgoingTitle.style.display = outgoingList.children.length ? '' : 'none';
+            }
+            const friendsList = document.getElementById('friends-list');
+            const friendsCount = document.getElementById('friends-count');
+            if (friendsList && friendsCount) {
+                friendsCount.textContent = '(' + friendsList.children.length + ')';
+                if (!friendsList.children.length && !document.getElementById('no-friends-msg')) {
+                    const p = document.createElement('p');
+                    p.id = 'no-friends-msg';
+                    p.style.opacity = '0.4';
+                    p.textContent = "No friends yet. Send friend requests from someone's profile page.";
+                    friendsList.appendChild(p);
+                } else if (friendsList.children.length > 1) {
+                    const msg = document.getElementById('no-friends-msg');
+                    if (msg) msg.remove();
+                }
+            }
         }
 
         function acceptRequest(username) {
             fetch('/friend-request/accept/' + username, { method: 'POST' })
-                .then(r => r.json()).then(d => { if (d.ok) location.reload(); });
+                .then(r => r.json()).then(d => {
+                    if (!d.ok) return;
+                    const row = findRow('incoming-list', username);
+                    if (!row) return;
+                    row.querySelectorAll('button, a.button').forEach(el => el.remove());
+                    const msgLink = document.createElement('a');
+                    msgLink.href = '/messages/' + username;
+                    msgLink.className = 'button';
+                    msgLink.style.cssText = 'padding:6px 12px;text-decoration:none;font-size:0.85em;';
+                    msgLink.textContent = 'Message';
+                    const unfriendBtn = document.createElement('button');
+                    unfriendBtn.className = 'button';
+                    unfriendBtn.style.cssText = 'padding:6px 12px;font-size:0.85em;height:44px;background:rgba(255,60,60,0.15);border-color:rgba(255,60,60,0.6);color:var(--danger-light-color);';
+                    unfriendBtn.textContent = 'Unfriend';
+                    unfriendBtn.addEventListener('click', () => unfriend(username));
+                    row.appendChild(msgLink);
+                    row.appendChild(unfriendBtn);
+                    const msg = document.getElementById('no-friends-msg');
+                    if (msg) msg.remove();
+                    document.getElementById('friends-list').prepend(row);
+                    updateSectionVisibility();
+                });
         }
 
         function declineRequest(username) {
             fetch('/friend-request/decline/' + username, { method: 'POST' })
-                .then(r => r.json()).then(d => { if (d.ok) location.reload(); });
+                .then(r => r.json()).then(d => { if (d.ok) removeRow('incoming-list', username); });
         }
 
         function cancelRequest(username) {
             fetch('/friend-request/cancel/' + username, { method: 'POST' })
-                .then(r => r.json()).then(d => { if (d.ok) location.reload(); });
+                .then(r => r.json()).then(d => { if (d.ok) removeRow('outgoing-list', username); });
         }
 
         function unfriend(username) {
             if (!confirm('Remove ' + username + ' from friends?')) return;
             fetch('/unfriend/' + username, { method: 'POST' })
-                .then(r => r.json()).then(d => { if (d.ok) location.reload(); });
+                .then(r => r.json()).then(d => { if (d.ok) removeRow('friends-list', username); });
         }
         function toggleNav() {
             const dropdown = document.getElementById('nav-dropdown');
@@ -4806,7 +5244,7 @@ app.get('/friends', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -4893,7 +5331,7 @@ app.get('/followers', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -5057,7 +5495,7 @@ app.get('/user/:username', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -5143,7 +5581,7 @@ app.get('/messages', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -5427,7 +5865,7 @@ app.get('/messages/:username', (req, res) => {
             }
         });
     </script>
-
+${REPORT_SCRIPT}
 </body>
 </html>`);
     });
@@ -5704,7 +6142,7 @@ app.get('/notifications', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -5766,80 +6204,122 @@ function requireHeadAdmin(req, res, next) {
     next();
 }
 
+// ----- Admin dashboard table rendering (shared between the full page render
+// and the /admin/tables-partial endpoint used to refresh tables without a
+// full page reload after an admin action). -----
+function buildAdminUserRows(users, activeWarningCounts) {
+    return (users || []).map(u => {
+        const badges = [
+            u.IsOwner ? '<span style="color:var(--gold-color);font-weight:700;">Owner</span>' : '',
+            u.IsHeadAdmin ? '<span style="color:var(--danger-strong-color);font-weight:700;">Head Admin</span>' : '',
+            u.IsAdmin ? '<span style="color:var(--admin-color);font-weight:700;">Admin</span>' : '',
+            u.IsDeveloper ? '<span style="color:var(--accent-color);font-weight:700;">Dev</span>' : '',
+            u.IsSupporter ? '<span style="color:var(--purple-color);font-weight:700;">Supporter</span>' : '',
+            u.IsVerified ? '<span style="color:var(--accent-color, #1d9bf0);font-weight:700;">Verified</span>' : '',
+            u.IsDeleted ? '<span style="color:var(--gray-color);font-weight:700;">Deleted</span>' : (u.IsBanned ? '<span style="color:var(--danger-color);font-weight:700;">Banned</span>' : ''),
+        ].filter(Boolean).join(' ');
+        const ipBtn = u.last_ip
+            ? `<button class="button" style="font-size:0.75em;padding:2px 8px;margin-left:6px;" onclick="prefillIPBan('${escapeHTML(u.last_ip)}')">IP Ban</button>`
+            : '';
+        const nicknameSuffix = (u.Nickname && u.Nickname.trim()) ? ` <span style="opacity:0.5;font-weight:400;">(${escapeHTML(u.Nickname.trim())})</span>` : '';
+        const banExpirySuffix = (u.IsBanned && u.BanExpiresAt) ? ` (until ${escapeHTML(new Date(u.BanExpiresAt).toLocaleString())})` : '';
+        const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') + banExpirySuffix : '');
+        const standing = getStanding(activeWarningCounts[u.username] || 0);
+        const standingBtn = `<button class="button" style="font-size:0.72em;padding:2px 8px;margin-left:6px;" onclick="prefillWarnUsername('${escapeHTML(u.username)}')">Warn</button>`;
+        return `<tr>
+            <td><a href="/user/${escapeHTML(u.username)}" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
+            <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${badges || '<span style="opacity:0.4;">-</span>'}</td>
+            <td style="font-size:0.8em;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${statusReason}</td>
+            <td style="font-size:0.85em;white-space:nowrap; word-break: break-word; overflow-wrap: break-word"><span style="color:${standing.color};font-weight:700;">${escapeHTML(standing.label)}</span> <span style="opacity:0.5;">(${standing.count})</span>${standingBtn}</td>
+            <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${u.last_ip ? escapeHTML(u.last_ip) : '<span style="opacity:0.3;">-</span>'}${ipBtn}</td>
+        </tr>`;
+    }).join('');
+}
+
+function buildAdminIPBanRows(ipbans) {
+    return (ipbans || []).map(b => `<tr>
+        <td style="font-family:monospace; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.ip)}</td>
+        <td style="font-size:0.8em;opacity:0.7; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.reason || '')}</td>
+        <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.banned_by || '')}</td>
+        <td><button class="button" style="font-size:0.75em;padding:2px 8px;" onclick="unIPBan('${escapeHTML(b.ip)}')">Unban</button></td>
+    </tr>`).join('');
+}
+
+const ADMIN_AUDIT_ACTION_LABELS = {
+    account_created: 'Account Created',
+    account_banned: 'Account Banned',
+    account_unbanned: 'Account Unbanned',
+    account_deleted: 'Account Deleted',
+    registration_gate_enabled: 'Registration Gate ON',
+    registration_gate_disabled: 'Registration Gate OFF',
+    ip_banned: 'IP Banned',
+    ip_unbanned: 'IP Unbanned',
+    warning_issued: 'Warning Issued',
+    warning_revoked: 'Warning Revoked',
+    content_reported: 'Content Reported',
+    report_resolved: 'Report Resolved',
+    report_reopened: 'Report Reopened',
+    report_content_deleted: 'Reported Content Deleted'
+};
+const ADMIN_AUDIT_IP_ACTIONS = new Set(['ip_banned', 'ip_unbanned']);
+function buildAdminAuditRows(auditEntries) {
+    return (auditEntries || []).map(a => {
+        let targetDisplay = '<span style="opacity:0.3;">-</span>';
+        if (a.target) {
+            targetDisplay = ADMIN_AUDIT_IP_ACTIONS.has(a.action)
+                ? `<span style="font-family:monospace;">${escapeHTML(a.target)}</span>`
+                : '@' + escapeHTML(a.target);
+        }
+        return `<tr>
+        <td style="font-size:0.78em;opacity:0.5;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.created_at || '')}</td>
+        <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(ADMIN_AUDIT_ACTION_LABELS[a.action] || a.action)}</td>
+        <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.actor || '')}</td>
+        <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${targetDisplay}</td>
+        <td style="font-size:0.8em;opacity:0.7;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.details || '')}</td>
+    </tr>`;
+    }).join('');
+}
+
+function getActiveWarningCounts(allWarnings) {
+    const activeWarningCounts = {};
+    (allWarnings || []).forEach(w => {
+        if (isWarningActive(w)) activeWarningCounts[w.username] = (activeWarningCounts[w.username] || 0) + 1;
+    });
+    return activeWarningCounts;
+}
+
+// Returns just the refreshed table bodies (Users, Banned IPs, Audit Log) as
+// HTML fragments so the admin dashboard can update them in place after an
+// action (ban, unban, warn, delete, IP ban, badge change, ...) instead of
+// doing a full page reload - much lighter on slow connections.
+app.get('/admin/tables-partial', requireAdmin, (req, res) => {
+    db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, IsVerified, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
+        if (err) return res.status(500).json({ error: 'DB error' });
+        db.all(`SELECT username, expires_at FROM Warnings`, [], (errW, allWarnings) => {
+            const userRows = buildAdminUserRows(users, getActiveWarningCounts(allWarnings));
+            db.all(`SELECT ip, reason, banned_by, created_at FROM IP_Bans ORDER BY created_at DESC`, [], (err2, ipbans) => {
+                const ipBanRows = buildAdminIPBanRows(ipbans);
+                db.all(`SELECT action, actor, target, details, created_at FROM Audit_Log ORDER BY id DESC LIMIT 150`, [], (err3, auditEntries) => {
+                    const auditRows = buildAdminAuditRows(auditEntries);
+                    res.json({ userRows, ipBanRows, auditRows });
+                });
+            });
+        });
+    });
+});
+
 app.get('/admin/dashboard', requireAdmin, (req, res) => {
     db.all(`SELECT username, Nickname, IsBanned, BanReason, BanExpiresAt, IsDeleted, DeleteReason, IsOwner, IsAdmin, IsHeadAdmin, IsDeveloper, IsSupporter, IsVerified, last_ip FROM User_Data ORDER BY username ASC`, [], (err, users) => {
         if (err) return res.status(500).send('DB error');
         db.all(`SELECT username, expires_at FROM Warnings`, [], (errW, allWarnings) => {
-        // Active-warning counts per username, computed in JS (same
-        // expires-as-Date approach used everywhere else for expiry checks).
-        const activeWarningCounts = {};
-        (allWarnings || []).forEach(w => {
-            if (isWarningActive(w)) activeWarningCounts[w.username] = (activeWarningCounts[w.username] || 0) + 1;
-        });
-        const userRows = (users || []).map(u => {
-            const badges = [
-                u.IsOwner ? '<span style="color:var(--gold-color);font-weight:700;">Owner</span>' : '',
-                u.IsHeadAdmin ? '<span style="color:var(--danger-strong-color);font-weight:700;">Head Admin</span>' : '',
-                u.IsAdmin ? '<span style="color:var(--admin-color);font-weight:700;">Admin</span>' : '',
-                u.IsDeveloper ? '<span style="color:var(--accent-color);font-weight:700;">Dev</span>' : '',
-                u.IsSupporter ? '<span style="color:var(--purple-color);font-weight:700;">Supporter</span>' : '',
-                u.IsVerified ? '<span style="color:var(--accent-color, #1d9bf0);font-weight:700;">Verified</span>' : '',
-                u.IsDeleted ? '<span style="color:var(--gray-color);font-weight:700;">Deleted</span>' : (u.IsBanned ? '<span style="color:var(--danger-color);font-weight:700;">Banned</span>' : ''),
-            ].filter(Boolean).join(' ');
-            const ipBtn = u.last_ip
-                ? `<button class="button" style="font-size:0.75em;padding:2px 8px;margin-left:6px;" onclick="prefillIPBan('${escapeHTML(u.last_ip)}')">IP Ban</button>`
-                : '';
-            const nicknameSuffix = (u.Nickname && u.Nickname.trim()) ? ` <span style="opacity:0.5;font-weight:400;">(${escapeHTML(u.Nickname.trim())})</span>` : '';
-            const banExpirySuffix = (u.IsBanned && u.BanExpiresAt) ? ` (until ${escapeHTML(new Date(u.BanExpiresAt).toLocaleString())})` : '';
-            const statusReason = u.IsDeleted ? escapeHTML(u.DeleteReason || '') : (u.IsBanned ? escapeHTML(u.BanReason || '') + banExpirySuffix : '');
-            const standing = getStanding(activeWarningCounts[u.username] || 0);
-            const standingBtn = `<button class="button" style="font-size:0.72em;padding:2px 8px;margin-left:6px;" onclick="prefillWarnUsername('${escapeHTML(u.username)}')">Warn</button>`;
-            return `<tr>
-                <td><a href="/user/${escapeHTML(u.username)}" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(u.username)}</a>${nicknameSuffix}</td>
-                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${badges || '<span style="opacity:0.4;">-</span>'}</td>
-                <td style="font-size:0.8em;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${statusReason}</td>
-                <td style="font-size:0.85em;white-space:nowrap; word-break: break-word; overflow-wrap: break-word"><span style="color:${standing.color};font-weight:700;">${escapeHTML(standing.label)}</span> <span style="opacity:0.5;">(${standing.count})</span>${standingBtn}</td>
-                <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${u.last_ip ? escapeHTML(u.last_ip) : '<span style="opacity:0.3;">-</span>'}${ipBtn}</td>
-            </tr>`;
-        }).join('');
+        const activeWarningCounts = getActiveWarningCounts(allWarnings);
+        const userRows = buildAdminUserRows(users, activeWarningCounts);
 
         db.all(`SELECT ip, reason, banned_by, created_at FROM IP_Bans ORDER BY created_at DESC`, [], (err2, ipbans) => {
-            const ipBanRows = (ipbans || []).map(b => `<tr>
-                <td style="font-family:monospace; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.ip)}</td>
-                <td style="font-size:0.8em;opacity:0.7; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.reason || '')}</td>
-                <td style="font-size:0.78em;opacity:0.5; word-break: break-word; overflow-wrap: break-word">${escapeHTML(b.banned_by || '')}</td>
-                <td><button class="button" style="font-size:0.75em;padding:2px 8px;" onclick="unIPBan('${escapeHTML(b.ip)}')">Unban</button></td>
-            </tr>`).join('');
+            const ipBanRows = buildAdminIPBanRows(ipbans);
 
         db.all(`SELECT action, actor, target, details, created_at FROM Audit_Log ORDER BY id DESC LIMIT 150`, [], (err3, auditEntries) => {
-            const ACTION_LABELS = {
-                account_created: 'Account Created',
-                account_banned: 'Account Banned',
-                account_unbanned: 'Account Unbanned',
-                account_deleted: 'Account Deleted',
-                registration_gate_enabled: 'Registration Gate ON',
-                registration_gate_disabled: 'Registration Gate OFF',
-                ip_banned: 'IP Banned',
-                ip_unbanned: 'IP Unbanned',
-                warning_issued: 'Warning Issued',
-                warning_revoked: 'Warning Revoked'
-            };
-            const IP_ACTIONS = new Set(['ip_banned', 'ip_unbanned']);
-            const auditRows = (auditEntries || []).map(a => {
-                let targetDisplay = '<span style="opacity:0.3;">-</span>';
-                if (a.target) {
-                    targetDisplay = IP_ACTIONS.has(a.action)
-                        ? `<span style="font-family:monospace;">${escapeHTML(a.target)}</span>`
-                        : '@' + escapeHTML(a.target);
-                }
-                return `<tr>
-                <td style="font-size:0.78em;opacity:0.5;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.created_at || '')}</td>
-                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(ACTION_LABELS[a.action] || a.action)}</td>
-                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.actor || '')}</td>
-                <td style="font-size:0.85em; word-break: break-word; overflow-wrap: break-word">${targetDisplay}</td>
-                <td style="font-size:0.8em;opacity:0.7;max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap; word-break: break-word; overflow-wrap: break-word">${escapeHTML(a.details || '')}</td>
-            </tr>`;
-            }).join('');
+            const auditRows = buildAdminAuditRows(auditEntries);
 
         res.send(`<!DOCTYPE html>
 <html lang="en" class="page-admin">
@@ -5871,12 +6351,14 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <strong>Admin Dashboard</strong>
     <div id="topbar-right" style="position:relative;display:flex;align-items:center;">
         <a href="/feed">Feed</a>
+        <a href="/admin/reports">Reports</a>
         <a href="/admin/support">Support Tickets</a>
         <a href="/edit">Dashboard</a>
         <a href="/logout">Logout</a>
         <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
         <nav id="nav-dropdown">
             <a href="/feed">Feed</a>
+            <a href="/admin/reports">Reports</a>
             <a href="/admin/support">Support Tickets</a>
             <a href="/edit">Dashboard</a>
             <a href="/logout">Logout</a>
@@ -6083,9 +6565,29 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 </div>
 
 <script>
-    document.querySelectorAll('.button').forEach(btn => {
-        btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
+    // Event delegation so buttons injected later (e.g. after refreshAdminTables()
+    // repopulates a table) still get the click animation without re-binding.
+    document.addEventListener('mousedown', (e) => {
+        const btn = e.target.closest('.button');
+        if (btn) { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); }
     });
+
+    // Refreshes the Users, Banned IPs, and Audit Log tables in place by
+    // fetching just their rows - avoids a full page reload (and re-running
+    // every query on the page) after a ban/unban/warn/delete/etc.
+    async function refreshAdminTables() {
+        try {
+            const r = await fetch('/admin/tables-partial');
+            if (!r.ok) return;
+            const d = await r.json();
+            const userTable = document.getElementById('user-table');
+            const ipBanTable = document.getElementById('ip-ban-table');
+            const auditTable = document.getElementById('audit-table');
+            if (userTable) userTable.innerHTML = d.userRows || '<tr><td colspan="5" style="opacity:0.4;">No users found.</td></tr>';
+            if (ipBanTable) ipBanTable.innerHTML = d.ipBanRows || '<tr><td colspan="4" style="opacity:0.4;">No IP bans.</td></tr>';
+            if (auditTable) auditTable.innerHTML = d.auditRows || '<tr><td colspan="5" style="opacity:0.4;">No audit events yet.</td></tr>';
+        } catch (e) { /* leave existing tables as-is on network error */ }
+    }
 
     async function toggleRegistrationGate(enable) {
         const result = document.getElementById('reg-gate-result');
@@ -6261,7 +6763,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const data = await res.json();
             if (!res.ok) { resultEl.className = 'err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
             resultEl.className = 'ok'; resultEl.textContent = 'Badges updated for @' + username + '.';
-            setTimeout(() => location.reload(), 1000);
+            setTimeout(() => refreshAdminTables(), 1000);
         } catch (e) {
             resultEl.className = 'err'; resultEl.textContent = 'Network error.';
         }
@@ -6298,7 +6800,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 document.getElementById('target-username').value = '';
                 document.getElementById('ban-reason').value = '';
                 document.getElementById('ban-duration').value = '';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -6330,7 +6832,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 resultEl.textContent = '@' + username + ' has been deleted.';
                 document.getElementById('delete-username').value = '';
                 document.getElementById('delete-reason').value = '';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -6363,7 +6865,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 resultEl.textContent = '@' + username + ' has been permanently deleted from the database.';
                 document.getElementById('hard-delete-username').value = '';
                 document.getElementById('hard-delete-reason').value = '';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -6400,7 +6902,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                     : ip + ' has been IP unbanned.';
                 document.getElementById('target-ip').value = '';
                 document.getElementById('ip-ban-reason').value = '';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -6440,7 +6942,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
                 document.getElementById('warn-username').value = '';
                 document.getElementById('warn-reason').value = '';
                 document.getElementById('warn-duration').value = '';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -6527,7 +7029,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             } else {
                 resultEl.className = 'ok';
                 resultEl.textContent = ip + ' has been IP unbanned.';
-                setTimeout(() => location.reload(), 1200);
+                setTimeout(() => refreshAdminTables(), 1200);
             }
         } catch (e) {
             resultEl.className = 'err';
@@ -7013,11 +7515,15 @@ function renderSupportTopbar(title) {
     <strong>${escapeHTML(title)}</strong>
     <div id="topbar-right" style="position:relative;display:flex;align-items:center;">
         <a href="/admin/dashboard">Admin Dashboard</a>
+        <a href="/admin/reports">Reports</a>
+        <a href="/admin/support">Support Tickets</a>
         <a href="/feed">Feed</a>
         <a href="/logout">Logout</a>
         <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
         <nav id="nav-dropdown">
             <a href="/admin/dashboard">Admin Dashboard</a>
+            <a href="/admin/reports">Reports</a>
+            <a href="/admin/support">Support Tickets</a>
             <a href="/feed">Feed</a>
             <a href="/logout">Logout</a>
         </nav>
@@ -7206,6 +7712,319 @@ app.post('/admin/support/:id/reply', requireAdmin, (req, res) => {
     });
 });
 
+// ----- Reports (admin) -----
+// Standalone page, linked from the admin dashboard, listing every report
+// filed via the "Report" button on a feed post, DM, or group chat message.
+// Mirrors the Support Tickets page's list/detail/status shape.
+const REPORT_SOURCE_LABELS = { post: 'Post', dm: 'DM', gc: 'Group Chat' };
+function reportSourceLink(r) {
+    if (r.source_type === 'post') return `<a href="/post/${r.source_id}" style="color:var(--text-color);">#${r.source_id}</a>`;
+    if (r.source_type === 'gc') return `<span style="opacity:0.6;">msg #${r.source_id}</span>`;
+    return `<span style="opacity:0.6;">msg #${r.source_id}</span>`;
+}
+
+app.get('/admin/reports', requireAdmin, (req, res) => {
+    db.all(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at FROM Reports ORDER BY (status = 'open') DESC, id DESC`, [], (err, reports) => {
+        if (err) return res.status(500).send('DB error');
+        const rows = (reports || []).map(r => {
+            const snippet = escapeHTML((r.content || '').trim().slice(0, 80)) + ((r.content || '').length > 80 ? '…' : '');
+            const attachmentMarker = r.attachments_json ? ' <span title="Has attachment(s)">📎</span>' : '';
+            return `<tr class="ticket-row" onclick="window.location.href='/admin/reports/${r.id}'">
+            <td style="opacity:0.5;">#${r.id}</td>
+            <td>${REPORT_SOURCE_LABELS[r.source_type] || r.source_type}</td>
+            <td><a href="/user/${escapeHTML(r.reported_username)}" onclick="event.stopPropagation();" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(r.reported_username)}</a></td>
+            <td><a href="/user/${escapeHTML(r.reporter_username)}" onclick="event.stopPropagation();" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(r.reporter_username)}</a></td>
+            <td style="opacity:0.7;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${snippet || '<span style="opacity:0.4;">(no text)</span>'}${attachmentMarker}</td>
+            <td>${r.status === 'open' ? '<span style="color:var(--warning-color, #d9a441);font-weight:700;">Open</span>' : '<span style="color:var(--success-color);font-weight:700;">Resolved</span>'}</td>
+            <td style="font-size:0.78em;opacity:0.5;white-space:nowrap;">${escapeHTML(r.created_at || '')}</td>
+        </tr>`;
+        }).join('');
+
+        res.send(`<!DOCTYPE html>
+<html lang="en" class="page-admin">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Reports</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+<style>
+    .table-scroll-wrap { display:block !important; width:100% !important; max-width:100% !important; overflow-x:auto !important; -webkit-overflow-scrolling:touch; }
+    .ticket-row { cursor:pointer; }
+    .ticket-row:hover { background:rgba(255,255,255,0.05); }
+</style>
+</head>
+<body class="page-admin">
+${renderSupportTopbar('Reports')}
+<div id="content">
+    <h1>Reports</h1>
+    <p style="opacity:0.5;margin-top:4px;">Content reported by users from the feed, DMs, and group chats. Click a report to see the full snapshot.</p>
+
+    <div class="panel">
+        <div class="table-scroll-wrap">
+            <table>
+                <thead><tr><th>#</th><th>Source</th><th>Reported</th><th>Reporter</th><th>Content</th><th>Status</th><th>Filed</th></tr></thead>
+                <tbody>
+                    ${rows || '<tr><td colspan="7" style="opacity:0.4;">No reports.</td></tr>'}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+${SUPPORT_NAV_SCRIPT}
+</body>
+</html>`);
+    });
+});
+
+app.get('/admin/reports/:id', requireAdmin, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
+
+    db.get(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at FROM Reports WHERE id = ?`, [id], (err, report) => {
+        if (err) return res.status(500).send('DB error');
+        if (!report) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
+
+        let attachments = [];
+        if (report.attachments_json) {
+            try { attachments = JSON.parse(report.attachments_json) || []; } catch (e) {}
+        }
+        const attachmentsHTML = renderAttachmentsHTML(attachments, 400, '500px');
+
+        let bannerHTML = '';
+        if (req.query.error) bannerHTML = `<p style="color:var(--danger-color);font-weight:700;">${escapeHTML(req.query.error)}</p>`;
+
+        const statusLabel = report.status === 'open'
+            ? '<span style="color:var(--warning-color, #d9a441);font-weight:700;">Open</span>'
+            : '<span style="color:var(--success-color);font-weight:700;">Resolved</span>';
+
+        res.send(`<!DOCTYPE html>
+<html lang="en" class="page-admin">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Report #${report.id}</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+<style>
+    .report-action-form { margin-top:12px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.1); }
+    .report-action-form label { display:block;font-size:0.85em;opacity:0.7;margin-bottom:4px; }
+    .report-action-form input, .report-action-form textarea { width:100%;box-sizing:border-box;font-family:inherit;padding:6px;margin-bottom:8px; }
+    .report-action-result { font-size:0.85em;margin-top:6px;min-height:1.2em; }
+    .report-action-result.ok { color:var(--success-color); }
+    .report-action-result.err { color:var(--danger-color); }
+</style>
+</head>
+<body class="page-admin">
+${renderSupportTopbar('Report #' + report.id)}
+<div id="content">
+    <p><a href="/admin/reports" style="color:var(--text-color);opacity:0.6;text-decoration:none;">< Back to reports</a></p>
+    ${bannerHTML}
+    <input type="hidden" id="report-target-username" value="${escapeHTML(report.reported_username)}">
+
+    <div class="panel">
+        <h2>${REPORT_SOURCE_LABELS[report.source_type] || report.source_type} reported</h2>
+        <p style="opacity:0.5;font-size:0.85em;margin-top:-6px;">Report #${report.id} · ${escapeHTML(report.created_at || '')}</p>
+        <p style="font-size:0.9em;"><strong>Reported account:</strong> <a href="/user/${escapeHTML(report.reported_username)}" style="color:var(--text-color);">@${escapeHTML(report.reported_username)}</a></p>
+        <p style="font-size:0.9em;"><strong>Reported by:</strong> <a href="/user/${escapeHTML(report.reporter_username)}" style="color:var(--text-color);">@${escapeHTML(report.reporter_username)}</a></p>
+        <p style="font-size:0.9em;"><strong>Source:</strong> ${REPORT_SOURCE_LABELS[report.source_type] || report.source_type} ${reportSourceLink(report)}</p>
+        <p style="font-size:0.9em;"><strong>Status:</strong> <span id="report-status-label">${statusLabel}</span></p>
+        <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
+        <p style="opacity:0.5;font-size:0.8em;margin-bottom:4px;">Content at time of report:</p>
+        <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(report.content) || '<span style="opacity:0.4;">(no text)</span>'}</p>
+        ${attachmentsHTML}
+        <form method="POST" action="/admin/reports/${report.id}/status" class="action-row">
+            <input type="hidden" name="status" value="${report.status === 'open' ? 'resolved' : 'open'}">
+            <button type="submit" class="button" style="width:auto;padding:8px 16px;">${report.status === 'open' ? 'Mark Resolved' : 'Reopen'}</button>
+        </form>
+    </div>
+
+    <div class="panel">
+        <h2>Quick Actions <span style="opacity:0.5;font-weight:400;font-size:0.7em;">on @${escapeHTML(report.reported_username)}</span></h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Take action against the reported account without leaving this page. Each action also deletes the reported content.</p>
+
+        <div class="report-action-form">
+            <h3 style="margin-bottom:8px;">Warn</h3>
+            <label>Reason (required)</label>
+            <textarea id="warn-reason" rows="2" placeholder="Reason for the warning..."></textarea>
+            <label>Expires in <span style="opacity:0.5;">(e.g. 30m, 6h, 3d, 2w - blank never expires)</span></label>
+            <input type="text" id="warn-duration" placeholder="Leave blank for permanent">
+            <button type="button" class="button" style="width:auto;padding:8px 16px;" onclick="reportWarn()">Warn User</button>
+            <div id="warn-result" class="report-action-result"></div>
+        </div>
+
+        <div class="report-action-form">
+            <h3 style="margin-bottom:8px;">Ban</h3>
+            <label>Reason</label>
+            <textarea id="ban-reason" rows="2" placeholder="Reason for the ban..."></textarea>
+            <label>Duration <span style="opacity:0.5;">(e.g. 30m, 6h, 3d, 2w - blank is permanent)</span></label>
+            <input type="text" id="ban-duration" placeholder="Leave blank for permanent">
+            <button type="button" class="button" style="width:auto;padding:8px 16px;" onclick="reportBan()">Ban Account</button>
+            <div id="ban-result" class="report-action-result"></div>
+        </div>
+
+        <div class="report-action-form">
+            <h3 style="margin-bottom:8px;">Delete Account</h3>
+            <label>Reason (required)</label>
+            <textarea id="delete-reason" rows="2" placeholder="Reason for deletion..."></textarea>
+            <button type="button" class="button" style="width:auto;padding:8px 16px;" onclick="reportDeleteAccount()">Delete Account</button>
+            <div id="delete-result" class="report-action-result"></div>
+        </div>
+    </div>
+</div>
+${SUPPORT_NAV_SCRIPT}
+<script>
+    var reportTargetUsername = document.getElementById('report-target-username').value;
+    var reportId = ${report.id};
+
+    async function deleteReportedContent(resultEl) {
+        try {
+            const res = await fetch('/admin/reports/' + reportId + '/delete-content', { method: 'POST' });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.deleted) {
+                resultEl.textContent += ' Reported content deleted.';
+            } else if (res.ok) {
+                resultEl.textContent += ' (Reported content was already gone.)';
+            } else {
+                resultEl.textContent += ' (Could not delete the reported content: ' + (data.error || res.status) + ')';
+            }
+        } catch (e) {
+            resultEl.textContent += ' (Network error deleting reported content.)';
+        }
+    }
+
+    async function reportWarn() {
+        const reason = document.getElementById('warn-reason').value.trim();
+        const duration = document.getElementById('warn-duration').value.trim();
+        const resultEl = document.getElementById('warn-result');
+        if (!reason) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'A reason is required.'; return; }
+        resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/warn/' + encodeURIComponent(reportTargetUsername), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason, duration })
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'report-action-result ok';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been warned (' + (data.expiresAt ? 'expires ' + new Date(data.expiresAt).toLocaleString() : 'never expires') + ').';
+            await deleteReportedContent(resultEl);
+        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
+    }
+
+    async function reportBan() {
+        const reason = document.getElementById('ban-reason').value.trim();
+        const duration = document.getElementById('ban-duration').value.trim();
+        const resultEl = document.getElementById('ban-result');
+        resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/ban/' + encodeURIComponent(reportTargetUsername), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason, duration })
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'report-action-result ok';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been banned' + (data.expiresAt ? ' until ' + new Date(data.expiresAt).toLocaleString() : ' permanently') + '.';
+            await deleteReportedContent(resultEl);
+        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
+    }
+
+    async function reportDeleteAccount() {
+        const reason = document.getElementById('delete-reason').value.trim();
+        const resultEl = document.getElementById('delete-result');
+        if (!reason) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'A reason is required.'; return; }
+        if (!confirm('This will reset @' + reportTargetUsername + '\\'s avatar, name, and bio, mark the account as deleted, and delete all of its posts. The account stays in the database and the username is kept. Continue?')) return;
+        resultEl.className = 'report-action-result'; resultEl.textContent = 'Working…';
+        try {
+            const res = await fetch('/admin/delete-account/' + encodeURIComponent(reportTargetUsername), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ reason })
+            });
+            const data = await res.json();
+            if (!res.ok) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Error: ' + (data.error || res.status); return; }
+            resultEl.className = 'report-action-result ok';
+            resultEl.textContent = '@' + reportTargetUsername + ' has been deleted.';
+            await deleteReportedContent(resultEl);
+        } catch (e) { resultEl.className = 'report-action-result err'; resultEl.textContent = 'Network error.'; }
+    }
+<\/script>
+</body>
+</html>`);
+    });
+});
+
+app.post('/admin/reports/:id/status', requireAdmin, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(404).send('Report not found.');
+    const status = req.body.status;
+    if (status !== 'open' && status !== 'resolved') return res.redirect(`/admin/reports/${id}?error=` + encodeURIComponent("Status must be 'open' or 'resolved'."));
+    db.get(`SELECT reported_username FROM Reports WHERE id = ?`, [id], (err0, report) => {
+        db.run(`UPDATE Reports SET status = ? WHERE id = ?`, [status, id], function (err) {
+            if (err || this.changes === 0) return res.redirect(`/admin/reports/${id}?error=` + encodeURIComponent('Failed to update report.'));
+            logAudit(status === 'resolved' ? 'report_resolved' : 'report_reopened', req.session.userUsername, report && report.reported_username, `report #${id}`);
+            res.redirect(`/admin/reports/${id}`);
+        });
+    });
+});
+
+// Deletes the original post/DM/group-chat message a report points at,
+// bypassing the normal "only the sender can delete" check on those routes
+// since this is an admin acting on a report - called automatically by the
+// Quick Actions panel on /admin/reports/:id after a warn/ban/delete-account
+// action, but is its own endpoint so it can be retried/called independently.
+// Treats an already-gone message (e.g. the user deleted it themselves) as
+// success rather than an error.
+app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isInteger(id)) return res.status(404).json({ error: 'Report not found.' });
+    const admin = req.session.userUsername;
+
+    db.get(`SELECT reported_username, source_type, source_id FROM Reports WHERE id = ?`, [id], (err, report) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!report) return res.status(404).json({ error: 'Report not found.' });
+        const { reported_username, source_type, source_id } = report;
+
+        if (source_type === 'post') {
+            db.run(`DELETE FROM Posts WHERE id = ?`, [source_id], function (err2) {
+                if (err2) return res.status(500).json({ error: 'db error' });
+                const deleted = this.changes > 0;
+                if (deleted) logAudit('report_content_deleted', admin, reported_username, `post #${source_id}`);
+                res.json({ ok: true, deleted });
+            });
+        } else if (source_type === 'dm') {
+            db.get(`SELECT from_user, to_user FROM Messages WHERE id = ?`, [source_id], (err2, msg) => {
+                if (err2) return res.status(500).json({ error: 'db error' });
+                if (!msg) return res.json({ ok: true, deleted: false });
+                db.run(`DELETE FROM Messages WHERE id = ?`, [source_id], (err3) => {
+                    if (err3) return res.status(500).json({ error: 'db error' });
+                    broadcastDMDelete(msg.from_user, msg.to_user, source_id);
+                    logAudit('report_content_deleted', admin, reported_username, `dm #${source_id}`);
+                    res.json({ ok: true, deleted: true });
+                });
+            });
+        } else if (source_type === 'gc') {
+            db.get(`SELECT group_id FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err2, msg) => {
+                if (err2) return res.status(500).json({ error: 'db error' });
+                if (!msg) return res.json({ ok: true, deleted: false });
+                db.run(`DELETE FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err3) => {
+                    if (err3) return res.status(500).json({ error: 'db error' });
+                    db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [msg.group_id], (err4, memberRows) => {
+                        broadcastGCDelete(msg.group_id, source_id, (memberRows || []).map(r => r.username));
+                        logAudit('report_content_deleted', admin, reported_username, `gc #${source_id}`);
+                        res.json({ ok: true, deleted: true });
+                    });
+                });
+            });
+        } else {
+            res.status(400).json({ error: 'Unknown report source type.' });
+        }
+    });
+});
+
 function renderGCMessageBubble(m, me, replyMsg) {
     const mine = m.from_user === me;
     const fileHTML = renderAttachmentsHTML(getAttachments(m), 260, '260px');
@@ -7220,18 +8039,20 @@ function renderGCMessageBubble(m, me, replyMsg) {
     </div>`;
     const editLink = mine ? `<a href="#" onclick="editGCMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
+    const reportLink = !mine ? `<a href="#" onclick="reportContent('gc', ${m.id}, this);return false;" class="msg-delete-link report-action" data-report-type="gc" data-report-id="${m.id}" style="text-decoration:none;">Report</a>` : '';
     const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderLabel}
             ${replyBanner}
-            <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${linkifyMentions(escapeHTML(cleanText))}</div>
+            <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${escapeAndLinkify(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setGCReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
                 ${editLink}
                 ${deleteLink}
+                ${reportLink}
                 ${editedMarker}
                 <span data-ts="${m.created_at.replace(' ','T')+'Z'}"></span>
             </div>
@@ -7415,7 +8236,7 @@ app.get('/groups', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);
@@ -7535,7 +8356,7 @@ app.get('/groups/:id', (req, res) => {
                     const msgsHTML = (msgs || []).map(m => renderGCMessageBubble(m, me, m.reply_to ? msgMap[m.reply_to] : null)).join('');
                     const isCreator = group.created_by === me;
                     const membersListHTML = (members || []).map(mbr =>
-                        `<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);border-radius:20px;padding:3px 10px;font-size:0.82em;">
+                        `<span data-username="${escapeHTML(mbr.username)}" style="display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);border-radius:20px;padding:3px 10px;font-size:0.82em;">
                             <a href="/user/${escapeHTML(mbr.username)}" style="color:var(--text-color);text-decoration:none;">${escapeHTML(mbr.username)}</a>
                             ${isCreator && mbr.username !== me ? `<button onclick="kickMember('${escapeHTML(mbr.username)}')" title="Kick ${escapeHTML(mbr.username)}" style="background:none;border:none;color:var(--danger-color);cursor:pointer;font-size:0.9em;padding:0 2px;line-height:1;" aria-label="Kick ${escapeHTML(mbr.username)}">✕</button>` : ''}
                         </span>`).join('');
@@ -7570,7 +8391,7 @@ app.get('/groups/:id', (req, res) => {
     </div>
     <div id="gc-members-bar">
         <span style="opacity:0.5;flex-shrink:0;">Members:</span>
-        ${membersListHTML}
+        <span id="gc-members-list" style="display:contents;">${membersListHTML}</span>
         <div id="add-member-row">
             <button class="button" onclick="openGCAddPicker()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;box-sizing: border-box !important;">+ Add Friends</button>
             <button class="button gc-action-btn" onclick="leaveGroup()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;border-color:rgb(255,80,80);color:var(--danger-color);" id="leave-gc-btn">Leave</button>
@@ -7605,6 +8426,8 @@ app.get('/groups/:id', (req, res) => {
     </div>
     <div id="gc-conn-indicator" style="position:fixed;top:54px;left:50%;transform:translateX(-50%);background:rgba(255,170,0,0.9);color:var(--on-warning-color);padding:4px 14px;border-radius:0 0 8px 8px;font-size:0.78em;font-weight:600;z-index:99;display:none;">Reconnecting…</div>
     <script>
+        const isCreator = ${isCreator};
+        const gcMembersList = document.getElementById('gc-members-list');
         document.querySelectorAll('[data-ts]').forEach(el => {
             const ts = el.getAttribute('data-ts');
             if (ts) el.textContent = new Date(ts).toLocaleString('en-GB');
@@ -7809,6 +8632,34 @@ app.get('/groups/:id', (req, res) => {
                 gcContent.focus();
             }
         }
+        function addMemberRow(username) {
+            if (!gcMembersList || gcMembersList.querySelector('span[data-username="' + username + '"]')) return;
+            const span = document.createElement('span');
+            span.setAttribute('data-username', username);
+            span.style.cssText = 'display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,0.08);border-radius:20px;padding:3px 10px;font-size:0.82em;';
+            const link = document.createElement('a');
+            link.href = '/user/' + username;
+            link.style.cssText = 'color:var(--text-color);text-decoration:none;';
+            link.textContent = username;
+            span.appendChild(link);
+            if (isCreator) {
+                const kickBtn = document.createElement('button');
+                kickBtn.title = 'Kick ' + username;
+                kickBtn.setAttribute('aria-label', 'Kick ' + username);
+                kickBtn.style.cssText = 'background:none;border:none;color:var(--danger-color);cursor:pointer;font-size:0.9em;padding:0 2px;line-height:1;';
+                kickBtn.textContent = '✕';
+                kickBtn.addEventListener('click', () => kickMember(username));
+                span.appendChild(kickBtn);
+            }
+            gcMembersList.appendChild(span);
+        }
+
+        function removeMemberRow(username) {
+            if (!gcMembersList) return;
+            const span = gcMembersList.querySelector('span[data-username="' + username + '"]');
+            if (span) span.remove();
+        }
+
         async function addMember(username) {
             const result = document.getElementById('add-member-result');
             if (!username) return;
@@ -7817,7 +8668,11 @@ app.get('/groups/:id', (req, res) => {
                 const r = await fetch('/groups/${groupId}/add-member', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ username }) });
                 const d = await r.json();
                 if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error.'; }
-                else { result.style.color = 'var(--accent-color)'; result.textContent = username + ' added!'; setTimeout(() => { result.textContent = ''; location.reload(); }, 900); }
+                else {
+                    result.style.color = 'var(--accent-color)'; result.textContent = username + ' added!';
+                    addMemberRow(username);
+                    setTimeout(() => { result.textContent = ''; }, 1500);
+                }
             } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
@@ -7906,7 +8761,7 @@ app.get('/groups/:id', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 
 </body>
 </html>`);

@@ -79,12 +79,36 @@ function resolveThemeCSSPath(theme) {
     return resolved;
 }
 
+// file.originalname is fully attacker-controlled (it's just whatever the
+// client's multipart request claims). Using it directly in a filename let a
+// crafted name like "../../../public/pwned.html" or "../../server.js"
+// escape uploadsDir via path.join and write/overwrite arbitrary files on
+// disk - a critical path-traversal -> arbitrary file write bug. This keeps
+// only a sanitized basename/extension and adds random bytes so names can't
+// be predicted or used to overwrite another user's upload.
+function safeUploadFilename(originalname) {
+    const base = path.basename(String(originalname || 'file'));
+    let ext = path.extname(base).toLowerCase().replace(/[^a-z0-9.]/g, '').slice(0, 12);
+    const stem = base.slice(0, base.length - path.extname(base).length)
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 60) || 'file';
+    return `${Date.now()}-${crypto.randomBytes(8).toString('hex')}-${stem}${ext}`;
+}
+
+// No extension filter on attachments by design - any file type is allowed,
+// same as Discord etc. (Discord mitigates the same-origin script risk by
+// serving attachments from a separate CDN domain with no session cookie;
+// this app serves uploads from its own origin, so a directly-opened
+// uploaded HTML/SVG file can still run script in that visitor's session -
+// worth knowing if this ever needs hardening later, e.g. by moving
+// /uploads to a separate subdomain.)
+
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         if (!req.session || !req.session.userId) return cb(new Error('Unauthorized'));
         cb(null, uploadsDir);
     },
-    filename: (req, file, cb) => cb(null, `${Date.now()}-${file.originalname}`)
+    filename: (req, file, cb) => cb(null, safeUploadFilename(file.originalname))
 });
 const MAX_FILE_SIZE = 90 * 1024 * 1024;
 const MAX_MSG_LENGTH = 4000;
@@ -643,6 +667,58 @@ function renderMessageBubble(m, me, replyMsg) {
     </div>`;
 }
 
+// Uploaded files live on disk under a randomized, sanitized name (see
+// safeUploadFilename) so two uploads never collide and a crafted name can't
+// escape uploadsDir - but that means the raw /uploads/<file> URL is also
+// what a browser offers as the filename if someone saves it, and clicking
+// it just opens/plays the file inline instead of downloading. This route
+// forces a download and restores the original filename the uploader saw,
+// using the name recorded alongside the attachment in the DB (passed
+// through as ?name=).
+app.get('/uploads/download/:filename', (req, res) => {
+    const requested = path.basename(req.params.filename); // strips any path traversal attempt
+    const filePath = path.join(uploadsDir, requested);
+    fs.access(filePath, fs.constants.R_OK, (err) => {
+        if (err) return res.status(404).end();
+        const rawName = req.query.name ? String(req.query.name) : requested;
+        const displayName = path.basename(rawName).slice(0, 255) || requested;
+        res.download(filePath, displayName);
+    });
+});
+
+function downloadUrlFor(f) {
+    return `/uploads/download/${path.basename(f.path)}?name=${encodeURIComponent(f.name || path.basename(f.path))}`;
+}
+
+// Icon + human-readable size for the generic "other file" attachment card.
+// Add /file.svg, /code.svg, /text.svg, /archive.svg to the public/ folder
+// (same place Biodeck.png and Default.svg live) - falls back to /file.svg
+// for anything not in the code/text/archive lists below.
+const CODE_FILE_EXTS = new Set([
+    '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.c', '.cpp', '.cc', '.cxx',
+    '.h', '.hpp', '.html', '.htm', '.css', '.scss', '.sass', '.less',
+    '.java', '.py', '.rb', '.go', '.rs', '.php', '.sh', '.bash', '.json',
+    '.xml', '.yml', '.yaml', '.sql', '.swift', '.kt', '.cs', '.lua', '.pl'
+]);
+const TEXT_FILE_EXTS = new Set(['.txt', '.md', '.markdown', '.log', '.csv', '.rtf', '.ini', '.conf', '.cfg']);
+const ARCHIVE_FILE_EXTS = new Set(['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2']);
+
+function fileIconFor(ext) {
+    if (CODE_FILE_EXTS.has(ext)) return '/code.svg';
+    if (TEXT_FILE_EXTS.has(ext)) return '/text.svg';
+    if (ARCHIVE_FILE_EXTS.has(ext)) return '/archive.svg';
+    return '/file.svg';
+}
+
+function formatFileSize(bytes) {
+    if (bytes == null || isNaN(bytes)) return '';
+    if (bytes < 1024) return `${bytes} B`;
+    const units = ['KB', 'MB', 'GB', 'TB'];
+    let val = bytes, i = -1;
+    do { val /= 1024; i++; } while (val >= 1024 && i < units.length - 1);
+    return `${val.toFixed(val < 10 ? 1 : 0)} ${units[i]}`;
+}
+
 // Pulls a normalized [{path,name}, ...] attachment list off a Post/Message/GC-Message
 // row. Prefers the new multi-file files_json column; falls back to the legacy single
 // file_path/file_name columns so old rows created before this feature still render.
@@ -680,7 +756,7 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
         const cols = Math.min(3, images.length);
         const cells = images.map(f => {
             const url = `/uploads/${path.basename(f.path)}`;
-            return `<a href="${url}" target="_blank" style="display:block;width:100%;aspect-ratio:1/1;overflow:hidden;border-radius:8px;"><img src="${url}" alt="${escapeHTML(f.name || '')}" style="width:100%;height:100%;object-fit:cover;display:block;"></a>`;
+            return `<a href="${downloadUrlFor(f)}" style="display:block;width:100%;aspect-ratio:1/1;overflow:hidden;border-radius:8px;"><img src="${url}" alt="${escapeHTML(f.name || '')}" style="width:100%;height:100%;object-fit:cover;display:block;"></a>`;
         }).join('');
         html += `<div class="post-file" style="display:grid;grid-template-columns:repeat(${cols},1fr);gap:6px;margin-top:8px;max-width:${maxWidth};margin-left:auto;margin-right:auto;">${cells}</div>`;
     }
@@ -689,11 +765,14 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
         const ext = path.extname(f.name || '').toLowerCase();
         const url = `/uploads/${path.basename(f.path)}`;
         if (MSG_VIDEO_MIME_TYPES[ext]) {
-            html += `<div class="post-file"><video controls preload="metadata" style="max-height:${maxHeight}px;max-width:${maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;background:black;"><source src="${url}" type="${MSG_VIDEO_MIME_TYPES[ext]}">Your browser can't play this video. <a href="${url}" target="_blank" style="color:var(--accent-color);">Download it instead</a>.</video></div>`;
+            html += `<div class="post-file"><video controls preload="metadata" style="max-height:${maxHeight}px;max-width:${maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;background:black;"><source src="${url}" type="${MSG_VIDEO_MIME_TYPES[ext]}">Your browser can't play this video. <a href="${downloadUrlFor(f)}" style="color:var(--accent-color);">Download it instead</a>.</video></div>`;
         } else if (MSG_AUDIO_MIME_TYPES[ext]) {
-            html += `<div class="post-file"><audio controls preload="metadata" style="width:100%;max-width:${maxWidth === 'min(100%,80vw)' ? '400px' : maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"><source src="${url}" type="${MSG_AUDIO_MIME_TYPES[ext]}">Your browser can't play this audio. <a href="${url}" target="_blank" style="color:var(--accent-color);">Download it instead</a>.</audio></div>`;
+            html += `<div class="post-file"><audio controls preload="metadata" style="width:100%;max-width:${maxWidth === 'min(100%,80vw)' ? '400px' : maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"><source src="${url}" type="${MSG_AUDIO_MIME_TYPES[ext]}">Your browser can't play this audio. <a href="${downloadUrlFor(f)}" style="color:var(--accent-color);">Download it instead</a>.</audio></div>`;
         } else {
-            html += `<div class="post-file"><a href="${url}" target="_blank">${escapeHTML(f.name)}</a></div>`;
+            let size = null;
+            try { size = fs.statSync(f.path).size; } catch (e) { /* file missing on disk - just omit size */ }
+            const sizeLine = size != null ? `<div style="font-size:0.8em;opacity:0.6;">${formatFileSize(size)}</div>` : '';
+            html += `<a href="${downloadUrlFor(f)}" style="display:inline-flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);text-decoration:none;color:inherit;max-width:${maxWidth};box-sizing:border-box;"><img src="${fileIconFor(ext)}" alt="" style="width:48px;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
         }
     });
 
@@ -1519,6 +1598,13 @@ const SESSION_SECRET = loadOrCreateSessionSecret();
 const sessionsDir = path.join(__dirname, 'sessions');
 if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
 
+// If this ever runs behind a reverse proxy that terminates TLS (nginx,
+// Caddy, a load balancer, etc.), uncomment the line below so express-session
+// can correctly see the connection as HTTPS via X-Forwarded-Proto - otherwise
+// cookie.secure: 'auto' will think every request is plain HTTP and the
+// session cookie will never get the Secure flag.
+// app.set('trust proxy', 1);
+
 app.use(session({
     store: new FileStore({ path: sessionsDir, ttl: 7 * 24 * 60 * 60, retries: 1, logFn: function () {} }),
     secret: SESSION_SECRET,
@@ -1528,9 +1614,25 @@ app.use(session({
     cookie: {
         httpOnly: true,
         sameSite: 'lax',
+        // 'auto' sends Secure (HTTPS-only) whenever the request is HTTPS,
+        // and falls back to unsecured cookies over plain HTTP for local
+        // dev. Previously this had no secure flag at all, so the session
+        // cookie would be sent over unencrypted HTTP in production too -
+        // trivially sniffable on shared networks.
+        secure: 'auto',
         maxAge: 7 * 24 * 60 * 60 * 1000
     }
 }))
+
+// Basic hardening headers. X-Content-Type-Options stops browsers from
+// MIME-sniffing uploaded/served files into something more dangerous than
+// their declared type; X-Frame-Options blocks this app from being framed
+// on another site for clickjacking.
+app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    next();
+});
 
 // Serves whichever stylesheet is currently active for the visitor. Every
 // page links to /theme.css instead of a fixed /styles.css so switching
@@ -2312,7 +2414,21 @@ app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'login.html'));
 });
 
-app.post('/register', async (req, res) => {
+// Login/register had no rate limiting at all, so a script could try
+// thousands of passwords per minute against one account (credential
+// stuffing / brute force) or mass-create accounts. This caps attempts per
+// IP; it's intentionally separate from postRateLimiter further down so
+// tuning one doesn't affect the other.
+const rateLimitForAuth = require('express-rate-limit');
+const authLimiter = rateLimitForAuth({
+    windowMs: 15 * 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: 'Too many attempts. Please wait a few minutes and try again.' }
+});
+
+app.post('/register', authLimiter, async (req, res) => {
     const { username, password } = req.body;
     const email = (req.body.email || '').trim().toLowerCase();
 
@@ -2442,7 +2558,15 @@ app.post('/register', async (req, res) => {
     }
 });
 
-app.post('/login', (req, res) => {
+// A password hash that's never assigned to a real account. Used below so a
+// login attempt for a nonexistent username still runs a bcrypt.compare of
+// roughly the same cost as a real one - otherwise the "no such user" path
+// returns near-instantly while a real username takes ~100ms for the hash
+// check, and that timing gap lets an attacker enumerate valid usernames
+// without ever seeing an error message that says so.
+const DUMMY_BCRYPT_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8p/K.hM7X1Gj1AqNU9CIsCzZbwjIYq';
+
+app.post('/login', authLimiter, (req, res) => {
     const { username, password } = req.body;
 
     db.get(`SELECT * FROM User_Data WHERE username = ?`, [username], async (err, user) => {
@@ -2452,6 +2576,7 @@ app.post('/login', (req, res) => {
         }
 
         if (!user) {
+            await bcrypt.compare(password || '', DUMMY_BCRYPT_HASH);
             return res.status(401).sendFile(path.join(__dirname, 'login_error_invalid_credentials.html'));
         }
 
@@ -3575,8 +3700,17 @@ app.get('/feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                // Always clear the file input after a submit attempt, success or
+                // not - otherwise a rejected/failed post left the previously
+                // chosen file silently sitting in the input, so the *next*
+                // submit would resend it even though "No file chosen" (or
+                // nothing) is what the person actually sees on screen.
+                attachmentInput.value = '';
+                document.getElementById('file-name-display').textContent = 'No file chosen';
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
+                } else if (r.url && r.url.includes('posterror=filetype')) {
+                    showPostError("That file type isn't allowed as an attachment.");
                 } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
@@ -3584,8 +3718,6 @@ app.get('/feed', (req, res) => {
                     postCounter.textContent = '0 / 1000';
                     postCounter.style.color = '';
                     postCounter.style.opacity = '0.5';
-                    attachmentInput.value = '';
-                    document.getElementById('file-name-display').textContent = 'No file chosen';
                     pollFeed();
                 }
             } catch (err) {
@@ -3596,9 +3728,12 @@ app.get('/feed', (req, res) => {
         }
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
-            const muted = new URLSearchParams(window.location.search).get('posterror') === 'muted';
+            const perr = new URLSearchParams(window.location.search).get('posterror');
+            const muted = perr === 'muted';
             const t = document.createElement('div');
-            t.textContent = muted ? "You're not able to post until your warning expires." : 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.textContent = muted ? "You're not able to post until your warning expires."
+                : perr === 'filetype' ? "That file type isn't allowed as an attachment."
+                : 'Post too long or too many files selected - 1,000 character limit, max 5 files.';
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
@@ -3969,6 +4104,7 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
         if (err) {
             const backTo = req.body && req.body.reply_to ? `/post/${parseInt(req.body.reply_to)}` : '/feed';
             if (err.code === 'LIMIT_FILE_COUNT') return res.redirect(`${backTo}?posterror=files`);
+            if (err.code === 'FILE_TYPE_BLOCKED') return res.redirect(`${backTo}?posterror=filetype`);
             return res.redirect(`${backTo}?posterror=1`);
         }
         next();
@@ -4356,7 +4492,10 @@ app.get('/following-feed', (req, res) => {
         }
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
-            showPostError(new URLSearchParams(window.location.search).get('posterror') === 'muted' ? "You're not able to post until your warning expires." : 'Post too long or too many files selected - 1,000 character limit, max 5 files.');
+            const perr = new URLSearchParams(window.location.search).get('posterror');
+            showPostError(perr === 'muted' ? "You're not able to post until your warning expires."
+                : perr === 'filetype' ? "That file type isn't allowed as an attachment."
+                : 'Post too long or too many files selected - 1,000 character limit, max 5 files.');
             window.history.replaceState(null, '', '/following-feed');
         }
 
@@ -4373,8 +4512,12 @@ app.get('/following-feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                attachmentInput.value = '';
+                document.getElementById('file-name-display').textContent = 'No file chosen';
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
+                } else if (r.url && r.url.includes('posterror=filetype')) {
+                    showPostError("That file type isn't allowed as an attachment.");
                 } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Post too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
@@ -4382,8 +4525,6 @@ app.get('/following-feed', (req, res) => {
                     postCounter.textContent = '0 / 1000';
                     postCounter.style.color = '';
                     postCounter.style.opacity = '0.5';
-                    attachmentInput.value = '';
-                    document.getElementById('file-name-display').textContent = 'No file chosen';
                     clearReply();
                     pollFeed();
                 }
@@ -4815,9 +4956,12 @@ app.get('/post/:id', (req, res) => {
         });
 
         if (new URLSearchParams(window.location.search).get('posterror')) {
-            const muted = new URLSearchParams(window.location.search).get('posterror') === 'muted';
+            const perr = new URLSearchParams(window.location.search).get('posterror');
+            const muted = perr === 'muted';
             const t = document.createElement('div');
-            t.textContent = muted ? "You're not able to reply until your warning expires." : 'Reply too long or too many files selected - 1,000 character limit, max 5 files.';
+            t.textContent = muted ? "You're not able to reply until your warning expires."
+                : perr === 'filetype' ? "That file type isn't allowed as an attachment."
+                : 'Reply too long or too many files selected - 1,000 character limit, max 5 files.';
             t.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);background:rgb(255,60,60);color:var(--text-color);padding:10px 20px;border-radius:8px;z-index:999;font-size:0.9em;';
             document.body.appendChild(t);
             setTimeout(() => t.remove(), 4000);
@@ -4837,8 +4981,12 @@ app.get('/post/:id', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
+                attachmentInput.value = '';
+                document.getElementById('file-name-display').textContent = 'No file chosen';
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to reply until your warning expires.");
+                } else if (r.url && r.url.includes('posterror=filetype')) {
+                    showPostError("That file type isn't allowed as an attachment.");
                 } else if (r.url && r.url.includes('posterror')) {
                     showPostError('Reply too long or too many files selected - 1,000 character limit, max 5 files.');
                 } else {
@@ -4846,8 +4994,6 @@ app.get('/post/:id', (req, res) => {
                     postCounter.textContent = '0 / 1000';
                     postCounter.style.color = '';
                     postCounter.style.opacity = '0.5';
-                    attachmentInput.value = '';
-                    document.getElementById('file-name-display').textContent = 'No file chosen';
                     pollReplies();
                 }
             } catch (err) {
@@ -6107,6 +6253,7 @@ app.post('/messages/:username/send', (req, res, next) => {
     uploadDM.array('attachments', MAX_FILES_DM)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_DM} per message.` });
+            if (err.code === 'FILE_TYPE_BLOCKED') return res.status(400).json({ error: err.message });
             return res.status(400).json({ error: 'Upload failed.' });
         }
         next();
@@ -9108,6 +9255,7 @@ app.post('/groups/:id/send', (req, res, next) => {
     uploadGC.array('attachments', MAX_FILES_GC)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_GC} per message.` });
+            if (err.code === 'FILE_TYPE_BLOCKED') return res.status(400).json({ error: err.message });
             return res.status(400).json({ error: 'Upload failed.' });
         }
         next();

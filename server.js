@@ -1080,7 +1080,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     const deleteBtn = canDelete ? `<button class="button post-action-btn" onclick="deletePost(${post.id})">Delete${(!isOwner && isAdmin) ? '' : ''}</button>` : '';
     const editBtn = isOwner ? `<button class="button post-action-btn" onclick="editPost(${post.id})">Edit</button>` : '';
     const pinBtn = isAdmin ? `<button class="button post-action-btn" onclick="${post.pinned ? `unpinPost(${post.id})` : `pinPost(${post.id})`}">${post.pinned ? 'Unpin' : 'Pin'}</button>` : '';
-    const reportBtn = !isOwner ? `<button class="button post-action-btn report-action" data-report-type="post" data-report-id="${post.id}" onclick="reportContent('post', ${post.id}, this)">Report</button>` : '';
+    const reportBtn = (!isOwner && sessionUsername) ? `<button class="button post-action-btn report-action" data-report-type="post" data-report-id="${post.id}" onclick="reportContent('post', ${post.id}, this)">Report</button>` : '';
     const safeUsername = escapeHTML(post.username);
     const { embedHTML, cleanText } = renderEmbeds(post.content || '');
     const avatarHTML = renderAvatarHTML(post.avatar_path, post.username, 32);
@@ -4269,7 +4269,8 @@ app.post('/feed/edit/:id', (req, res) => {
 });
 
 app.get('/feed/exists', (req, res) => {
-    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    // Read-only - allowed for guests too, so the post page's deletion polling
+    // still works when viewing without an account.
     let ids = req.query.id;
     if (!ids) return res.json({ existing: [] });
     if (!Array.isArray(ids)) ids = [ids];
@@ -4306,7 +4307,8 @@ app.get('/feed/reply-counts', (req, res) => {
 // Returns the raw content (for a cheap client-side "did this change?" check) plus a
 // freshly rendered card, but only for posts that are currently marked edited.
 app.get('/feed/edits', (req, res) => {
-    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    // Read-only - allowed for guests too, so the post page's edit polling
+    // still works when viewing without an account.
     let ids = req.query.id;
     if (!ids) return res.json({ posts: {} });
     if (!Array.isArray(ids)) ids = [ids];
@@ -4850,7 +4852,11 @@ app.get('/following-feed/older', (req, res) => {
 });
 
 app.get('/post/:id', (req, res) => {
-    if (!req.session.userId) return res.redirect('/');
+    // Posts are viewable by anyone with the link, logged in or not - only
+    // the ability to reply (and other write actions like edit/delete/report)
+    // requires an account. Those write endpoints already check
+    // req.session.userId themselves, so guests simply don't get the UI for them.
+    const isLoggedIn = !!req.session.userId;
     const postId = parseInt(req.params.id);
     if (!postId) return res.status(404).send('Post not found');
     const sessionUsername = req.session.userUsername;
@@ -4884,8 +4890,9 @@ app.get('/post/:id', (req, res) => {
 <body class="page-post">
     <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
-            <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
+            <div id="feed-topbar-left">${isLoggedIn ? `Logged in as <strong>${req.session.userUsername}</strong>` : 'Viewing as guest'}</div>
             <div id="feed-topbar-right" style="position:relative;display:flex;align-items:center;">
+                ${isLoggedIn ? `
                 <a href="/feed">Feed</a>
                 <a href="/edit">Dashboard</a>
                 <a href="/notifications" class="notif-nav-link">Notifications</a>
@@ -4896,7 +4903,9 @@ app.get('/post/:id', (req, res) => {
                     <a href="/edit">Dashboard</a>
                     <a href="/notifications" class="notif-nav-link">Notifications</a>
                     <a href="/logout">Logout</a>
-                </nav>
+                </nav>` : `
+                <a href="/">Log in</a>
+                <a href="/register">Register</a>`}
             </div>
         </div>
 
@@ -4921,6 +4930,7 @@ app.get('/post/:id', (req, res) => {
         </div>
 
         <div id="post-form-container">
+            ${isLoggedIn ? `
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <input type="hidden" name="reply_to" value="${rootPost.id}">
                 <div id="post-form-row">
@@ -4931,7 +4941,10 @@ app.get('/post/:id', (req, res) => {
                 </div>
                 <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
-            </form>
+            </form>` : `
+            <div style="text-align:center;padding:10px;opacity:0.7;">
+                <a href="/" style="color:var(--accent-color);">Log in</a> or <a href="/register" style="color:var(--accent-color);">register</a> to reply.
+            </div>`}
         </div>
     </div>
 
@@ -4941,6 +4954,7 @@ app.get('/post/:id', (req, res) => {
             if (ts) el.textContent = new Date(ts).toLocaleString('en-GB');
         });
 
+        ${isLoggedIn ? `
         document.getElementById('attachment').addEventListener('change', function () {
             const n = this.files.length;
             document.getElementById('file-name-display').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 5)';
@@ -5001,7 +5015,7 @@ app.get('/post/:id', (req, res) => {
             } finally {
                 postSubmitBtn.disabled = false;
             }
-        }
+        }` : ''}
 
         document.querySelectorAll('.button').forEach(btn => {
             btn.addEventListener('mousedown', () => {
@@ -5262,7 +5276,7 @@ app.get('/post/:id', (req, res) => {
             if (nearBottom) loadOlderReplies();
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${isLoggedIn ? `${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}` : ''}
 
 </body>
 </html>`);
@@ -5280,7 +5294,8 @@ ${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
 });
 
 app.get('/post/:id/poll', (req, res) => {
-    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    // Read-only - allowed for guests too, since the post page itself is now
+    // viewable without an account.
     const sessionUsername = req.session.userUsername;
     const postId = parseInt(req.params.id);
     const afterId = parseInt(req.query.after) || 0;
@@ -5296,7 +5311,8 @@ app.get('/post/:id/poll', (req, res) => {
 });
 
 app.get('/post/:id/older', (req, res) => {
-    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    // Read-only - allowed for guests too, since the post page itself is now
+    // viewable without an account.
     const sessionUsername = req.session.userUsername;
     const postId = parseInt(req.params.id);
     const beforeId = parseInt(req.query.before) || 0;

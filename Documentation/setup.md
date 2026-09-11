@@ -3,7 +3,7 @@
 ```bash
 $ git clone https://git.onogenatedwater.dpdns.org/GizmoTM_Inc/Biodeck
 $ cd Biodeck
-$ node install
+$ npm install
 $ node server.js
 ```
 Boom, biodeck works

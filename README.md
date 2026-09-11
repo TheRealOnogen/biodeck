@@ -11,7 +11,7 @@ Biodeck is a kewl website. idek wat to explain
 - dotenv
 - nodemailer
 
-## how thig worke
+## How it works
 - ``server.js``: Server
 - ``html files``: HTML files
 - ``vars.env``: Environment variables (for nodemailer, rename vars.env.public to vars.env and put your info in it)
@@ -19,3 +19,6 @@ Biodeck is a kewl website. idek wat to explain
 - ``public``: Public folder
     - ``uploads``: Uploads
     - ``v86``: v86
+
+For APIs refer to Documentation/APIs.md
+For setup instructions refer to Documentation/setup.md

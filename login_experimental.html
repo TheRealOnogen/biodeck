@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+<meta property="og:title" content="Welcome to Biodeck Experimental!" />
+<meta property="og:description" content="Biodeck Experimental is just Biodeck but with experimental features before they get pushed to the repo" />
+<meta property="og:url" content="https://biodeck-expr.onogenatedwater.dpdns.org"/>
+<meta property="og:image" content="https://biodeck-expr.onogenatedwater.dpdns.org/Ellie.png" />
+<meta name="theme-color" content="#FFFFFF" />
+<meta property="og:type" content="website" />
+</head>
+<body>
+    <form action="/login" method="POST">
+    <div class="box" style="color: white; height: auto; width: min(500px, 80vw);">
+        <h1>Welcome to Biodeck Experimental</h1>
+        <p>Warning: Don't leak major updates, it may lead to a permanent ban of your account on both biodeck experimental and biodeck stable</p>
+        <label for="username">Username</label><br>
+        <input type="text" id="username" name="username"><br><br>
+        <label for="password">Password</label><br>
+        <input type="password" id="password" name="password"><br><br>
+        <button type="submit" class="button">Login</button><br><br>
+        <button type="button" class="button" onclick="window.location.href='/forgot-password'" style="width: 180px">Forgot Password</button>
+        <button type="button" class="button" onclick="window.location.href='register'" style="width: 180px">Don't have an account</button><br><br>
+        <button type="button" class="button" onclick="window.location.href='support'" style="width: 180px">Support</button>
+    </div>
+    </form>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => {
+                btn.classList.add('clicked');
+                setTimeout(() => btn.classList.remove('clicked'), 150);
+            });
+        });
+    </script>
+
+</body>
+</html>

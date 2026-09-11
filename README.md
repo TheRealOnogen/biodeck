@@ -20,5 +20,5 @@ Biodeck is a kewl website. idek wat to explain
     - ``uploads``: Uploads
     - ``v86``: v86
 
-For APIs refer to Documentation/APIs.md
+For APIs refer to Documentation/APIs.md<br>
 For setup instructions refer to Documentation/setup.md

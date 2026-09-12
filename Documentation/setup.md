@@ -11,7 +11,7 @@ Boom, biodeck works
 # How to set up themes
 
 1. Make a theme
-2. Add it to themes.json
+2. Add it to themes.json<br>
 Example:
 ```json
   {

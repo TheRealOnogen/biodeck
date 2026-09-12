@@ -9378,6 +9378,375 @@ app.post('/groups/:id/edit/:msgId', (req, res) => {
     });
 });
 
+// =====================================================================
+// /api/v1/* - structured JSON API for third-party/custom clients
+// =====================================================================
+// Everything above this point is Biodeck's own frontend, which mostly
+// talks to itself via HTML fragments (see APIs.md). The routes below are
+// additive: they don't replace or change any existing route, they just
+// expose the same underlying data as real JSON so a custom client
+// doesn't have to scrape HTML. They intentionally share query/serializer
+// helpers with each other (not with the legacy HTML routes above) to
+// keep this section self-consistent without risking changes to the
+// battle-tested rendering code elsewhere in this file.
+
+function requireApiAuth(req, res, next) {
+    if (!req.session || !req.session.userId) return res.status(401).json({ error: 'Not logged in' });
+    next();
+}
+
+function clampLimit(raw, def, max) {
+    const n = parseInt(raw);
+    if (!n || n < 1) return def;
+    return Math.min(n, max);
+}
+
+function serializeAttachmentJSON(f) {
+    return {
+        url: `/uploads/${path.basename(f.path)}`,
+        downloadUrl: downloadUrlFor(f),
+        name: f.name || null
+    };
+}
+
+function serializeAuthorJSON(username, nickname, avatarPath, isVerified) {
+    return {
+        username,
+        nickname: nickname || null,
+        displayName: displayName(username, nickname),
+        avatarUrl: avatarPath ? avatarPathToURL(avatarPath) : null,
+        verified: !!isVerified
+    };
+}
+
+function serializePostJSON(post, sessionUsername, isAdmin) {
+    return {
+        id: post.id,
+        author: serializeAuthorJSON(post.username, post.Nickname, post.avatar_path, post.IsVerified),
+        content: post.content || '',
+        createdAt: post.created_at ? post.created_at.replace(' ', 'T') + 'Z' : null,
+        edited: !!post.edited,
+        pinned: !!post.pinned,
+        replyTo: post.reply_to || null,
+        replyCount: post.reply_count || 0,
+        attachments: getAttachments(post).map(serializeAttachmentJSON),
+        viewerCanEdit: !!sessionUsername && post.username === sessionUsername,
+        viewerCanDelete: !!sessionUsername && (post.username === sessionUsername || !!isAdmin)
+    };
+}
+
+function serializeMessageJSON(m, meUsername) {
+    return {
+        id: m.id,
+        author: serializeAuthorJSON(m.from_user, m.Nickname, m.avatar_path, m.IsVerified),
+        toUser: m.to_user,
+        content: m.content || '',
+        createdAt: m.created_at ? m.created_at.replace(' ', 'T') + 'Z' : null,
+        edited: !!m.edited,
+        replyTo: m.reply_to || null,
+        read: !!m.read,
+        mine: m.from_user === meUsername,
+        attachments: getAttachments(m).map(serializeAttachmentJSON)
+    };
+}
+
+function serializeGroupMessageJSON(m, meUsername) {
+    return {
+        id: m.id,
+        groupId: m.group_id,
+        author: serializeAuthorJSON(m.from_user, m.Nickname, m.avatar_path, m.IsVerified),
+        content: m.content || '',
+        createdAt: m.created_at ? m.created_at.replace(' ', 'T') + 'Z' : null,
+        edited: !!m.edited,
+        replyTo: m.reply_to || null,
+        mine: m.from_user === meUsername,
+        attachments: getAttachments(m).map(serializeAttachmentJSON)
+    };
+}
+
+function serializeNotificationJSON(n) {
+    return {
+        id: n.id,
+        type: n.type,
+        actor: {
+            username: n.actor_username,
+            nickname: n.actor_nickname || null,
+            displayName: displayName(n.actor_username, n.actor_nickname),
+            verified: !!n.actor_verified
+        },
+        postId: n.post_id || null,
+        messageId: n.message_id || null,
+        preview: n.content_preview || null,
+        read: !!n.read,
+        createdAt: n.created_at ? n.created_at.replace(' ', 'T') + 'Z' : null,
+        link: notifLink(n)
+    };
+}
+
+// Shared post query - same shape as the LEFT JOIN used throughout the HTML
+// routes above (Posts + author info + reply_count), parameterized by an
+// arbitrary WHERE clause so /api/v1/feed, /api/v1/following-feed and
+// /api/v1/post/:id/replies don't each hand-roll their own SQL.
+function fetchPostsJSON(whereSQL, whereParams, limit, cb) {
+    const sql = `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified,
+        (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count
+        FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username
+        ${whereSQL} ORDER BY Posts.created_at DESC LIMIT ?`;
+    db.all(sql, [...whereParams, limit], cb);
+}
+
+// ----- Current user / profiles -----
+
+app.get('/api/v1/me', requireApiAuth, (req, res) => {
+    db.get(`SELECT username, Nickname, bio, email, email_verified, IsOwner, IsDeveloper, IsSupporter,
+            IsAdmin, IsHeadAdmin, IsVerified, avatar_path, theme FROM User_Data WHERE id = ?`,
+        [req.session.userId], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: 'User not found' });
+        res.json({
+            username: user.username,
+            nickname: user.Nickname || null,
+            displayName: displayName(user.username, user.Nickname),
+            bio: user.bio || null,
+            email: user.email || null,
+            emailVerified: !!user.email_verified,
+            avatarUrl: user.avatar_path ? avatarPathToURL(user.avatar_path) : null,
+            verified: !!user.IsVerified,
+            admin: !!(user.IsAdmin || user.IsOwner || user.IsHeadAdmin),
+            owner: !!user.IsOwner,
+            developer: !!user.IsDeveloper,
+            supporter: !!user.IsSupporter,
+            theme: user.theme || 'default'
+        });
+    });
+});
+
+app.get('/api/v1/users/:username', requireApiAuth, (req, res) => {
+    const profileUsername = req.params.username;
+    const sessionUsername = req.session.userUsername;
+    db.get(`SELECT username, Nickname, bio, IsVerified, IsAdmin, IsOwner, IsHeadAdmin, IsBanned, IsDeleted, avatar_path
+            FROM User_Data WHERE username = ?`, [profileUsername], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: 'User not found' });
+        db.get(`SELECT COUNT(*) as cnt FROM Follows WHERE following_username = ?`, [profileUsername], (e1, followerCount) => {
+            db.get(`SELECT id FROM Follows WHERE follower_username = ? AND following_username = ?`,
+                [sessionUsername, profileUsername], (e2, followRow) => {
+                const a = [sessionUsername, profileUsername].sort()[0];
+                const b = [sessionUsername, profileUsername].sort()[1];
+                db.get(`SELECT id FROM Friends WHERE user_a = ? AND user_b = ?`, [a, b], (e3, friendRow) => {
+                    res.json({
+                        username: user.username,
+                        nickname: user.Nickname || null,
+                        displayName: displayName(user.username, user.Nickname),
+                        bio: user.bio || null,
+                        avatarUrl: user.avatar_path ? avatarPathToURL(user.avatar_path) : null,
+                        verified: !!user.IsVerified,
+                        admin: !!(user.IsAdmin || user.IsOwner || user.IsHeadAdmin),
+                        banned: !!user.IsBanned,
+                        deleted: !!user.IsDeleted,
+                        isSelf: profileUsername === sessionUsername,
+                        followerCount: (followerCount && followerCount.cnt) || 0,
+                        viewerIsFollowing: !!followRow,
+                        viewerIsFriend: !!friendRow
+                    });
+                });
+            });
+        });
+    });
+});
+
+// ----- Feed -----
+
+app.get('/api/v1/feed', requireApiAuth, (req, res) => {
+    const limit = clampLimit(req.query.limit, 20, 50);
+    const before = parseInt(req.query.before) || 0;
+    const after = parseInt(req.query.after) || 0;
+    const where = before ? 'WHERE Posts.id < ?' : (after ? 'WHERE Posts.id > ?' : '');
+    const params = before ? [before] : (after ? [after] : []);
+    fetchPostsJSON(where, params, limit, (err, posts) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        const roots = posts.filter(p => !p.reply_to);
+        res.json({
+            posts: roots.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin)),
+            hasMore: posts.length === limit
+        });
+    });
+});
+
+app.get('/api/v1/following-feed', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const limit = clampLimit(req.query.limit, 20, 50);
+    const before = parseInt(req.query.before) || 0;
+    getFollowingList(me, (followingList) => {
+        const placeholders = followingList.map(() => '?').join(',');
+        const where = `WHERE Posts.username IN (${placeholders})` + (before ? ' AND Posts.id < ?' : '');
+        const params = before ? [...followingList, before] : followingList;
+        fetchPostsJSON(where, params, limit, (err, posts) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            const roots = posts.filter(p => !p.reply_to);
+            res.json({
+                posts: roots.map(p => serializePostJSON(p, me, req.isAdmin)),
+                hasMore: posts.length === limit
+            });
+        });
+    });
+});
+
+// ----- Single post / thread -----
+
+app.get('/api/v1/post/:id', requireApiAuth, (req, res) => {
+    const postId = parseInt(req.params.id);
+    if (!postId) return res.status(404).json({ error: 'Post not found' });
+    db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified,
+            (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count
+            FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`,
+        [postId], (err, post) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!post) return res.status(404).json({ error: 'Post not found' });
+        res.json({ post: serializePostJSON(post, req.session.userUsername, req.isAdmin) });
+    });
+});
+
+app.get('/api/v1/post/:id/replies', requireApiAuth, (req, res) => {
+    const postId = parseInt(req.params.id);
+    if (!postId) return res.status(404).json({ error: 'Post not found' });
+    const limit = clampLimit(req.query.limit, 20, 50);
+    const before = parseInt(req.query.before) || 0;
+    const where = 'WHERE Posts.reply_to = ?' + (before ? ' AND Posts.id < ?' : '');
+    const params = before ? [postId, before] : [postId];
+    fetchPostsJSON(where, params, limit, (err, replies) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({
+            replies: replies.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin)),
+            hasMore: replies.length === limit
+        });
+    });
+});
+
+// ----- Direct messages -----
+
+app.get('/api/v1/messages', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    db.all(`SELECT DISTINCT CASE WHEN from_user = ? THEN to_user ELSE from_user END as other_user,
+            MAX(created_at) as last_at
+            FROM Messages WHERE from_user = ? OR to_user = ?
+            GROUP BY other_user ORDER BY last_at DESC`, [me, me, me], (err, convos) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({
+            conversations: (convos || []).map(c => ({
+                username: c.other_user,
+                lastMessageAt: c.last_at ? c.last_at.replace(' ', 'T') + 'Z' : null
+            }))
+        });
+    });
+});
+
+app.get('/api/v1/messages/:username', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const other = req.params.username;
+    const limit = clampLimit(req.query.limit, 50, 100);
+    const before = parseInt(req.query.before) || 0;
+    const where = before ? 'AND Messages.id < ?' : '';
+    const params = before ? [me, other, other, me, before] : [me, other, other, me];
+    db.all(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified
+            FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username
+            WHERE ((from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?)) ${where}
+            ORDER BY Messages.id DESC LIMIT ?`, [...params, limit], (err, msgs) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        const ordered = (msgs || []).slice().reverse();
+        res.json({
+            messages: ordered.map(m => serializeMessageJSON(m, me)),
+            hasMore: msgs.length === limit
+        });
+    });
+});
+
+app.post('/api/v1/messages/:username/mark-read', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const other = req.params.username;
+    db.run(`UPDATE Messages SET read = 1 WHERE to_user = ? AND from_user = ?`, [me, other], (err) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({ ok: true });
+    });
+});
+
+// ----- Group chats -----
+
+app.get('/api/v1/groups', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    db.all(`SELECT Group_Chats.* FROM Group_Chats
+            WHERE Group_Chats.id IN (SELECT group_id FROM Group_Chat_Members WHERE username = ?)
+            ORDER BY Group_Chats.created_at DESC`, [me], (err, groups) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!groups || !groups.length) return res.json({ groups: [] });
+        let remaining = groups.length;
+        const out = [];
+        groups.forEach(g => {
+            db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ? ORDER BY joined_at ASC`,
+                [g.id], (e2, members) => {
+                out.push({
+                    id: g.id,
+                    name: g.name,
+                    createdBy: g.created_by,
+                    createdAt: g.created_at ? g.created_at.replace(' ', 'T') + 'Z' : null,
+                    members: (members || []).map(m => m.username)
+                });
+                if (--remaining === 0) {
+                    out.sort((x, y) => y.id - x.id);
+                    res.json({ groups: out });
+                }
+            });
+        });
+    });
+});
+
+app.get('/api/v1/groups/:id/messages', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id);
+    if (!groupId) return res.status(404).json({ error: 'Group not found' });
+    db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (mErr, memberRow) => {
+        if (!memberRow) return res.status(403).json({ error: 'Not a member of this group' });
+        const limit = clampLimit(req.query.limit, 50, 100);
+        const before = parseInt(req.query.before) || 0;
+        const where = before ? 'AND Group_Chat_Messages.id < ?' : '';
+        const params = before ? [groupId, before] : [groupId];
+        db.all(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified
+                FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username
+                WHERE Group_Chat_Messages.group_id = ? ${where}
+                ORDER BY Group_Chat_Messages.id DESC LIMIT ?`, [...params, limit], (err, msgs) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            const ordered = (msgs || []).slice().reverse();
+            res.json({
+                messages: ordered.map(m => serializeGroupMessageJSON(m, me)),
+                hasMore: msgs.length === limit
+            });
+        });
+    });
+});
+
+// ----- Notifications -----
+
+app.get('/api/v1/notifications', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const limit = clampLimit(req.query.limit, 50, 100);
+    const before = parseInt(req.query.before) || 0;
+    const where = before ? 'AND Notifications.id < ?' : '';
+    const params = before ? [me, before] : [me];
+    db.all(`SELECT Notifications.*, User_Data.Nickname AS actor_nickname, User_Data.IsVerified AS actor_verified
+            FROM Notifications LEFT JOIN User_Data ON Notifications.actor_username = User_Data.username
+            WHERE Notifications.username = ? ${where}
+            ORDER BY Notifications.id DESC LIMIT ?`, [...params, limit], (err, notifs) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({
+            notifications: (notifs || []).map(serializeNotificationJSON),
+            hasMore: (notifs || []).length === limit
+        });
+        // Note: unlike GET /notifications (the HTML page), this does NOT
+        // mark notifications as read as a side effect - a client polling
+        // this endpoint in the background shouldn't silently clear
+        // someone's unread badge. Call POST /notifications/mark-read
+        // explicitly when the client actually wants that.
+    });
+});
+
 app.listen(PORT, () => {
     console.log(`Biodeck running on port ${PORT}`);
 });

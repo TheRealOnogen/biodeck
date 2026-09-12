@@ -2,6 +2,81 @@
 
 This documents every route in `server.js` for anyone building a custom client.
 
+## New: `/api/v1/*` - a real JSON API
+
+Everything under `/api/v1/` was added specifically for custom clients. Unlike the legacy routes documented further down, these always return proper structured JSON - no HTML fragments, no scraping required. They sit alongside the old routes rather than replacing them, so Biodeck's own frontend is unaffected; they read from the same tables via shared internal helpers, so the data is guaranteed consistent with what the web UI shows.
+
+Auth is still the session cookie described below - there's no separate token scheme for `/api/v1`. Log in via `POST /login` once, then send that cookie on every `/api/v1` request same as everything else. All `/api/v1` routes require a logged-in session and return `401 { "error": "Not logged in" }` otherwise.
+
+Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` query param pattern (never both `before` and `after` at once), and every paginated response includes `hasMore` so you know whether to fetch another page. `limit` is clamped server-side (defaults and caps noted per-route below).
+
+| Method | Path | Query | Response |
+|---|---|---|---|
+| GET | `/api/v1/me` | — | Your own account: `{ username, nickname, displayName, bio, email, emailVerified, avatarUrl, verified, admin, owner, developer, supporter, theme }` |
+| GET | `/api/v1/users/:username` | — | Public profile: `{ username, nickname, displayName, bio, avatarUrl, verified, admin, banned, deleted, isSelf, followerCount, viewerIsFollowing, viewerIsFriend }` |
+| GET | `/api/v1/feed` | `before`, `after`, `limit` (default 20, max 50) | `{ posts: [Post...], hasMore }` - top-level posts only, newest first |
+| GET | `/api/v1/following-feed` | `before`, `limit` (default 20, max 50) | Same shape as `/api/v1/feed`, scoped to accounts you follow (+ yourself) |
+| GET | `/api/v1/post/:id` | — | `{ post: Post }` - a single post by id |
+| GET | `/api/v1/post/:id/replies` | `before`, `limit` (default 20, max 50) | `{ replies: [Post...], hasMore }` |
+| GET | `/api/v1/messages` | — | `{ conversations: [{ username, lastMessageAt }, ...] }` - your DM inbox |
+| GET | `/api/v1/messages/:username` | `before`, `limit` (default 50, max 100) | `{ messages: [Message...], hasMore }` - oldest first |
+| POST | `/api/v1/messages/:username/mark-read` | — | `{ ok: true }` |
+| GET | `/api/v1/groups` | — | `{ groups: [{ id, name, createdBy, createdAt, members: [username,...] }, ...] }` |
+| GET | `/api/v1/groups/:id/messages` | `before`, `limit` (default 50, max 100) | `{ messages: [GroupMessage...], hasMore }`. `403` if you're not a member |
+| GET | `/api/v1/notifications` | `before`, `limit` (default 50, max 100) | `{ notifications: [Notification...], hasMore }`. **Does not** mark anything as read (unlike the HTML `/notifications` page) - call `POST /notifications/mark-read` when you actually want that |
+
+**Shapes referenced above:**
+
+```jsonc
+// Post
+{
+  "id": 123,
+  "author": { "username": "onogen", "nickname": null, "displayName": "onogen", "avatarUrl": "/uploads/avatar-1-....png", "verified": false },
+  "content": "post text",
+  "createdAt": "2026-09-12T10:00:00Z",
+  "edited": false,
+  "pinned": false,
+  "replyTo": null,           // id of parent post, or null for a root post
+  "replyCount": 3,
+  "attachments": [ { "url": "/uploads/xyz.png", "downloadUrl": "/uploads/download/xyz.png?name=...", "name": "xyz.png" } ],
+  "viewerCanEdit": true,     // true only if this is your own post
+  "viewerCanDelete": true    // true if it's yours, or you're an admin
+}
+
+// Message (DM)
+{
+  "id": 456,
+  "author": { "username": "...", "nickname": null, "displayName": "...", "avatarUrl": null, "verified": false },
+  "toUser": "otheruser",
+  "content": "hey",
+  "createdAt": "...",
+  "edited": false,
+  "replyTo": null,
+  "read": true,
+  "mine": true,              // true if you sent it
+  "attachments": [ ... ]
+}
+
+// GroupMessage - same as Message but with "groupId" instead of "toUser"/"read"
+
+// Notification
+{
+  "id": 789,
+  "type": "reply",           // friend_request | friend_accept | friend_decline | dm | reply | mention_post | mention_dm | mention_gc
+  "actor": { "username": "...", "nickname": null, "displayName": "...", "verified": false },
+  "postId": 123,
+  "messageId": null,
+  "preview": "...",
+  "read": false,
+  "createdAt": "...",
+  "link": "/post/123"        // path to navigate to for this notification
+}
+```
+
+**What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
+
+---
+
 ## Read this first: Biodeck is not a clean JSON API
 
 Before diving into endpoints, two things matter a lot for a custom client:

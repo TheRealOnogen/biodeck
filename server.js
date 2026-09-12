@@ -237,6 +237,24 @@ function broadcastGCEdit(groupId, fromUser, row, replyMsg, memberUsernames) {
     });
 }
 
+// Posts a "so-and-so joined/left" notice as a message from the reserved
+// 'System' sender (same convention as the Activations gate notices) and
+// pushes it live to every current member of the group over SSE.
+function postSystemGCMessage(groupId, content) {
+    db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content) VALUES (?, 'System', ?)`,
+        [groupId, content], function (err) {
+            if (err) { console.error('System GC message insert error:', err.message); return; }
+            const msgId = this.lastID;
+            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [msgId], (errRow, row) => {
+                if (errRow || !row) return;
+                db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (errMem, memberRows) => {
+                    const members = (memberRows || []).map(r => r.username);
+                    broadcastGCMessage(groupId, 'System', row, null, members);
+                });
+            });
+        });
+}
+
 
 const NOTIF_BADGE_SCRIPT = `<script>
 (function() {
@@ -1419,6 +1437,10 @@ db.serialize(() => {
             // Set to 1 the first time a group message's content is changed via
             // /groups/:id/edit/:msgId, so it can show an "(edited)" marker.
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
+            // Set to 1 when the group's creator marks it as public via
+            // /groups/:id/toggle-public. Public groups show up on /discover
+            // and can be joined by anyone, not just friends of a member.
+            db.run(`ALTER TABLE Group_Chats ADD COLUMN is_public INTEGER DEFAULT 0`, () => {});
             // Generic key/value store for small admin-configurable settings
             // (e.g. the registration gate toggle below).
             db.run(`CREATE TABLE IF NOT EXISTS Settings (
@@ -8542,6 +8564,7 @@ app.get('/groups', (req, res) => {
             <div style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
                 <div>
                     <a href="/groups/${g.id}" style="color:var(--text-color);text-decoration:none;font-weight:bold;font-size:1.05em;">${escapeHTML(g.name)}</a>
+                    ${g.is_public ? '<span style="font-size:0.7em;opacity:0.6;border:1px solid rgba(255,255,255,0.25);border-radius:10px;padding:1px 7px;margin-left:6px;">Public</span>' : ''}
                     <div style="font-size:0.8em;opacity:0.5;margin-top:3px;">${escapeHTML(g.members_list || '')}</div>
                 </div>
                 <a href="/groups/${g.id}" class="button" style="padding:8px 16px;text-decoration:none;white-space:nowrap;">Open</a>
@@ -8560,12 +8583,14 @@ app.get('/groups', (req, res) => {
     <div id="gc-topbar">
         <div>Group Chats</div>
         <div id="gc-topbar-right">
+            <a href="/discover">Discover</a>
             <a href="/messages">DMs</a>
             <a href="/feed">Feed</a>
             <a href="/notifications" class="notif-nav-link">Notifications</a>
             <a href="/logout">Logout</a>
             <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
             <nav id="nav-dropdown">
+                <a href="/discover">Discover</a>
                 <a href="/messages">DMs</a>
                 <a href="/feed">Feed</a>
                 <a href="/notifications" class="notif-nav-link">Notifications</a>
@@ -8711,6 +8736,107 @@ ${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
     });
 });
 
+app.get('/discover', (req, res) => {
+    if (!req.session.userId) return res.redirect('/');
+    const me = req.session.userUsername;
+    db.all(`SELECT Group_Chats.*, COUNT(Group_Chat_Members.id) AS member_count,
+                   SUM(CASE WHEN Group_Chat_Members.username = ? THEN 1 ELSE 0 END) AS is_member
+            FROM Group_Chats
+            LEFT JOIN Group_Chat_Members ON Group_Chats.id = Group_Chat_Members.group_id
+            WHERE Group_Chats.is_public = 1
+            GROUP BY Group_Chats.id
+            ORDER BY Group_Chats.created_at DESC`, [me], (err, groups) => {
+        if (err) { console.error(err); return res.status(500).send('Error loading discover'); }
+        const groupsHTML = (groups || []).map(g => `
+            <div class="discover-gc-row" data-id="${g.id}" style="display:flex;align-items:center;justify-content:space-between;padding:12px 0;border-bottom:1px solid rgba(255,255,255,0.1);">
+                <div>
+                    <a href="/groups/${g.id}" style="color:var(--text-color);text-decoration:none;font-weight:bold;font-size:1.05em;">${escapeHTML(g.name)}</a>
+                    <div style="font-size:0.8em;opacity:0.5;margin-top:3px;">${g.member_count} member${g.member_count === 1 ? '' : 's'} &middot; created by @${escapeHTML(g.created_by)}</div>
+                </div>
+                ${g.is_member
+                    ? `<button class="button" onclick="window.location.href='/groups/${g.id}'" style="padding:8px 16px;white-space:nowrap;">Open</button>`
+                    : `<button class="button" onclick="joinGC(${g.id}, this)" style="padding:8px 16px;white-space:nowrap;">Join</button>`}
+            </div>`).join('');
+
+        res.send(`<!DOCTYPE html>
+<html lang="en">
+<head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Discover Group Chats</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body class="page-groups">
+    <div id="gc-topbar">
+        <div>Discover</div>
+        <div id="gc-topbar-right">
+            <a href="/groups">Group Chats</a>
+            <a href="/messages">DMs</a>
+            <a href="/feed">Feed</a>
+            <a href="/notifications" class="notif-nav-link">Notifications</a>
+            <a href="/logout">Logout</a>
+            <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
+            <nav id="nav-dropdown">
+                <a href="/groups">Group Chats</a>
+                <a href="/messages">DMs</a>
+                <a href="/feed">Feed</a>
+                <a href="/notifications" class="notif-nav-link">Notifications</a>
+                <a href="/logout">Logout</a>
+            </nav>
+        </div>
+    </div>
+
+    <div id="gc-body">
+        <h3 style="opacity:0.6;margin:0 0 12px;">Public Group Chats</h3>
+        <div id="discover-result" style="font-size:0.85em;min-height:1em;"></div>
+        ${groupsHTML || '<p style="opacity:0.4;">No public group chats yet. Any group creator can make their group public from inside the group.</p>'}
+    </div>
+    <script>
+        document.querySelectorAll('.button').forEach(btn => {
+            btn.addEventListener('mousedown', () => { btn.classList.add('clicked'); setTimeout(() => btn.classList.remove('clicked'), 150); });
+        });
+
+        async function joinGC(id, btn) {
+            const result = document.getElementById('discover-result');
+            btn.disabled = true;
+            try {
+                const r = await fetch('/groups/' + id + '/join', { method: 'POST' });
+                const d = await r.json();
+                if (!r.ok) {
+                    result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error joining group.';
+                    btn.disabled = false;
+                } else {
+                    window.location.href = '/groups/' + id;
+                }
+            } catch(e) {
+                result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.';
+                btn.disabled = false;
+            }
+        }
+
+        function toggleNav() {
+            const dropdown = document.getElementById('nav-dropdown');
+            const btn = document.getElementById('nav-hamburger');
+            dropdown.classList.toggle('open');
+            btn.textContent = dropdown.classList.contains('open') ? '✕' : '☰';
+        }
+        document.addEventListener('click', function(e) {
+            const dropdown = document.getElementById('nav-dropdown');
+            const btn = document.getElementById('nav-hamburger');
+            if (dropdown && btn && !dropdown.contains(e.target) && e.target !== btn) {
+                dropdown.classList.remove('open');
+                btn.textContent = '☰';
+            }
+        });
+    </script>
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+
+</body>
+</html>`);
+    });
+});
+
 app.post('/groups/create', (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
     const me = req.session.userUsername;
@@ -8764,6 +8890,7 @@ app.post('/groups/:id/add-member', (req, res) => {
             db.run(`INSERT OR IGNORE INTO Group_Chat_Members (group_id, username) VALUES (?, ?)`, [groupId, newMember], function(err3) {
                 if (err3) return res.status(500).json({ error: 'db error' });
                 if (this.changes === 0) return res.status(400).json({ error: `${newMember} is already in the group.` });
+                postSystemGCMessage(groupId, `${me} added ${newMember} to the group`);
                 res.json({ ok: true });
             });
         });
@@ -8783,6 +8910,8 @@ app.post('/groups/:id/leave', (req, res) => {
                 if (!err3 && row && row.cnt === 0) {
                     db.run(`DELETE FROM Group_Chat_Messages WHERE group_id = ?`, [groupId]);
                     db.run(`DELETE FROM Group_Chats WHERE id = ?`, [groupId]);
+                } else {
+                    postSystemGCMessage(groupId, `${me} left the group`);
                 }
                 res.json({ ok: true });
             });
@@ -8804,6 +8933,36 @@ app.post('/groups/:id/kick/:username', (req, res) => {
             if (err2) return res.status(500).json({ error: 'db error' });
             if (this.changes === 0) return res.status(404).json({ error: `${target} is not in this group.` });
             res.json({ ok: true });
+        });
+    });
+});
+
+app.post('/groups/:id/toggle-public', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id);
+    db.get(`SELECT created_by, is_public FROM Group_Chats WHERE id = ?`, [groupId], (err, group) => {
+        if (err || !group) return res.status(404).json({ error: 'Group not found.' });
+        if (group.created_by !== me) return res.status(403).json({ error: 'Only the group creator can change this.' });
+        const newValue = group.is_public ? 0 : 1;
+        db.run(`UPDATE Group_Chats SET is_public = ? WHERE id = ?`, [newValue, groupId], (err2) => {
+            if (err2) return res.status(500).json({ error: 'db error' });
+            res.json({ ok: true, isPublic: !!newValue });
+        });
+    });
+});
+
+app.post('/groups/:id/join', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id);
+    db.get(`SELECT id, is_public FROM Group_Chats WHERE id = ?`, [groupId], (err, group) => {
+        if (err || !group) return res.status(404).json({ error: 'Group not found.' });
+        if (!group.is_public) return res.status(403).json({ error: 'This group is not public.' });
+        db.run(`INSERT OR IGNORE INTO Group_Chat_Members (group_id, username) VALUES (?, ?)`, [groupId, me], function(err2) {
+            if (err2) return res.status(500).json({ error: 'db error' });
+            if (this.changes > 0) postSystemGCMessage(groupId, `${me} joined the group`);
+            res.json({ ok: true, id: groupId });
         });
     });
 });
@@ -8840,8 +8999,9 @@ app.get('/groups/:id', (req, res) => {
 </head>
 <body class="page-group-chat">
     <div id="gc-chat-topbar">
-        <div style="font-weight:bold;">${escapeHTML(group.name)}</div>
+        <div style="font-weight:bold;">${escapeHTML(group.name)} ${group.is_public ? '<span id="gc-public-badge" style="font-size:0.65em;font-weight:400;opacity:0.6;border:1px solid rgba(255,255,255,0.3);border-radius:10px;padding:1px 7px;vertical-align:middle;">Public</span>' : '<span id="gc-public-badge" style="display:none;font-size:0.65em;font-weight:400;opacity:0.6;border:1px solid rgba(255,255,255,0.3);border-radius:10px;padding:1px 7px;vertical-align:middle;">Public</span>'}</div>
         <div id="gc-chat-topbar-right">
+            <a href="/discover">Discover</a>
             <a href="/groups">Groups</a>
             <a href="/messages">DMs</a>
             <a href="/feed">Feed</a>
@@ -8849,6 +9009,7 @@ app.get('/groups/:id', (req, res) => {
             <a href="/logout">Logout</a>
             <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
             <nav id="nav-dropdown">
+                <a href="/discover">Discover</a>
                 <a href="/groups">Groups</a>
                 <a href="/messages">DMs</a>
                 <a href="/feed">Feed</a>
@@ -8862,6 +9023,7 @@ app.get('/groups/:id', (req, res) => {
         <span id="gc-members-list" style="display:contents;">${membersListHTML}</span>
         <div id="add-member-row">
             <button class="button" onclick="openGCAddPicker()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;box-sizing: border-box !important;">+ Add Friends</button>
+            ${isCreator ? `<button class="button" onclick="togglePublic()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;box-sizing: border-box !important;" id="toggle-public-btn">${group.is_public ? 'Make Private' : 'Make Public'}</button>` : ''}
             <button class="button gc-action-btn" onclick="leaveGroup()" style="width:auto;height:28px;padding:0 12px;font-size:0.8em;border-color:rgb(255,80,80);color:var(--danger-color);" id="leave-gc-btn">Leave</button>
             <span id="add-member-result" style="font-size:0.8em;"></span>
         </div>
@@ -9196,6 +9358,30 @@ app.get('/groups/:id', (req, res) => {
                 const d = await r.json();
                 if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error leaving group.'; }
                 else { window.location.href = '/groups'; }
+            } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
+        }
+
+        async function togglePublic() {
+            // Re-check current state from the button label each time, since
+            // this can be toggled back and forth without a page reload.
+            const btn = document.getElementById('toggle-public-btn');
+            const nowPublic = btn.textContent.trim() === 'Make Private';
+            const result = document.getElementById('add-member-result');
+            const question = nowPublic
+                ? 'Make this group private again? It will be removed from Discover and only current members will be able to see it.'
+                : 'Make this group public? Anyone will be able to find it on Discover and join.';
+            if (!confirm(question)) return;
+            if (!confirm('Are you sure? Press OK to ' + (nowPublic ? 'make it private' : 'make it public') + '.')) return;
+            result.style.color = 'var(--text-color)'; result.textContent = 'Updating...';
+            try {
+                const r = await fetch('/groups/${groupId}/toggle-public', { method: 'POST' });
+                const d = await r.json();
+                if (!r.ok) { result.style.color = 'var(--danger-color)'; result.textContent = d.error || 'Error.'; return; }
+                btn.textContent = d.isPublic ? 'Make Private' : 'Make Public';
+                const badge = document.getElementById('gc-public-badge');
+                if (badge) badge.style.display = d.isPublic ? 'inline' : 'none';
+                result.style.color = 'var(--accent-color)'; result.textContent = d.isPublic ? 'Group is now public.' : 'Group is now private.';
+                setTimeout(() => { result.textContent = ''; }, 2000);
             } catch(e) { result.style.color = 'var(--danger-color)'; result.textContent = 'Network error.'; }
         }
 
@@ -9687,6 +9873,7 @@ app.get('/api/v1/groups', requireApiAuth, (req, res) => {
                     name: g.name,
                     createdBy: g.created_by,
                     createdAt: g.created_at ? g.created_at.replace(' ', 'T') + 'Z' : null,
+                    isPublic: !!g.is_public,
                     members: (members || []).map(m => m.username)
                 });
                 if (--remaining === 0) {
@@ -9694,6 +9881,29 @@ app.get('/api/v1/groups', requireApiAuth, (req, res) => {
                     res.json({ groups: out });
                 }
             });
+        });
+    });
+});
+
+app.get('/api/v1/groups/public', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    db.all(`SELECT Group_Chats.*, COUNT(Group_Chat_Members.id) AS member_count,
+                   SUM(CASE WHEN Group_Chat_Members.username = ? THEN 1 ELSE 0 END) AS is_member
+            FROM Group_Chats
+            LEFT JOIN Group_Chat_Members ON Group_Chats.id = Group_Chat_Members.group_id
+            WHERE Group_Chats.is_public = 1
+            GROUP BY Group_Chats.id
+            ORDER BY Group_Chats.created_at DESC`, [me], (err, groups) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({
+            groups: (groups || []).map(g => ({
+                id: g.id,
+                name: g.name,
+                createdBy: g.created_by,
+                createdAt: g.created_at ? g.created_at.replace(' ', 'T') + 'Z' : null,
+                memberCount: g.member_count,
+                viewerIsMember: !!g.is_member
+            }))
         });
     });
 });

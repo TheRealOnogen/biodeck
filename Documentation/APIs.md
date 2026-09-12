@@ -21,7 +21,8 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 | GET | `/api/v1/messages` | — | `{ conversations: [{ username, lastMessageAt }, ...] }` - your DM inbox |
 | GET | `/api/v1/messages/:username` | `before`, `limit` (default 50, max 100) | `{ messages: [Message...], hasMore }` - oldest first |
 | POST | `/api/v1/messages/:username/mark-read` | — | `{ ok: true }` |
-| GET | `/api/v1/groups` | — | `{ groups: [{ id, name, createdBy, createdAt, members: [username,...] }, ...] }` |
+| GET | `/api/v1/groups` | — | `{ groups: [{ id, name, createdBy, createdAt, isPublic, members: [username,...] }, ...] }` |
+| GET | `/api/v1/groups/public` | — | `{ groups: [{ id, name, createdBy, createdAt, memberCount, viewerIsMember }, ...] }` — every group chat that's currently public, for building a Discover view. Not scoped to your own groups; `viewerIsMember` tells you whether you're already in it |
 | GET | `/api/v1/groups/:id/messages` | `before`, `limit` (default 50, max 100) | `{ messages: [GroupMessage...], hasMore }`. `403` if you're not a member |
 | GET | `/api/v1/notifications` | `before`, `limit` (default 50, max 100) | `{ notifications: [Notification...], hasMore }`. **Does not** mark anything as read (unlike the HTML `/notifications` page) - call `POST /notifications/mark-read` when you actually want that |
 
@@ -73,7 +74,7 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 }
 ```
 
-**What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
+**What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
 
 ---
 
@@ -193,7 +194,7 @@ Notification types generated internally: `friend_request`, `friend_accept`, `fri
 
 ## Group chats
 
-Members must be friends with the inviter to be added. Group creator has kick privileges. Max message length/attachments same as DMs.
+Members must be friends with the inviter to be added, *unless* the group is public - see below. Group creator has kick privileges. Max message length/attachments same as DMs.
 
 | Method | Path | Body | Response |
 |---|---|---|---|
@@ -205,6 +206,12 @@ Members must be friends with the inviter to be added. Group creator has kick pri
 | POST | `/groups/:id/delete/:msgId` | — | Plain 200/403/404 |
 | POST | `/groups/:id/edit/:msgId` | body: `content` | **JSON.** `{ ok: true }` |
 | GET | `/groups/:id/stream` | — | **SSE.** Events: `message`, `edit`, `delete`, same shape as DM stream |
+| POST | `/groups/:id/toggle-public` | — | **JSON.** `{ ok: true, isPublic }`. Creator-only, flips the group's public/private flag. `403` if you're not the creator |
+| POST | `/groups/:id/join` | — | **JSON.** `{ ok: true, id }`. Joins a **public** group without needing a friendship or invite. `403 { error: "This group is not public." }` if it isn't public |
+
+### Discover (public group chats)
+
+Any group creator can flip their group to public via `POST /groups/:id/toggle-public`. Public groups are listed on the `/discover` page and can be joined by anyone via `POST /groups/:id/join` - no friendship with a member required (this is the one exception to the "must be friends with the inviter" rule above). Making a group private again just removes it from Discover; existing members are unaffected. For a custom client, the real-data equivalent of the `/discover` page is `GET /api/v1/groups/public` (documented above).
 
 ## Admin-only APIs (`requireAdmin`, some `requireHeadAdmin`)
 

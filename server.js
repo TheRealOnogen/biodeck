@@ -790,7 +790,7 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
             let size = null;
             try { size = fs.statSync(f.path).size; } catch (e) { /* file missing on disk - just omit size */ }
             const sizeLine = size != null ? `<div style="font-size:0.8em;opacity:0.6;">${formatFileSize(size)}</div>` : '';
-            html += `<a href="${downloadUrlFor(f)}" style="display:inline-flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);text-decoration:none;color:inherit;max-width:${maxWidth};box-sizing:border-box;"><img src="${fileIconFor(ext)}" alt="" style="width:48px;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
+            html += `<a href="${downloadUrlFor(f)}" style="display:inline-flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);text-decoration:none;color:inherit;max-width:${maxWidth};box-sizing:border-box;"><img src="${fileIconFor(ext)}" alt="" style="width:auto;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
         }
     });
 

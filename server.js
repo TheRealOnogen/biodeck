@@ -709,8 +709,8 @@ function downloadUrlFor(f) {
 }
 
 // Icon + human-readable size for the generic "other file" attachment card.
-// Add /file.svg, /code.svg, /text.svg, /archive.svg to the public/ folder
-// (same place Biodeck.png and Default.svg live) - falls back to /file.svg
+// Add /file.png, /code.png, /text.png, /archive.png to the public/ folder
+// (same place Biodeck.png and Default.png live) - falls back to /file.png
 // for anything not in the code/text/archive lists below.
 const CODE_FILE_EXTS = new Set([
     '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx', '.c', '.cpp', '.cc', '.cxx',
@@ -722,10 +722,10 @@ const TEXT_FILE_EXTS = new Set(['.txt', '.md', '.markdown', '.log', '.csv', '.rt
 const ARCHIVE_FILE_EXTS = new Set(['.zip', '.rar', '.7z', '.tar', '.gz', '.bz2', '.xz', '.tgz', '.tbz2']);
 
 function fileIconFor(ext) {
-    if (CODE_FILE_EXTS.has(ext)) return '/code.svg';
-    if (TEXT_FILE_EXTS.has(ext)) return '/text.svg';
-    if (ARCHIVE_FILE_EXTS.has(ext)) return '/archive.svg';
-    return '/file.svg';
+    if (CODE_FILE_EXTS.has(ext)) return '/code.png';
+    if (TEXT_FILE_EXTS.has(ext)) return '/text.png';
+    if (ARCHIVE_FILE_EXTS.has(ext)) return '/archive.png';
+    return '/file.png';
 }
 
 function formatFileSize(bytes) {
@@ -2481,7 +2481,7 @@ app.post('/register', authLimiter, async (req, res) => {
             ? "Account creation is currently disabled, please contact biodecksupport@gmail.com to activate your account, a message was also sent to admins"
             : null;
 
-        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, 0, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.svg'], function(err) {
+        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, 0, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.png'], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
@@ -7754,10 +7754,10 @@ app.post('/admin/profile/:username/avatar', requireAdmin, (req, res) => {
 
 app.post('/admin/profile/:username/reset-avatar', requireAdmin, (req, res) => {
     const target = req.params.username;
-    db.run(`UPDATE User_Data SET avatar_path = ? WHERE username = ?`, ['public/Default.svg', target], function(err) {
+    db.run(`UPDATE User_Data SET avatar_path = ? WHERE username = ?`, ['public/Default.png', target], function(err) {
         if (err) return res.status(500).json({ error: 'db error' });
         if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
-        res.json({ ok: true, username: target, avatar_url: avatarPathToURL('public/Default.svg') });
+        res.json({ ok: true, username: target, avatar_url: avatarPathToURL('public/Default.png') });
     });
 });
 
@@ -7774,7 +7774,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
     if (!reason) return res.status(400).json({ error: 'a reason is required to delete an account' });
     db.run(
         `UPDATE User_Data SET avatar_path = ?, Nickname = ?, bio = ?, IsDeleted = 1, DeleteReason = ? WHERE username = ?`,
-        ['public/Default.svg', 'Account Deleted', '', reason, target],
+        ['public/Default.png', 'Account Deleted', '', reason, target],
         function(err) {
             if (err) return res.status(500).json({ error: 'db error' });
             if (this.changes === 0) return res.status(404).json({ error: 'user not found' });

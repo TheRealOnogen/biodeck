@@ -1901,12 +1901,14 @@ if (nodemailer && process.env.SMTP_HOST && process.env.SMTP_USER && process.env.
 }
 
 // ----- Inbound support email -----
-// Polls an IMAP mailbox so replies (and brand new emails) sent to the support
-// address turn into ticket activity automatically, instead of only being
-// reachable through the /support web form.
+// Keeps a persistent IMAP IDLE connection open so replies (and brand new
+// emails) sent to the support address turn into ticket activity in near
+// real time, instead of only being reachable through the /support web form.
 //   IMAP_HOST, IMAP_PORT (default 993), IMAP_USER, IMAP_PASS - mailbox creds
 //   IMAP_TLS - 'false' to disable TLS (default on)
-//   SUPPORT_INBOX_POLL_MS - how often to check, in ms (default 60000)
+//   IMAP_CONN_TIMEOUT_MS / IMAP_AUTH_TIMEOUT_MS - handshake timeouts (default 10000)
+//   SUPPORT_INBOX_POLL_MS - safety-net re-check interval on the already-open
+//     connection, in case an IDLE notification is ever missed (default 60000)
 // Needs `npm install imap mailparser`; without them (or without the env vars)
 // this feature just stays off and everything else keeps working as before.
 const SUPPORT_INBOX_POLL_MS = parseInt(process.env.SUPPORT_INBOX_POLL_MS || '60000', 10);
@@ -1968,37 +1970,98 @@ function processInboundSupportEmail(mail) {
         });
 }
 
-function pollSupportInbox() {
+// Instead of reconnecting/authenticating on a timer (which is both slow to
+// notice new mail and, against Gmail specifically, one of the things that
+// seems to trigger the intermittent "Timed out while authenticating"
+// errors), keep a single IMAP connection open and use IDLE so Gmail pushes
+// new-mail notifications to us in real time. node-imap manages the actual
+// IDLE/NOOP renewal internally once a mailbox is open; we just need to
+// reconnect (with backoff) if the connection drops, and do an occasional
+// safety-net search in case a 'mail' notification is ever missed - that
+// safety-net check reuses the already-open connection, so it costs a search
+// command, not a fresh login.
+let supportImap = null;
+let supportInboxReconnectTimer = null;
+let supportInboxReconnectDelayMs = 5000;
+const SUPPORT_INBOX_MAX_RECONNECT_MS = 5 * 60 * 1000; // cap backoff at 5 minutes
+let supportInboxCheckInFlight = false;
+
+function checkSupportInboxForUnseenMail(imap) {
+    if (supportInboxCheckInFlight) return;
+    supportInboxCheckInFlight = true;
+    imap.search(['UNSEEN'], (err, uids) => {
+        if (err) { console.error('Support inbox search error:', err.message); supportInboxCheckInFlight = false; return; }
+        if (!uids || uids.length === 0) { supportInboxCheckInFlight = false; return; }
+
+        const pending = [];
+        const fetcher = imap.fetch(uids, { bodies: '', markSeen: true });
+        fetcher.on('message', msg => {
+            let buffer = '';
+            msg.on('body', stream => { stream.on('data', chunk => { buffer += chunk.toString('utf8'); }); });
+            msg.once('end', () => {
+                pending.push(simpleParser(buffer).then(processInboundSupportEmail).catch(err => console.error('Support inbox parse error:', err.message)));
+            });
+        });
+        fetcher.once('error', err => { console.error('Support inbox fetch error:', err.message); supportInboxCheckInFlight = false; });
+        fetcher.once('end', () => { Promise.allSettled(pending).finally(() => { supportInboxCheckInFlight = false; }); });
+    });
+}
+
+function scheduleSupportInboxReconnect() {
+    if (supportInboxReconnectTimer) return; // already scheduled
+    console.warn(`Support inbox reconnecting in ${Math.round(supportInboxReconnectDelayMs / 1000)}s`);
+    supportInboxReconnectTimer = setTimeout(() => {
+        supportInboxReconnectTimer = null;
+        connectSupportInbox();
+    }, supportInboxReconnectDelayMs);
+    supportInboxReconnectDelayMs = Math.min(supportInboxReconnectDelayMs * 2, SUPPORT_INBOX_MAX_RECONNECT_MS);
+}
+
+function connectSupportInbox() {
     const imap = new ImapClient({
         user: process.env.IMAP_USER,
         password: process.env.IMAP_PASS,
         host: process.env.IMAP_HOST,
         port: parseInt(process.env.IMAP_PORT || '993', 10),
         tls: process.env.IMAP_TLS !== 'false',
-        tlsOptions: { rejectUnauthorized: false }
+        tlsOptions: { rejectUnauthorized: false },
+        // Without explicit timeouts a stalled handshake (bad TLS/STARTTLS
+        // mismatch, dropped packets, provider throttling) can hang far
+        // longer than is useful before the library gives up on its own.
+        connTimeout: parseInt(process.env.IMAP_CONN_TIMEOUT_MS || '10000', 10),
+        authTimeout: parseInt(process.env.IMAP_AUTH_TIMEOUT_MS || '10000', 10),
+        keepalive: true
+    });
+    supportImap = imap;
+
+    imap.once('error', err => {
+        console.error('Support inbox IMAP error:', err.message);
     });
 
-    imap.once('error', err => console.error('Support inbox IMAP error:', err.message));
+    imap.once('end', () => {
+        supportImap = null;
+        scheduleSupportInboxReconnect();
+    });
 
     imap.once('ready', () => {
         imap.openBox('INBOX', false, (err) => {
-            if (err) { console.error('Support inbox open error:', err.message); return imap.end(); }
-            imap.search(['UNSEEN'], (err, uids) => {
-                if (err) { console.error('Support inbox search error:', err.message); return imap.end(); }
-                if (!uids || uids.length === 0) return imap.end();
+            if (err) { console.error('Support inbox open error:', err.message); imap.end(); return; }
+            // Connected and logged in successfully - reset backoff.
+            supportInboxReconnectDelayMs = 5000;
 
-                const pending = [];
-                const fetcher = imap.fetch(uids, { bodies: '', markSeen: true });
-                fetcher.on('message', msg => {
-                    let buffer = '';
-                    msg.on('body', stream => { stream.on('data', chunk => { buffer += chunk.toString('utf8'); }); });
-                    msg.once('end', () => {
-                        pending.push(simpleParser(buffer).then(processInboundSupportEmail).catch(err => console.error('Support inbox parse error:', err.message)));
-                    });
-                });
-                fetcher.once('error', err => console.error('Support inbox fetch error:', err.message));
-                fetcher.once('end', () => { Promise.allSettled(pending).finally(() => imap.end()); });
-            });
+            // Catch up on anything that arrived while disconnected, then
+            // let IDLE notify us of anything after that.
+            checkSupportInboxForUnseenMail(imap);
+            imap.on('mail', () => checkSupportInboxForUnseenMail(imap));
+
+            // Belt-and-suspenders re-check in case an IDLE notification is
+            // ever missed (e.g. a notification lost around a keepalive
+            // renewal). Cheap - it's a search on the existing connection,
+            // not a new login.
+            const safetyNetTimer = setInterval(() => {
+                if (supportImap === imap) checkSupportInboxForUnseenMail(imap);
+                else clearInterval(safetyNetTimer);
+            }, SUPPORT_INBOX_POLL_MS);
         });
     });
 
@@ -2006,8 +2069,7 @@ function pollSupportInbox() {
 }
 
 if (ImapClient && simpleParser && process.env.IMAP_HOST && process.env.IMAP_USER && process.env.IMAP_PASS) {
-    pollSupportInbox();
-    setInterval(pollSupportInbox, SUPPORT_INBOX_POLL_MS);
+    connectSupportInbox();
 } else if (!ImapClient || !simpleParser) {
     console.warn('imap/mailparser not installed (run `npm install imap mailparser`) - inbound emails will not be turned into support tickets.');
 } else {

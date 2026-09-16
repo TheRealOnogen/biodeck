@@ -23,5 +23,10 @@
   "name": "nostalgia",
   "displayName": "Nostalgia",
   "file": "styles_nostalgia.css"
+  },
+  {
+  "name": "nostalgia_dark",
+  "displayName": "Nostalgia Dark",
+  "file": "styles_nostalgia_dark.css"
   }
 ]

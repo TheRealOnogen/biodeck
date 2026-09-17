@@ -1600,6 +1600,26 @@ db.serialize(() => {
 app.use(express.urlencoded({extended:true}))
 app.use(express.json())
 
+// Forces every direct request under /uploads/ to download rather than
+// render inline as a top-level navigation - not just the dedicated
+// /uploads/download/:filename route above. Content-Disposition only affects
+// how a browser handles a top-level navigation (or a plain clicked link);
+// it does NOT stop <img src>, <video><source>, or <audio><source> from
+// rendering the response inline, since those are embedded resource fetches,
+// not navigations - so avatars, feed image thumbnails, and video/audio
+// previews all keep working unchanged. What this closes off is someone
+// sharing/pasting the *raw* /uploads/<file> URL outside the app (or via
+// "copy image address") and a visitor opening it directly - previously that
+// would serve an uploaded HTML/SVG file inline and let any embedded script
+// run same-origin in that visitor's session; now it always downloads.
+app.use('/uploads', (req, res, next) => {
+    const filename = path.basename(req.path);
+    if (filename && filename !== '/' ) {
+        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+    }
+    next();
+});
+
 app.use(express.static(path.join(__dirname, 'public')));
 
 const SESSION_SECRET_PATH = path.join(__dirname, '.session-secret');

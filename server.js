@@ -3656,10 +3656,10 @@ app.post('/account/email/confirm', (req, res) => {
 app.get('/feed', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.pinned = 1 ORDER BY Posts.created_at DESC`, [], (pinErr, pinnedPosts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.pinned = 1 ORDER BY Posts.created_at DESC`, [], (pinErr, pinnedPosts) => {
         const pinnedHTML = (pinnedPosts || []).map(renderPinnedItem).join('');
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username ORDER BY Posts.created_at DESC LIMIT 10`, [], (err, posts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username ORDER BY Posts.created_at DESC LIMIT 10`, [], (err, posts) => {
         if (err) { console.error(err); return res.status(500).send('Error loading feed'); }
 
         const sessionUsername = req.session.userUsername;
@@ -4366,7 +4366,7 @@ app.post('/feed/edit/:id', (req, res) => {
         if (post.username !== req.session.userUsername) return res.status(403).json({ error: 'You can only edit your own posts.' });
         db.run(`UPDATE Posts SET content = ?, edited = 1 WHERE id = ?`, [content.trim(), postId], (err2) => {
             if (err2) { console.error('Post edit error:', err2.message); return res.status(500).json({ error: 'Failed to edit post.' }); }
-            db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err3, row) => {
+            db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err3, row) => {
                 if (err3 || !row) return res.json({ ok: true });
                 res.json({ ok: true, html: renderFeedPost(row, req.session.userUsername, 350, req.isAdmin) });
             });
@@ -4421,7 +4421,7 @@ app.get('/feed/edits', (req, res) => {
     const intIds = ids.map(Number).filter(Boolean);
     if (!intIds.length) return res.json({ posts: {} });
     db.all(
-        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id IN (${intIds.map(() => '?').join(',')}) AND edited = 1`,
+        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id IN (${intIds.map(() => '?').join(',')}) AND edited = 1`,
         intIds,
         (err, rows) => {
             if (err) return res.status(500).json({ error: 'db error' });
@@ -4440,7 +4440,7 @@ app.get('/feed/search', (req, res) => {
     if (!q) return res.json({ html: '' });
     const like = '%' + q + '%';
     db.all(
-        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE (Posts.content LIKE ? OR Posts.username LIKE ?) AND Posts.reply_to IS NULL ORDER BY Posts.created_at DESC LIMIT 30`,
+        `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE (Posts.content LIKE ? OR Posts.username LIKE ?) AND Posts.reply_to IS NULL ORDER BY Posts.created_at DESC LIMIT 30`,
         [like, like],
         (err, posts) => {
             if (err) return res.status(500).json({ error: 'db error' });
@@ -4457,7 +4457,7 @@ app.get('/feed/older', (req, res) => {
     const beforeId = parseInt(req.query.before) || 0;
     if (!beforeId) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [beforeId], (err, posts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [beforeId], (err, posts) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!posts || !posts.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
@@ -4474,7 +4474,7 @@ app.get('/feed/poll', (req, res) => {
     const sessionUsername = req.session.userUsername;
     const afterId = parseInt(req.query.after) || 0;
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id > ? ORDER BY Posts.created_at DESC`, [afterId], (err, newPosts) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id > ? ORDER BY Posts.created_at DESC`, [afterId], (err, newPosts) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!newPosts || !newPosts.length) return res.json({ html: '', lastId: afterId });
 
@@ -4501,7 +4501,7 @@ app.get('/following-feed', (req, res) => {
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
 
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) ORDER BY Posts.created_at DESC LIMIT 10`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) ORDER BY Posts.created_at DESC LIMIT 10`,
             followingList, (err, posts) => {
             if (err) { console.error(err); return res.status(500).send('Error loading feed'); }
 
@@ -4926,7 +4926,7 @@ app.get('/following-feed/poll', (req, res) => {
 
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id > ? ORDER BY Posts.created_at DESC`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id > ? ORDER BY Posts.created_at DESC`,
             [...followingList, afterId], (err, newPosts) => {
             if (err) return res.status(500).json({ error: 'db error' });
             if (!newPosts || !newPosts.length) return res.json({ html: '', lastId: afterId });
@@ -4945,7 +4945,7 @@ app.get('/following-feed/older', (req, res) => {
 
     getFollowingList(sessionUsername, (followingList) => {
         const placeholders = followingList.map(() => '?').join(',');
-        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`,
+        db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.username IN (${placeholders}) AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`,
             [...followingList, beforeId], (err, posts) => {
             if (err) return res.status(500).json({ error: 'db error' });
             if (!posts || !posts.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
@@ -4967,7 +4967,7 @@ app.get('/post/:id', (req, res) => {
     if (!postId) return res.status(404).send('Post not found');
     const sessionUsername = req.session.userUsername;
 
-    db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err, rootPost) => {
+    db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err, rootPost) => {
         if (err) { console.error(err); return res.status(500).send('Error loading post'); }
         if (!rootPost) return res.status(404).send('Post not found');
 
@@ -4976,7 +4976,7 @@ app.get('/post/:id', (req, res) => {
                 ? `<div class="reply-context"><a href="/post/${parentPost.id}" style="color:var(--accent-color);text-decoration:none;">> Replying to @${escapeHTML(parentPost.username)}</a></div>`
                 : `<div class="reply-context" style="opacity:0.4;">> Replying to a deleted post</div>`);
 
-            db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId], (err2, replies) => {
+            db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId], (err2, replies) => {
                 if (err2) { console.error(err2); return res.status(500).send('Error loading replies'); }
 
                 const oldestReplyId = replies.length ? Math.min(...replies.map(p => p.id)) : 0;
@@ -5406,7 +5406,7 @@ app.get('/post/:id/poll', (req, res) => {
     const postId = parseInt(req.params.id);
     const afterId = parseInt(req.query.after) || 0;
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id > ? ORDER BY Posts.created_at DESC`, [postId, afterId], (err, newReplies) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id > ? ORDER BY Posts.created_at DESC`, [postId, afterId], (err, newReplies) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!newReplies || !newReplies.length) return res.json({ html: '', lastId: afterId });
 
@@ -5424,7 +5424,7 @@ app.get('/post/:id/older', (req, res) => {
     const beforeId = parseInt(req.query.before) || 0;
     if (!beforeId) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
-    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId, beforeId], (err, replies) => {
+    db.all(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.reply_to = ? AND Posts.id < ? ORDER BY Posts.created_at DESC LIMIT 10`, [postId, beforeId], (err, replies) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!replies || !replies.length) return res.json({ html: '', hasMore: false, oldestId: 0 });
 
@@ -5834,7 +5834,7 @@ app.get('/user/:username', (req, res) => {
                 db.get(`SELECT id FROM Friends WHERE user_a = ? AND user_b = ?`, [a, b], (ferr2, friendRow) => {
                 let friendStatus = 'none';
                 const continueRender = (friendStatus) => {
-                db.all(`SELECT *, (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count FROM Posts WHERE username = ? ORDER BY created_at DESC`, [profileUsername], (err2, posts) => {
+                db.all(`SELECT *, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts WHERE username = ? ORDER BY created_at DESC`, [profileUsername], (err2, posts) => {
                     const postsHTML = (posts || []).map(post => {
                         const fileHTML = renderAttachmentsHTML(getAttachments(post), 300);
                         return `<div class="post" style="border:1px solid var(--post-border-color);border-radius:10px;padding:10px;margin-bottom:14px;text-align:left;">
@@ -9759,7 +9759,7 @@ function serializeNotificationJSON(n) {
 // /api/v1/post/:id/replies don't each hand-roll their own SQL.
 function fetchPostsJSON(whereSQL, whereParams, limit, cb) {
     const sql = `SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified,
-        (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count
+        (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count
         FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username
         ${whereSQL} ORDER BY Posts.created_at DESC LIMIT ?`;
     db.all(sql, [...whereParams, limit], cb);
@@ -9866,7 +9866,7 @@ app.get('/api/v1/post/:id', requireApiAuth, (req, res) => {
     const postId = parseInt(req.params.id);
     if (!postId) return res.status(404).json({ error: 'Post not found' });
     db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified,
-            (SELECT COUNT(*) FROM Posts AS Replies WHERE Replies.reply_to = Posts.id) AS reply_count
+            (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count
             FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`,
         [postId], (err, post) => {
         if (err) return res.status(500).json({ error: 'db error' });

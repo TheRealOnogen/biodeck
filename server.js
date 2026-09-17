@@ -1620,12 +1620,14 @@ const SESSION_SECRET = loadOrCreateSessionSecret();
 const sessionsDir = path.join(__dirname, 'sessions');
 if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
 
-// If this ever runs behind a reverse proxy that terminates TLS (nginx,
-// Caddy, a load balancer, etc.), uncomment the line below so express-session
-// can correctly see the connection as HTTPS via X-Forwarded-Proto - otherwise
-// cookie.secure: 'auto' will think every request is plain HTTP and the
-// session cookie will never get the Secure flag.
-// app.set('trust proxy', 1);
+// This app runs behind a reverse proxy (confirmed by X-Forwarded-For showing
+// up on incoming requests), so Express needs to trust it - both so
+// express-session sees HTTPS correctly via X-Forwarded-Proto (cookie.secure:
+// 'auto' needs this) and so express-rate-limit derives req.ip from the real
+// client IP instead of the proxy's. '1' trusts exactly one hop (the
+// immediate proxy in front of this app) - bump it if there's more than one
+// proxy between the internet and this process.
+app.set('trust proxy', 1);
 
 app.use(session({
     store: new FileStore({ path: sessionsDir, ttl: 7 * 24 * 60 * 60, retries: 1, logFn: function () {} }),

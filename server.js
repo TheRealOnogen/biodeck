@@ -4633,7 +4633,13 @@ app.get('/feed/reply-counts', (req, res) => {
     const intIds = ids.map(Number).filter(Boolean);
     if (!intIds.length) return res.json({ counts: {} });
     db.all(
-        `SELECT reply_to AS post_id, COUNT(*) AS cnt FROM Posts WHERE reply_to IN (${intIds.map(() => '?').join(',')}) GROUP BY reply_to`,
+        `SELECT Posts.id AS post_id,
+                (WITH RECURSIVE descendants(id) AS (
+                    SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id
+                    UNION ALL
+                    SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id
+                ) SELECT COUNT(*) FROM descendants) AS cnt
+         FROM Posts WHERE Posts.id IN (${intIds.map(() => '?').join(',')})`,
         intIds,
         (err, rows) => {
             if (err) return res.status(500).json({ error: 'db error' });

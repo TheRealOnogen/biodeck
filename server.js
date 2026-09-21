@@ -693,16 +693,129 @@ function renderMessageBubble(m, me, replyMsg) {
 // forces a download and restores the original filename the uploader saw,
 // using the name recorded alongside the attachment in the DB (passed
 // through as ?name=).
-app.get('/uploads/download/:filename', (req, res) => {
-    const requested = path.basename(req.params.filename); // strips any path traversal attempt
-    const filePath = path.join(uploadsDir, requested);
-    fs.access(filePath, fs.constants.R_OK, (err) => {
-        if (err) return res.status(404).end();
-        const rawName = req.query.name ? String(req.query.name) : requested;
-        const displayName = path.basename(rawName).slice(0, 255) || requested;
-        res.download(filePath, displayName);
+app.get('/uploads/download/:filename', (req, res) => serveUpload(req, res, true));
+
+// ----- Private attachment access control (DMs + group chats) -----
+//
+// Every file lives in one flat folder, so by default anyone who has (or
+// guesses) a /uploads/<file> URL could fetch it - including attachments from
+// DMs and group chats they were never part of. Private_Uploads records, at
+// send time, which conversation each DM/GC attachment belongs to (it's a
+// separate table rather than a lookup on Messages/Group_Chat_Messages so the
+// restriction survives the message being deleted - files are never removed
+// from disk). serveUpload() below checks it on every request:
+//   - filename not in Private_Uploads -> feed attachment / avatar, served
+//     exactly as before (no session needed, so avatars stay cheap)
+//   - filename in Private_Uploads     -> must be logged in AND be one of the
+//     two DM participants / a current member of that group chat
+// The one exception is moderation: the user a warning was issued to can
+// still see the content removed from them, and admins can see attachments
+// that appear in a report or warning (otherwise the admin report view would
+// break for anything reported out of a DM/GC). Admins can NOT browse
+// arbitrary private attachments.
+// Denied requests get a plain 404, same as a missing file.
+
+// Called from the DM/GC send routes once the message has passed validation.
+function recordPrivateUploads(files, info) {
+    (files || []).forEach(f => {
+        const filename = f.filename || path.basename(String(f.path || '').replace(/\\/g, '/'));
+        if (!filename) return;
+        db.run(`INSERT OR IGNORE INTO Private_Uploads (filename, scope, user_a, user_b, group_id) VALUES (?, ?, ?, ?, ?)`,
+            [filename, info.scope, info.userA || null, info.userB || null, info.groupId || null],
+            (err) => { if (err) console.error('Private upload record error:', err.message); });
     });
-});
+}
+
+// Fills Private_Uploads for attachments sent before this table existed.
+// Idempotent (INSERT OR IGNORE), runs on every boot right after the table is
+// created. Attachments from messages that were already deleted before this
+// was added can't be recovered and stay unrestricted (they're unlinked from
+// any conversation and have unguessable names).
+function backfillPrivateUploads() {
+    const add = (row, scope, a, b, gid) => {
+        getAttachments(row).forEach(f => {
+            const filename = path.basename(String(f.path || '').replace(/\\/g, '/'));
+            if (!filename) return;
+            db.run(`INSERT OR IGNORE INTO Private_Uploads (filename, scope, user_a, user_b, group_id) VALUES (?, ?, ?, ?, ?)`,
+                [filename, scope, a, b, gid], () => {});
+        });
+    };
+    db.all(`SELECT from_user, to_user, file_path, files_json FROM Messages WHERE file_path IS NOT NULL OR files_json IS NOT NULL`, [], (err, rows) => {
+        if (err) return console.error('Private upload backfill (DMs) error:', err.message);
+        (rows || []).forEach(r => add(r, 'dm', r.from_user, r.to_user, null));
+    });
+    db.all(`SELECT group_id, file_path, files_json FROM Group_Chat_Messages WHERE file_path IS NOT NULL OR files_json IS NOT NULL`, [], (err, rows) => {
+        if (err) return console.error('Private upload backfill (GCs) error:', err.message);
+        (rows || []).forEach(r => add(r, 'gc', null, null, r.group_id));
+    });
+}
+
+// Moderation exception, see the comment block above.
+function moderationMayViewUpload(req, filename, cb) {
+    const like = '%' + filename.replace(/[\\%_]/g, '\\$&') + '%';
+    db.get(`SELECT id FROM Warnings WHERE username = ? AND removed_attachments_json LIKE ? ESCAPE '\\' LIMIT 1`,
+        [req.session.userUsername, like], (e1, ownWarning) => {
+        if (!e1 && ownWarning) return cb(true);
+        db.get(`SELECT IsAdmin, IsOwner, IsHeadAdmin FROM User_Data WHERE id = ?`, [req.session.userId], (e2, u) => {
+            if (e2 || !u || !(u.IsAdmin || u.IsOwner || u.IsHeadAdmin)) return cb(false);
+            db.get(`SELECT id FROM Reports WHERE attachments_json LIKE ? ESCAPE '\\' LIMIT 1`, [like], (e3, report) => {
+                if (!e3 && report) return cb(true);
+                db.get(`SELECT id FROM Warnings WHERE removed_attachments_json LIKE ? ESCAPE '\\' LIMIT 1`, [like], (e4, warning) => cb(!e4 && !!warning));
+            });
+        });
+    });
+}
+
+function userMayViewPrivateUpload(req, row, filename, cb) {
+    const me = req.session && req.session.userUsername;
+    if (!req.session || !req.session.userId || !me) return cb(false);
+    const orModerator = (ok) => ok ? cb(true) : moderationMayViewUpload(req, filename, cb);
+    if (row.scope === 'dm') return orModerator(me === row.user_a || me === row.user_b);
+    if (row.scope === 'gc') {
+        return db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [row.group_id, me],
+            (err, member) => orModerator(!err && !!member));
+    }
+    cb(false);
+}
+
+// Serves /uploads/:filename (inline-capable embed) and
+// /uploads/download/:filename (forced download with the original name).
+// Both go through here so neither can be used to bypass the check.
+function serveUpload(req, res, asDownload) {
+    const filename = req.params.filename;
+    // Only plain files directly inside uploadsDir, never anything path-like.
+    if (!filename || filename !== path.basename(filename) || filename.startsWith('.')) return res.status(404).end();
+
+    const send = (restricted) => {
+        // Private files must not be stored by a shared cache (e.g. the reverse
+        // proxy) or the next person to request the URL would skip this check.
+        const opts = { dotfiles: 'deny', cacheControl: !restricted };
+        if (restricted) res.setHeader('Cache-Control', 'private, no-cache');
+        const done = (err) => { if (err && !res.headersSent) res.status(err.status === 400 ? 400 : 404).end(); };
+        if (asDownload) {
+            const rawName = req.query.name ? String(req.query.name) : filename;
+            const displayName = path.basename(rawName).slice(0, 255) || filename;
+            return res.download(path.join(uploadsDir, filename), displayName, opts, done);
+        }
+        // Direct navigation to a raw /uploads/<file> URL always downloads instead
+        // of rendering inline (so an uploaded HTML/SVG can't run script on this
+        // origin). <img>/<video>/<audio> embeds are unaffected by this header.
+        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
+        res.sendFile(filename, Object.assign({ root: uploadsDir }, opts), done);
+    };
+
+    db.get(`SELECT scope, user_a, user_b, group_id FROM Private_Uploads WHERE filename = ?`, [filename], (err, row) => {
+        if (err) { console.error('Private upload lookup error:', err.message); return res.status(500).end(); }
+        if (!row) return send(false);
+        // Only now do we need to know who's asking. (sessionMiddleware is
+        // defined further down with the rest of the session setup; it's only
+        // touched at request time, so that's fine.)
+        sessionMiddleware(req, res, (sessErr) => {
+            if (sessErr) return res.status(500).end();
+            userMayViewPrivateUpload(req, row, filename, (ok) => ok ? send(true) : res.status(404).end());
+        });
+    });
+}
 
 function downloadUrlFor(f) {
     return `/uploads/download/${path.basename(f.path)}?name=${encodeURIComponent(f.name || path.basename(f.path))}`;
@@ -749,6 +862,49 @@ function getAttachments(row) {
     }
     if (row && row.file_path) return [{ path: row.file_path, name: row.file_name }];
     return [];
+}
+
+// Actually removes attachment files from disk once nothing references them
+// anymore. Call this AFTER the DB row that owned the attachment has been
+// deleted, passing the attachment list read from that row via
+// getAttachments() *beforehand* (there's nothing left to read it from once
+// the row is gone).
+//
+// A file is kept on disk if it's still referenced by:
+//   - another Post/Message/Group_Chat_Message row (shouldn't normally
+//     happen given the random per-upload filenames, but it's cheap to check
+//     and safer than assuming)
+//   - a Reports.attachments_json or Warnings.removed_attachments_json
+//     snapshot - these are kept forever as moderation history (see the
+//     comment above issuePreActionWarning) and still need to render that
+//     file for admins and, via /standing, the affected user
+// Only once none of those reference the filename is it safe to unlink it
+// and drop its Private_Uploads row (see the comment above
+// recordPrivateUploads - that row exists only to gate access while the
+// file is alive, so it should go with the file).
+function cleanupAttachmentFiles(files) {
+    (files || []).forEach(f => {
+        const filename = path.basename(String((f && f.path) || '').replace(/\\/g, '/'));
+        if (!filename || filename !== path.basename(filename)) return;
+        const like = '%' + filename.replace(/[\\%_]/g, '\\$&') + '%';
+        db.get(
+            `SELECT
+                (SELECT COUNT(*) FROM Posts WHERE file_path = ? OR files_json LIKE ? ESCAPE '\\') AS a,
+                (SELECT COUNT(*) FROM Messages WHERE file_path = ? OR files_json LIKE ? ESCAPE '\\') AS b,
+                (SELECT COUNT(*) FROM Group_Chat_Messages WHERE file_path = ? OR files_json LIKE ? ESCAPE '\\') AS c,
+                (SELECT COUNT(*) FROM Reports WHERE attachments_json LIKE ? ESCAPE '\\') AS d,
+                (SELECT COUNT(*) FROM Warnings WHERE removed_attachments_json LIKE ? ESCAPE '\\') AS e`,
+            [filename, like, filename, like, filename, like, like, like],
+            (err, row) => {
+                if (err) { console.error('Attachment reference check error:', err.message); return; }
+                if (row && (row.a || row.b || row.c || row.d || row.e)) return; // still referenced - keep the file
+                fs.unlink(path.join(uploadsDir, filename), (unlinkErr) => {
+                    if (unlinkErr && unlinkErr.code !== 'ENOENT') console.error('Attachment delete error:', unlinkErr.message);
+                });
+                db.run(`DELETE FROM Private_Uploads WHERE filename = ?`, [filename], () => {});
+            }
+        );
+    });
 }
 
 // Renders one or more attachments. A single image renders full-size like before.
@@ -1383,6 +1539,21 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`ALTER TABLE User_Data ADD COLUMN last_ip TEXT DEFAULT NULL`, () => {});
+            // Full history of the IPs each account has logged in/registered
+            // from, so support can look at a compromised account and see
+            // whether the IP suddenly changed (and when). changed_from_previous
+            // is precomputed at insert time so the admin view doesn't have to
+            // do a self-join to highlight the jumps.
+            db.run(`CREATE TABLE IF NOT EXISTS IP_Login_History (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                event TEXT NOT NULL DEFAULT 'login',
+                changed_from_previous INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_ip_login_history_user ON IP_Login_History(user_id, created_at)`);
             db.run(`CREATE TABLE IF NOT EXISTS Friend_Requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_user TEXT NOT NULL,
@@ -1434,6 +1605,17 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN files_json TEXT DEFAULT NULL`, () => {});
+            // Which conversation each DM / group chat attachment belongs to, so
+            // /uploads/<file> can be restricted to the people in it. See
+            // serveUpload(). scope is 'dm' (user_a/user_b) or 'gc' (group_id).
+            db.run(`CREATE TABLE IF NOT EXISTS Private_Uploads (
+                filename TEXT PRIMARY KEY,
+                scope TEXT NOT NULL,
+                user_a TEXT DEFAULT NULL,
+                user_b TEXT DEFAULT NULL,
+                group_id INTEGER DEFAULT NULL
+            )`);
+            backfillPrivateUploads();
             // Set to 1 the first time a group message's content is changed via
             // /groups/:id/edit/:msgId, so it can show an "(edited)" marker.
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
@@ -1547,6 +1729,12 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_support_tickets_status ON Support_Tickets(status)`);
+            // IP the ticket was submitted from, so support can compare it
+            // against the account's login IP history (see IP_Login_History)
+            // when triaging a possible account-takeover report. NULL for
+            // tickets that came in by email instead of the web form - there's
+            // no meaningful client IP for those.
+            db.run(`ALTER TABLE Support_Tickets ADD COLUMN ip TEXT DEFAULT NULL`, () => {});
             // Admin replies sent from the /admin/support/:id ticket page. Kept as
             // history alongside the ticket even though the actual reply goes out
             // by email, not through any in-app messaging.
@@ -1600,27 +1788,24 @@ db.serialize(() => {
 app.use(express.urlencoded({extended:true}))
 app.use(express.json())
 
-// Forces every direct request under /uploads/ to download rather than
-// render inline as a top-level navigation - not just the dedicated
-// /uploads/download/:filename route above. Content-Disposition only affects
-// how a browser handles a top-level navigation (or a plain clicked link);
-// it does NOT stop <img src>, <video><source>, or <audio><source> from
-// rendering the response inline, since those are embedded resource fetches,
-// not navigations - so avatars, feed image thumbnails, and video/audio
-// previews all keep working unchanged. What this closes off is someone
-// sharing/pasting the *raw* /uploads/<file> URL outside the app (or via
-// "copy image address") and a visitor opening it directly - previously that
-// would serve an uploaded HTML/SVG file inline and let any embedded script
-// run same-origin in that visitor's session; now it always downloads.
-app.use('/uploads', (req, res, next) => {
-    const filename = path.basename(req.path);
-    if (filename && filename !== '/' ) {
-        res.setHeader('Content-Disposition', `attachment; filename="${filename.replace(/"/g, '')}"`);
-    }
-    next();
+// public/ is served statically EXCEPT anything under /uploads, which goes
+// through serveUpload() (above) so DM / group chat attachments can be access
+// checked. The path is decoded and normalized before testing because
+// express.static does the same before touching the disk - testing the raw
+// URL would let something like /%75ploads/<file> or /a/../uploads/<file> slip
+// past this and be served unchecked.
+const publicStatic = express.static(path.join(__dirname, 'public'));
+function isUploadsPath(rawPath) {
+    let p;
+    try { p = decodeURIComponent(rawPath); } catch (e) { return true; }
+    p = path.posix.normalize('/' + p).toLowerCase();
+    return p === '/uploads' || p.startsWith('/uploads/');
+}
+app.use((req, res, next) => {
+    if (isUploadsPath(req.path)) return next();
+    publicStatic(req, res, next);
 });
-
-app.use(express.static(path.join(__dirname, 'public')));
+app.get('/uploads/:filename', (req, res) => serveUpload(req, res, false));
 
 const SESSION_SECRET_PATH = path.join(__dirname, '.session-secret');
 function loadOrCreateSessionSecret() {
@@ -1649,7 +1834,10 @@ if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
 // proxy between the internet and this process.
 app.set('trust proxy', 1);
 
-app.use(session({
+// Named so serveUpload() can load the session on demand for private files.
+// express-session is a no-op when req.session is already set, so registering
+// it globally below as well is safe.
+const sessionMiddleware = session({
     store: new FileStore({ path: sessionsDir, ttl: 7 * 24 * 60 * 60, retries: 1, logFn: function () {} }),
     secret: SESSION_SECRET,
     resave: false,
@@ -1666,7 +1854,8 @@ app.use(session({
         secure: 'auto',
         maxAge: 7 * 24 * 60 * 60 * 1000
     }
-}))
+});
+app.use(sessionMiddleware);
 
 // Basic hardening headers. X-Content-Type-Options stops browsers from
 // MIME-sniffing uploaded/served files into something more dangerous than
@@ -1717,6 +1906,28 @@ function getClientIP(req) {
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) return forwarded.split(',')[0].trim();
     return req.socket.remoteAddress || req.ip || 'unknown';
+}
+
+// Records a login/register event in IP_Login_History and keeps
+// User_Data.last_ip in sync. Figures out whether this IP is different from
+// the account's last known one and, if so, writes an audit log entry
+// (surfaces on the existing admin Audit Log tab) so a sudden IP change is
+// visible without support having to dig through raw history rows.
+// Fire-and-forget, same pattern as logAudit - never blocks the
+// login/register response.
+function recordLoginIP(userId, username, ip, event) {
+    if (!ip) return;
+    db.get(`SELECT ip FROM IP_Login_History WHERE user_id = ? ORDER BY id DESC LIMIT 1`, [userId], (err, lastRow) => {
+        const previousIP = !err && lastRow ? lastRow.ip : null;
+        const changed = previousIP !== null && previousIP !== ip;
+        db.run(`INSERT INTO IP_Login_History (user_id, username, ip, event, changed_from_previous) VALUES (?, ?, ?, ?, ?)`,
+            [userId, username, ip, event || 'login', changed ? 1 : 0],
+            (err2) => { if (err2) console.error('IP history insert error:', err2.message); });
+        if (changed) {
+            logAudit('ip_changed', username, username, `${previousIP} -> ${ip} (${event || 'login'})`);
+        }
+        db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [ip, userId], () => {});
+    });
 }
 
 function checkIPBan(req, res, next) {
@@ -2648,7 +2859,7 @@ app.post('/register', authLimiter, async (req, res) => {
 </html>`);
                 }
                 const registerIP = getClientIP(req);
-                db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [registerIP, newUserId], () => {});
+                recordLoginIP(newUserId, username, registerIP, 'register');
                 // New accounts start with email_verified = 0, so hold them in
                 // the same "pending" session state used elsewhere until they
                 // confirm the address, instead of granting a full session.
@@ -2808,11 +3019,21 @@ app.post('/login', authLimiter, (req, res) => {
                     req.session.pendingVerifyUsername = user.username;
                     return res.redirect('/account/verify-email-required');
                 }
-                req.session.userId = user.id;
-                req.session.userUsername = user.username;
-                const loginIP = getClientIP(req);
-                db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [loginIP, user.id], () => {});
-                return res.redirect('/feed');
+                // Regenerate the session here so a pre-existing (and possibly
+                // attacker-planted) session ID can't ride along into an
+                // authenticated session - this swaps in a fresh session ID
+                // before granting the login, closing a session-fixation gap.
+                req.session.regenerate((regenErr) => {
+                    if (regenErr) {
+                        console.error('Session regenerate error:', regenErr.message);
+                        return res.status(500).sendFile(path.join(__dirname, 'login_error_auth_exception.html'));
+                    }
+                    req.session.userId = user.id;
+                    req.session.userUsername = user.username;
+                    const loginIP = getClientIP(req);
+                    recordLoginIP(user.id, user.username, loginIP, 'login');
+                    return res.redirect('/feed');
+                });
             } else {
                 return res.status(401).sendFile(path.join(__dirname, 'login_error_invalid_credentials.html'));
             }
@@ -2858,7 +3079,7 @@ app.post('/account/add-email', (req, res) => {
         delete req.session.pendingEmailUserId;
         delete req.session.pendingEmailUsername;
         const loginIP = getClientIP(req);
-        db.run(`UPDATE User_Data SET last_ip = ? WHERE id = ?`, [loginIP, userId], () => {});
+        recordLoginIP(userId, username, loginIP, 'add-email');
         logAudit('email_added', username, username, 'added email on login (pre-existing account)');
         // The address hasn't been confirmed yet, so route into the same
         // verification hold used everywhere else instead of logging in.
@@ -2972,18 +3193,22 @@ app.get('/account/verify-email', (req, res) => {
                 db.run(`UPDATE Email_Verifications SET used = 1 WHERE id = ?`, [verifyRow.id], () => {});
                 logAudit('email_verified', user.username, user.username, null);
 
-                // Clear any pending hold and log the user in fully, whether they
-                // arrived here from registration/login or just clicked the link
-                // while the account already had a full session.
-                if (req.session.pendingVerifyUserId === user.id) {
-                    delete req.session.pendingVerifyUserId;
-                    delete req.session.pendingVerifyUsername;
-                }
-                req.session.userId = user.id;
-                req.session.userUsername = user.username;
-                return res.send(renderMessagePage('Email Verified', 'You\'re all set',
-                    `<h3>Your email has been verified.</h3><br><br>
-                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/feed';">Continue</button>`));
+                // Same session-fixation guard as /login: swap in a fresh
+                // session ID before this request's session gains
+                // authenticated (or re-authenticated) status. This also
+                // naturally clears any pendingVerify* hold from the old
+                // session, since regenerate() starts from an empty one.
+                req.session.regenerate((regenErr) => {
+                    if (regenErr) {
+                        console.error('Session regenerate error:', regenErr.message);
+                        return res.status(500).send(renderMessagePage('Error', 'Something went wrong', `<h3>Please try again.</h3>`));
+                    }
+                    req.session.userId = user.id;
+                    req.session.userUsername = user.username;
+                    return res.send(renderMessagePage('Email Verified', 'You\'re all set',
+                        `<h3>Your email has been verified.</h3><br><br>
+                        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/feed';">Continue</button>`));
+                });
             });
         });
     });
@@ -3004,7 +3229,12 @@ app.get('/forgot-password', (req, res) => {
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`));
 });
 
-app.post('/forgot-password', (req, res) => {
+// Unauthenticated and previously had no rate limit at all - anyone could
+// repeatedly POST a valid username and cause an unlimited stream of
+// password-reset emails to that account's inbox (email bombing), plus
+// unbounded rows in Password_Resets. Reuses the same per-IP budget as
+// login/register/support.
+app.post('/forgot-password', authLimiter, (req, res) => {
     const username = (req.body.username || '').trim();
     // Always show the same response either way, so this endpoint can't be used
     // to probe which usernames have accounts.
@@ -3131,7 +3361,11 @@ app.get('/support', (req, res) => {
     res.send(renderSupportForm({ values: { username: prefillUsername } }));
 });
 
-app.post('/support', (req, res) => {
+// This form is reachable without logging in, so without a rate limit it was
+// an open spam/flood vector: unlimited DB rows plus an outbound confirmation
+// email per submission, with no cost to the requester. Reuses authLimiter's
+// same per-IP budget as login/register.
+app.post('/support', authLimiter, (req, res) => {
     const username = (req.body.username || '').trim();
     const email = (req.body.email || '').trim().toLowerCase();
     const subject = (req.body.subject || '').trim();
@@ -3145,8 +3379,9 @@ app.post('/support', (req, res) => {
     if (!message) return res.status(400).send(renderSupportForm({ error: 'Please describe the issue.', values }));
     if (message.length > MAX_SUPPORT_MSG_LENGTH) return res.status(400).send(renderSupportForm({ error: `Message too long - ${MAX_SUPPORT_MSG_LENGTH} character limit.`, values }));
 
-    db.run(`INSERT INTO Support_Tickets (username, email, subject, message) VALUES (?, ?, ?, ?)`,
-        [username, email, subject, message], function (err) {
+    const ip = getClientIP(req);
+    db.run(`INSERT INTO Support_Tickets (username, email, subject, message, ip) VALUES (?, ?, ?, ?, ?)`,
+        [username, email, subject, message, ip], function (err) {
             if (err) {
                 console.error('Support ticket insert error:', err.message);
                 return res.status(500).send(renderSupportForm({ error: 'Something went wrong. Please try again.', values }));
@@ -4345,11 +4580,13 @@ app.get('/api/my-reports', (req, res) => {
 app.post('/feed/delete/:id', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     const postId = parseInt(req.params.id);
-    db.get(`SELECT username FROM Posts WHERE id = ?`, [postId], (err, post) => {
+    db.get(`SELECT username, file_path, file_name, files_json FROM Posts WHERE id = ?`, [postId], (err, post) => {
         if (err || !post) return res.status(404).end();
         if (post.username !== req.session.userUsername && !req.isAdmin) return res.status(403).end();
+        const attachments = getAttachments(post);
         db.run(`DELETE FROM Posts WHERE id = ?`, [postId], (err) => {
             if (err) console.error('Delete error:', err.message);
+            else cleanupAttachmentFiles(attachments);
             res.status(200).end();
         });
     });
@@ -6398,6 +6635,7 @@ app.post('/messages/:username/send', (req, res, next) => {
     if ((!content || !content.trim()) && !files.length) return res.status(400).json({ error: 'Message is empty.' });
     if (content && content.length > MAX_MSG_LENGTH) return res.status(400).json({ error: 'Message too long or too many files selected - 4,000 character limit, max 10 files.' });
 
+    recordPrivateUploads(files, { scope: 'dm', userA: me, userB: other });
     db.run(`INSERT INTO Messages (from_user, to_user, content, file_path, file_name, files_json, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [me, other, (content || '').trim(), filePath, fileName, filesJSON, replyTo], function (err) {
             if (err) return res.status(500).json({ error: 'Failed to send message.' });
@@ -6434,11 +6672,13 @@ app.post('/messages/:username/delete/:id', (req, res) => {
     const me = req.session.userUsername;
     const other = req.params.username;
     const msgId = parseInt(req.params.id);
-    db.get(`SELECT from_user, to_user FROM Messages WHERE id = ?`, [msgId], (err, msg) => {
+    db.get(`SELECT from_user, to_user, file_path, file_name, files_json FROM Messages WHERE id = ?`, [msgId], (err, msg) => {
         if (err || !msg) return res.status(404).end();
         if (msg.from_user !== me) return res.status(403).end();
+        const attachments = getAttachments(msg);
         db.run(`DELETE FROM Messages WHERE id = ?`, [msgId], (err2) => {
             if (err2) { console.error('Message delete error:', err2.message); return res.status(500).end(); }
+            cleanupAttachmentFiles(attachments);
             broadcastDMDelete(msg.from_user, msg.to_user, msgId);
             res.status(200).end();
         });
@@ -7862,8 +8102,11 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
         function(err) {
             if (err) return res.status(500).json({ error: 'db error' });
             if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
+            db.all(`SELECT file_path, file_name, files_json FROM Posts WHERE username = ?`, [target], (errPre, postRows) => {
+            const attachments = (postRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []);
             db.run(`DELETE FROM Posts WHERE username = ?`, [target], (err2) => {
                 if (err2) return res.status(500).json({ error: 'db error deleting posts' });
+                cleanupAttachmentFiles(attachments);
                 // Push a deleted event to any open SSE streams for this user, and email them
                 db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err3, row) => {
                     if (!err3 && row) {
@@ -7873,6 +8116,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
                 });
                 logAudit('account_deleted', req.session.userUsername, target, reason);
                 res.json({ ok: true, deleted: true, username: target });
+            });
             });
         }
     );
@@ -7888,6 +8132,16 @@ function hardDeleteAccount(username, reason, callback) {
         if (!row) return callback(new Error('user not found'));
         const userId = row.id;
         const email = row.email;
+        // Gather every attachment this user owns (DMs, posts, group chat
+        // messages) BEFORE any row is deleted, so the files can be cleaned
+        // up from disk once the rows referencing them are gone.
+        db.all(`SELECT file_path, file_name, files_json FROM Messages WHERE from_user = ? OR to_user = ?`, [username, username], (errM, msgRows) => {
+        db.all(`SELECT file_path, file_name, files_json FROM Posts WHERE username = ?`, [username], (errP, postRows) => {
+        db.all(`SELECT file_path, file_name, files_json FROM Group_Chat_Messages WHERE from_user = ?`, [username], (errG, gcRows) => {
+            const attachments = []
+                .concat((msgRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []))
+                .concat((postRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []))
+                .concat((gcRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []));
         db.serialize(() => {
             db.run(`DELETE FROM Messages WHERE from_user = ? OR to_user = ?`, [username, username]);
             db.run(`DELETE FROM Password_Resets WHERE user_id = ?`, [userId]);
@@ -7903,6 +8157,7 @@ function hardDeleteAccount(username, reason, callback) {
             db.run(`DELETE FROM User_Data WHERE username = ?`, [username], function (err2) {
                 if (err2) return callback(err2);
                 if (this.changes === 0) return callback(new Error('user not found'));
+                cleanupAttachmentFiles(attachments);
                 // Push a 'deleted' event to any open tabs for this user, same as
                 // the soft delete above, so an active session sees the "Account
                 // Deleted" screen immediately instead of waiting for its next
@@ -7914,6 +8169,9 @@ function hardDeleteAccount(username, reason, callback) {
                 if (email) sendAccountPermanentlyDeletedEmail(email, username, cleanReason);
                 callback(null);
             });
+        });
+        });
+        });
         });
     });
 }
@@ -8142,9 +8400,31 @@ app.get('/admin/support/:id', requireAdmin, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(404).send(renderMessagePage('Not Found', 'Ticket not found', `<h3>That ticket doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/support';">Back to tickets</button>`));
 
-    db.get(`SELECT id, username, email, subject, message, status, created_at FROM Support_Tickets WHERE id = ?`, [id], (err, ticket) => {
+    db.get(`SELECT id, username, email, subject, message, status, created_at, ip FROM Support_Tickets WHERE id = ?`, [id], (err, ticket) => {
         if (err) return res.status(500).send('DB error');
         if (!ticket) return res.status(404).send(renderMessagePage('Not Found', 'Ticket not found', `<h3>That ticket doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/support';">Back to tickets</button>`));
+
+        db.all(`SELECT ip, event, changed_from_previous, created_at FROM IP_Login_History WHERE username = ? ORDER BY id DESC LIMIT 15`, [ticket.username], (errIP, ipHistory) => {
+        const ticketIPKnown = !!(ipHistory && ipHistory.length && ticket.ip);
+        const ticketIPMatchesLatest = ticketIPKnown && ipHistory[0].ip === ticket.ip;
+        const ipSectionHTML = `
+        <p style="font-size:0.9em;"><strong>Submitted from IP:</strong> ${ticket.ip ? escapeHTML(ticket.ip) : '<span style="opacity:0.4;">unknown (submitted by email)</span>'}${
+            ticketIPKnown ? (ticketIPMatchesLatest
+                ? ' <span style="color:var(--success-color);">(matches account\'s most recent login IP)</span>'
+                : ' <span style="color:var(--danger-color);font-weight:700;">(does NOT match account\'s most recent login IP - worth a closer look)</span>')
+                : ''
+        }</p>
+        <details style="margin-top:6px;">
+            <summary style="cursor:pointer;font-size:0.85em;opacity:0.7;">Recent login IP history for @${escapeHTML(ticket.username)} (${(ipHistory || []).length})</summary>
+            ${(ipHistory && ipHistory.length) ? `<table style="width:100%;font-size:0.8em;margin-top:8px;border-collapse:collapse;">
+                <tr style="opacity:0.6;text-align:left;"><th style="padding:2px 8px 2px 0;">IP</th><th style="padding:2px 8px;">Event</th><th style="padding:2px 8px;">When</th></tr>
+                ${ipHistory.map(h => `<tr${h.changed_from_previous ? ' style="color:var(--danger-color);font-weight:700;"' : ''}>
+                    <td style="padding:2px 8px 2px 0;">${escapeHTML(h.ip)}${h.changed_from_previous ? ' ⚠️ changed' : ''}</td>
+                    <td style="padding:2px 8px;">${escapeHTML(h.event)}</td>
+                    <td style="padding:2px 8px;">${escapeHTML(h.created_at || '')}</td>
+                </tr>`).join('')}
+            </table>` : `<p style="opacity:0.4;font-size:0.85em;margin-top:6px;">No login history recorded yet.</p>`}
+        </details>`;
 
         db.all(`SELECT admin_username, message, created_at, is_customer, customer_email FROM Support_Ticket_Replies WHERE ticket_id = ? ORDER BY id ASC`, [id], (err2, replies) => {
             const repliesHTML = (replies || []).map(r => {
@@ -8188,6 +8468,7 @@ ${renderSupportTopbar('Support Ticket #' + ticket.id)}
         <p style="font-size:0.9em;"><strong>Account:</strong> <a href="/user/${escapeHTML(ticket.username)}" style="color:var(--text-color);">@${escapeHTML(ticket.username)}</a></p>
         <p style="font-size:0.9em;"><strong>Contact email:</strong> ${escapeHTML(ticket.email)}</p>
         <p style="font-size:0.9em;"><strong>Status:</strong> ${statusLabel}</p>
+        ${ipSectionHTML}
         <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
         <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(ticket.message)}</p>
         <form method="POST" action="/admin/support/${ticket.id}/status" class="action-row">
@@ -8212,6 +8493,7 @@ ${renderSupportTopbar('Support Ticket #' + ticket.id)}
 ${SUPPORT_NAV_SCRIPT}
 </body>
 </html>`);
+        });
         });
     });
 });
@@ -8563,29 +8845,39 @@ app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
         const { reported_username, source_type, source_id } = report;
 
         if (source_type === 'post') {
-            db.run(`DELETE FROM Posts WHERE id = ?`, [source_id], function (err2) {
-                if (err2) return res.status(500).json({ error: 'db error' });
-                const deleted = this.changes > 0;
-                if (deleted) logAudit('report_content_deleted', admin, reported_username, `post #${source_id}`);
-                res.json({ ok: true, deleted });
+            db.get(`SELECT file_path, file_name, files_json FROM Posts WHERE id = ?`, [source_id], (errPre, postRow) => {
+                const attachments = getAttachments(postRow);
+                db.run(`DELETE FROM Posts WHERE id = ?`, [source_id], function (err2) {
+                    if (err2) return res.status(500).json({ error: 'db error' });
+                    const deleted = this.changes > 0;
+                    if (deleted) {
+                        cleanupAttachmentFiles(attachments);
+                        logAudit('report_content_deleted', admin, reported_username, `post #${source_id}`);
+                    }
+                    res.json({ ok: true, deleted });
+                });
             });
         } else if (source_type === 'dm') {
-            db.get(`SELECT from_user, to_user FROM Messages WHERE id = ?`, [source_id], (err2, msg) => {
+            db.get(`SELECT from_user, to_user, file_path, file_name, files_json FROM Messages WHERE id = ?`, [source_id], (err2, msg) => {
                 if (err2) return res.status(500).json({ error: 'db error' });
                 if (!msg) return res.json({ ok: true, deleted: false });
+                const attachments = getAttachments(msg);
                 db.run(`DELETE FROM Messages WHERE id = ?`, [source_id], (err3) => {
                     if (err3) return res.status(500).json({ error: 'db error' });
+                    cleanupAttachmentFiles(attachments);
                     broadcastDMDelete(msg.from_user, msg.to_user, source_id);
                     logAudit('report_content_deleted', admin, reported_username, `dm #${source_id}`);
                     res.json({ ok: true, deleted: true });
                 });
             });
         } else if (source_type === 'gc') {
-            db.get(`SELECT group_id FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err2, msg) => {
+            db.get(`SELECT group_id, file_path, file_name, files_json FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err2, msg) => {
                 if (err2) return res.status(500).json({ error: 'db error' });
                 if (!msg) return res.json({ ok: true, deleted: false });
+                const attachments = getAttachments(msg);
                 db.run(`DELETE FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err3) => {
                     if (err3) return res.status(500).json({ error: 'db error' });
+                    cleanupAttachmentFiles(attachments);
                     db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [msg.group_id], (err4, memberRows) => {
                         broadcastGCDelete(msg.group_id, source_id, (memberRows || []).map(r => r.username));
                         logAudit('report_content_deleted', admin, reported_username, `gc #${source_id}`);
@@ -8992,7 +9284,10 @@ app.post('/groups/:id/leave', (req, res) => {
             // If no members remain, clean up the group and its messages
             db.get(`SELECT COUNT(*) AS cnt FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (err3, row) => {
                 if (!err3 && row && row.cnt === 0) {
-                    db.run(`DELETE FROM Group_Chat_Messages WHERE group_id = ?`, [groupId]);
+                    db.all(`SELECT file_path, file_name, files_json FROM Group_Chat_Messages WHERE group_id = ?`, [groupId], (errPre, gcRows) => {
+                        const attachments = (gcRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []);
+                        db.run(`DELETE FROM Group_Chat_Messages WHERE group_id = ?`, [groupId], () => cleanupAttachmentFiles(attachments));
+                    });
                     db.run(`DELETE FROM Group_Chats WHERE id = ?`, [groupId]);
                 } else {
                     postSystemGCMessage(groupId, `${me} left the group`);
@@ -9566,6 +9861,7 @@ app.post('/groups/:id/send', (req, res, next) => {
         if ((!content || !content.trim()) && !files.length) return res.status(400).json({ error: 'Message is empty.' });
         if (content && content.length > MAX_MSG_LENGTH) return res.status(400).json({ error: 'Message too long or too many files selected - 4,000 character limit, max 10 files.' });
 
+        recordPrivateUploads(files, { scope: 'gc', groupId });
         db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content, file_path, file_name, files_json, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [groupId, me, (content || '').trim(), filePath, fileName, filesJSON, replyTo], function (err2) {
                 if (err2) return res.status(500).json({ error: 'Failed to send message.' });
@@ -9603,11 +9899,13 @@ app.post('/groups/:id/delete/:msgId', (req, res) => {
     const me = req.session.userUsername;
     const groupId = parseInt(req.params.id);
     const msgId = parseInt(req.params.msgId);
-    db.get(`SELECT from_user FROM Group_Chat_Messages WHERE id = ? AND group_id = ?`, [msgId, groupId], (err, msg) => {
+    db.get(`SELECT from_user, file_path, file_name, files_json FROM Group_Chat_Messages WHERE id = ? AND group_id = ?`, [msgId, groupId], (err, msg) => {
         if (err || !msg) return res.status(404).end();
         if (msg.from_user !== me) return res.status(403).end();
+        const attachments = getAttachments(msg);
         db.run(`DELETE FROM Group_Chat_Messages WHERE id = ?`, [msgId], (err2) => {
             if (err2) return res.status(500).end();
+            cleanupAttachmentFiles(attachments);
             db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (err3, memberRows) => {
                 broadcastGCDelete(groupId, msgId, (memberRows || []).map(r => r.username));
                 res.status(200).end();

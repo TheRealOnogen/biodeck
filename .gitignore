@@ -5,3 +5,6 @@ node_modules/
 public/uploads/
 public/v86/images
 vars.env
+experimental.js
+login_experimental.html
+register_experimental.html

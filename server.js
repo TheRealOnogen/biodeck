@@ -934,8 +934,13 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
         } else if (MSG_AUDIO_MIME_TYPES[ext]) {
             html += `<div class="post-file"><audio controls preload="metadata" style="width:100%;max-width:${maxWidth === 'min(100%,80vw)' ? '400px' : maxWidth};border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"><source src="${url}" type="${MSG_AUDIO_MIME_TYPES[ext]}">Your browser can't play this audio. <a href="${downloadUrlFor(f)}" style="color:var(--accent-color);">Download it instead</a>.</audio></div>`;
         } else {
-            let size = null;
-            try { size = fs.statSync(f.path).size; } catch (e) { /* file missing on disk - just omit size */ }
+            // f.size is set for anything uploaded after this was added; older
+            // attachments won't have it, so fall back to a stat() just for those
+            // rather than doing a blocking syscall on every single render.
+            let size = typeof f.size === 'number' ? f.size : null;
+            if (size == null) {
+                try { size = fs.statSync(f.path).size; } catch (e) { /* file missing on disk - just omit size */ }
+            }
             const sizeLine = size != null ? `<div style="font-size:0.8em;opacity:0.6;">${formatFileSize(size)}</div>` : '';
             html += `<a href="${downloadUrlFor(f)}" style="display:inline-flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);text-decoration:none;color:inherit;max-width:${maxWidth};box-sizing:border-box;"><img src="${fileIconFor(ext)}" alt="" style="width:auto;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
         }
@@ -1428,6 +1433,11 @@ db.serialize(() => {
             // Set to 1 the first time a message's content is changed via
             // /messages/:username/edit/:id, so bubbles can show "(edited)".
             db.run(`ALTER TABLE Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
+            // DM lookups filter by from_user/to_user on nearly every request
+            // (conversation list, thread fetch) - these were full table scans
+            // before this index existed.
+            db.run(`CREATE INDEX IF NOT EXISTS idx_messages_from ON Messages(from_user)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_messages_to ON Messages(to_user)`);
             db.run(`ALTER TABLE User_Data ADD COLUMN IsOwner INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsDeveloper INTEGER DEFAULT 0`, () => {});
             db.run(`ALTER TABLE User_Data ADD COLUMN IsSupporter INTEGER DEFAULT 0`, () => {});
@@ -1515,6 +1525,11 @@ db.serialize(() => {
             // Set to 1 the first time a post/reply's content is changed via
             // /feed/edit/:id, so it can show an "(edited)" marker.
             db.run(`ALTER TABLE Posts ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
+            // username backs profile pages and the feed; reply_to backs every
+            // reply-thread fetch and the profile page's per-post reply count
+            // (a recursive CTE, so this matters even more there).
+            db.run(`CREATE INDEX IF NOT EXISTS idx_posts_username ON Posts(username)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_posts_reply_to ON Posts(reply_to)`);
             db.run(`CREATE TABLE IF NOT EXISTS Follows (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 follower_username TEXT NOT NULL,
@@ -1522,6 +1537,11 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(follower_username, following_username)
             )`);
+            // The UNIQUE(follower_username, following_username) constraint above
+            // already indexes follower_username as its leading column, but a
+            // lookup by following_username alone (follower list, follower
+            // count) can't use that composite - hence this separate index.
+            db.run(`CREATE INDEX IF NOT EXISTS idx_follows_following ON Follows(following_username)`);
             db.run(`CREATE TABLE IF NOT EXISTS IP_Bans (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 ip TEXT UNIQUE NOT NULL,
@@ -1610,6 +1630,7 @@ db.serialize(() => {
             // Set to 1 the first time a group message's content is changed via
             // /groups/:id/edit/:msgId, so it can show an "(edited)" marker.
             db.run(`ALTER TABLE Group_Chat_Messages ADD COLUMN edited INTEGER DEFAULT 0`, () => {});
+            db.run(`CREATE INDEX IF NOT EXISTS idx_gcm_group ON Group_Chat_Messages(group_id)`);
             // Set to 1 when the group's creator marks it as public via
             // /groups/:id/toggle-public. Public groups show up on /discover
             // and can be joined by anyone, not just friends of a member.
@@ -3348,7 +3369,7 @@ function renderSupportForm(opts) {
             <textarea class="box" name="message" placeholder="How can we help?" required maxlength="${MAX_SUPPORT_MSG_LENGTH}" rows="6" style="width: 260px; resize: vertical; font-family: inherit; padding: 8px; box-sizing: border-box;">${escapeHTML(v.message || '')}</textarea>
             <button type="submit" class="button" style="width: 180px;">Send</button>
         </form><br>
-        <button type="button" class="button" style="width: 150px" onclick="history.back()">Back</button>`);
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back</button>`);
 }
 
 app.get('/support', (req, res) => {
@@ -4450,7 +4471,7 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
 
     const { content, reply_to } = req.body;
     const files = req.files || [];
-    const filesMeta = files.map(f => ({ path: f.path, name: f.originalname }));
+    const filesMeta = files.map(f => ({ path: f.path, name: f.originalname, size: f.size }));
     const filesJSON = filesMeta.length ? JSON.stringify(filesMeta) : null;
     // Keep the legacy single-file columns populated with the first attachment so
     // any old code path that still reads file_path/file_name keeps working.
@@ -6628,7 +6649,7 @@ app.post('/messages/:username/send', (req, res, next) => {
         }
     const { content, reply_to } = req.body;
     const files = req.files || [];
-    const filesMeta = files.map(f => ({ path: f.path, name: f.originalname }));
+    const filesMeta = files.map(f => ({ path: f.path, name: f.originalname, size: f.size }));
     const filesJSON = filesMeta.length ? JSON.stringify(filesMeta) : null;
     const filePath = files[0] ? files[0].path : null;
     const fileName = files[0] ? files[0].originalname : null;
@@ -9854,7 +9875,7 @@ app.post('/groups/:id/send', (req, res, next) => {
         }
         const { content, reply_to } = req.body;
         const files = req.files || [];
-        const filesMeta = files.map(f => ({ path: f.path, name: f.originalname }));
+        const filesMeta = files.map(f => ({ path: f.path, name: f.originalname, size: f.size }));
         const filesJSON = filesMeta.length ? JSON.stringify(filesMeta) : null;
         const filePath = files[0] ? files[0].path : null;
         const fileName = files[0] ? files[0].originalname : null;
@@ -10251,23 +10272,27 @@ app.get('/api/v1/groups', requireApiAuth, (req, res) => {
             ORDER BY Group_Chats.created_at DESC`, [me], (err, groups) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!groups || !groups.length) return res.json({ groups: [] });
-        let remaining = groups.length;
-        const out = [];
-        groups.forEach(g => {
-            db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ? ORDER BY joined_at ASC`,
-                [g.id], (e2, members) => {
-                out.push({
+        // One query for every member of every one of these groups, instead of
+        // a separate members query per group (was N+1 for N groups).
+        const ids = groups.map(g => g.id);
+        const placeholders = ids.map(() => '?').join(',');
+        db.all(`SELECT group_id, username FROM Group_Chat_Members WHERE group_id IN (${placeholders}) ORDER BY joined_at ASC`,
+            ids, (e2, allMembers) => {
+            if (e2) return res.status(500).json({ error: 'db error' });
+            const membersByGroup = new Map();
+            (allMembers || []).forEach(m => {
+                if (!membersByGroup.has(m.group_id)) membersByGroup.set(m.group_id, []);
+                membersByGroup.get(m.group_id).push(m.username);
+            });
+            res.json({
+                groups: groups.map(g => ({
                     id: g.id,
                     name: g.name,
                     createdBy: g.created_by,
                     createdAt: toISO(g.created_at),
                     isPublic: !!g.is_public,
-                    members: (members || []).map(m => m.username)
-                });
-                if (--remaining === 0) {
-                    out.sort((x, y) => y.id - x.id);
-                    res.json({ groups: out });
-                }
+                    members: membersByGroup.get(g.id) || []
+                }))
             });
         });
     });

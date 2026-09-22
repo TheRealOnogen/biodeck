@@ -6,7 +6,7 @@ This documents every route in `server.js` for anyone building a custom client.
 
 Everything under `/api/v1/` was added specifically for custom clients. Unlike the legacy routes documented further down, these always return proper structured JSON - no HTML fragments, no scraping required. They sit alongside the old routes rather than replacing them, so Biodeck's own frontend is unaffected; they read from the same tables via shared internal helpers, so the data is guaranteed consistent with what the web UI shows.
 
-Auth is still the session cookie described below - there's no separate token scheme for `/api/v1`. Log in via `POST /login` once, then send that cookie on every `/api/v1` request same as everything else. All `/api/v1` routes require a logged-in session and return `401 { "error": "Not logged in" }` otherwise.
+Auth is still the session cookie described below - there's no separate token scheme for `/api/v1`. Log in via `POST /login` once, then send that cookie on every `/api/v1` request same as everything else. All `/api/v1` routes require a logged-in session and return `401 { "error": "Not logged in" }` otherwise. Hitting a path under `/api/v1/` (or any `/api/*` path) that doesn't exist returns `404 { "error": "Not found" }` rather than an HTML page - safe to treat any `/api/*` response as JSON, even a 404.
 
 Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` query param pattern (never both `before` and `after` at once), and every paginated response includes `hasMore` so you know whether to fetch another page. `limit` is clamped server-side (defaults and caps noted per-route below).
 
@@ -228,6 +228,7 @@ A few admin routes (`/admin/support`, `/admin/support/:id`, `/admin/reports`, an
 | GET | `/uploads/download/:filename?name=...` | Serves an uploaded attachment for download |
 | GET | `/theme.css` | Dynamic CSS based on saved theme preference |
 | GET | `/support`, POST `/support` | Support ticket form |
+| GET | `/404.html` | Themed "not found" page (matches `/theme.css`). Any unmatched non-`/api/*` route serves this with a `404` status, URL unchanged - not a redirect |
 
 ---
 

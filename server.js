@@ -661,7 +661,7 @@ function renderMessageBubble(m, me, replyMsg) {
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderHeader}
             ${replyBanner}
-            <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${escapeAndLinkify(cleanText)}</div>
+            <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${renderMarkdown(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
@@ -1164,42 +1164,145 @@ function linkifyMentions(escapedText) {
     });
 }
 
-// Escapes post/message text for safe rendering while also turning any bare
-// http(s) URLs into real clickable links (and, via linkifyMentions, @handles
-// into profile links). Runs on the *raw* (unescaped) text passed in -
-// candidate URLs are located first, since escapeHTML() would otherwise
-// mangle URL characters (e.g. "&" -> "&amp;") before the URL regex ever
-// saw them. Each URL is escaped individually for its href/display text and
-// spliced back in; everything else is escaped and mention-linkified as
-// before. This is the counterpart to renderEmbeds(), which already pulls
-// known embeddable URLs (YouTube, images, etc.) out of the text - anything
-// left over after that is a "plain" link that just needs to be clickable.
+// Renders post/message/ticket text for safe display: HTML-escapes it, then
+// layers a small self-contained Markdown renderer on top (headers, bold,
+// italic, strikethrough, inline code, fenced code blocks, links, lists,
+// blockquotes), and finally the existing bare-URL autolinking and
+// @mention linking. Runs on the *raw* (unescaped) text passed in.
+//
+// Escaping happens FIRST, on the whole string, before any Markdown syntax
+// is interpreted. That ordering is what keeps this safe: by the time any
+// "<a>", "<strong>", etc. tag gets built, every "<", ">", "&", etc. that
+// came from the user has already been turned into an inert entity, so
+// there's no way for user input to smuggle real HTML/script through -
+// worst case someone's literal "<script>" shows up as escaped text inside
+// a paragraph, never as a live tag. Matching a bare URL or a [text](url)
+// link *after* escaping is still correct HTML: an "&" inside the URL is by
+// then "&amp;", which browsers decode back to "&" when they parse the
+// resulting href="..." attribute, same as if a human had hand-escaped it.
+//
+// Anything that becomes real HTML along the way (code spans, links, bold,
+// etc.) is swapped out for a one-time placeholder token and stashed in
+// `slots`, so later passes (e.g. the italic regex) never see - and can't
+// re-mangle - HTML an earlier pass already produced. Tokens are resolved
+// back to their HTML at the very end, looping until none remain since they
+// can nest (e.g. a link stashed inside bold text).
+//
+// This is the counterpart to renderEmbeds(), which already pulls known
+// embeddable URLs (YouTube, images, etc.) out of the text - anything left
+// over after that is what gets Markdown-rendered here.
 const BARE_URL_REGEX = /https?:\/\/[^\s<>"']+/g;
-function escapeAndLinkify(text) {
+const MD_LINK_REGEX = /\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/g;
+const MD_HEADER_SIZES = { 1: '1.35em', 2: '1.22em', 3: '1.12em', 4: '1.05em', 5: '1em', 6: '0.95em' };
+
+function renderMarkdown(text) {
     if (!text) return '';
-    let result = '';
-    let lastIndex = 0;
-    let match;
-    BARE_URL_REGEX.lastIndex = 0;
-    while ((match = BARE_URL_REGEX.exec(text)) !== null) {
-        let url = match[0];
+
+    const slots = [];
+    const stash = html => {
+        const token = `\u0000MD${slots.length}\u0000`;
+        slots.push(html);
+        return token;
+    };
+
+    let escaped = escapeHTML(text);
+
+    // Fenced code blocks - highest precedence, protects their contents
+    // (including anything that looks like more Markdown) from every rule
+    // below, same as real Markdown.
+    escaped = escaped.replace(/```[a-zA-Z0-9_+-]*\n?([\s\S]*?)```/g, (m, code) =>
+        stash(`<pre style="background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.12);border-radius:6px;padding:10px;overflow-x:auto;margin:6px 0;"><code>${code.replace(/\n$/, '')}</code></pre>`));
+
+    // Inline code spans.
+    escaped = escaped.replace(/`([^`\n]+)`/g, (m, code) =>
+        stash(`<code style="background:rgba(255,255,255,0.08);padding:1px 5px;border-radius:4px;font-family:monospace;">${code}</code>`));
+
+    // Applies the remaining inline rules (links/bold/italic/strikethrough/
+    // bare URLs/@mentions) to a single line of text that's already been
+    // through the code-block/code-span pass above.
+    function inlineFormat(line) {
+        line = line.replace(MD_LINK_REGEX, (m, label, url) =>
+            stash(`<a href="${url}" target="_blank" rel="noopener noreferrer nofollow" style="color:var(--accent-color);word-break:break-all;">${label}</a>`));
+        line = line.replace(/\*\*([^\n]+?)\*\*/g, (m, t) => stash(`<strong>${t}</strong>`));
+        line = line.replace(/__([^\n]+?)__/g, (m, t) => stash(`<strong>${t}</strong>`));
+        line = line.replace(/~~([^\n]+?)~~/g, (m, t) => stash(`<del>${t}</del>`));
+        line = line.replace(/\*([^\s*][^\n]*?)\*/g, (m, t) => stash(`<em>${t}</em>`));
+        line = line.replace(/(^|[^\w])_([^\s_][^\n]*?)_(?!\w)/g, (m, pre, t) => `${pre}${stash(`<em>${t}</em>`)}`);
         // Trailing punctuation is usually sentence punctuation, not part of
         // the URL (e.g. "check https://example.com." or "(see https://x.com)").
-        const trailingMatch = url.match(/[.,!?;:'")\]]+$/);
-        let trailing = '';
-        if (trailingMatch) {
-            trailing = trailingMatch[0];
-            url = url.slice(0, -trailing.length);
-        }
-        if (!url) continue;
-        result += linkifyMentions(escapeHTML(text.slice(lastIndex, match.index)));
-        const safeUrl = escapeHTML(url);
-        result += `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer nofollow" style="color:var(--accent-color);word-break:break-all;">${safeUrl}</a>`;
-        result += escapeHTML(trailing);
-        lastIndex = match.index + match[0].length;
+        line = line.replace(BARE_URL_REGEX, url => {
+            const trailingMatch = url.match(/[.,!?;:'")\]]+$/);
+            let trailing = '';
+            if (trailingMatch) {
+                trailing = trailingMatch[0];
+                url = url.slice(0, -trailing.length);
+            }
+            if (!url) return trailing;
+            return stash(`<a href="${url}" target="_blank" rel="noopener noreferrer nofollow" style="color:var(--accent-color);word-break:break-all;">${url}</a>`) + trailing;
+        });
+        return linkifyMentions(line);
     }
-    result += linkifyMentions(escapeHTML(text.slice(lastIndex)));
-    return result;
+
+    const lines = escaped.split('\n');
+    const blocks = [];
+    let i = 0;
+    while (i < lines.length) {
+        const line = lines[i];
+
+        if (/^#{1,6}\s+/.test(line)) {
+            const level = line.match(/^(#{1,6})/)[1].length;
+            blocks.push(`<div style="font-weight:700;font-size:${MD_HEADER_SIZES[level]};margin:6px 0 4px;">${inlineFormat(line.replace(/^#{1,6}\s+/, ''))}</div>`);
+            i++;
+            continue;
+        }
+
+        if (/^&gt;\s?/.test(line)) {
+            const quote = [];
+            while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+                quote.push(inlineFormat(lines[i].replace(/^&gt;\s?/, '')));
+                i++;
+            }
+            blocks.push(`<blockquote style="border-left:3px solid rgba(255,255,255,0.25);margin:6px 0;padding:2px 0 2px 10px;opacity:0.85;">${quote.join('<br>')}</blockquote>`);
+            continue;
+        }
+
+        if (/^[-*]\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+                items.push(`<li>${inlineFormat(lines[i].replace(/^[-*]\s+/, ''))}</li>`);
+                i++;
+            }
+            blocks.push(`<ul style="margin:4px 0;padding-left:22px;">${items.join('')}</ul>`);
+            continue;
+        }
+
+        if (/^\d+\.\s+/.test(line)) {
+            const items = [];
+            while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+                items.push(`<li>${inlineFormat(lines[i].replace(/^\d+\.\s+/, ''))}</li>`);
+                i++;
+            }
+            blocks.push(`<ol style="margin:4px 0;padding-left:22px;">${items.join('')}</ol>`);
+            continue;
+        }
+
+        if (line.trim() === '') { i++; continue; }
+
+        const para = [];
+        while (i < lines.length && lines[i].trim() !== ''
+            && !/^#{1,6}\s+/.test(lines[i]) && !/^&gt;\s?/.test(lines[i])
+            && !/^[-*]\s+/.test(lines[i]) && !/^\d+\.\s+/.test(lines[i])) {
+            para.push(inlineFormat(lines[i]));
+            i++;
+        }
+        blocks.push(`<div>${para.join('<br>')}</div>`);
+    }
+
+    let out = blocks.join('');
+    for (let guard = 0; guard < 10 && /\u0000MD\d+\u0000/.test(out); guard++) {
+        out = out.replace(/\u0000MD(\d+)\u0000/g, (m, n) => slots[+n]);
+    }
+    return out;
 }
 
 const NOTIF_ICONS = { reply: '>', dm: '>', friend_request: '+', friend_accept: '✓', friend_decline: '×', mention_post: '@', mention_dm: '@', mention_gc: '@' };
@@ -1262,7 +1365,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
                 <span><span class="post-time" data-ts="${post.created_at.replace(' ', 'T') + 'Z'}" style="font-size:0.8em;opacity:0.6;"></span>${editedMarker}</span>
             </div>
         </div>
-        <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${escapeAndLinkify(cleanText)}</div>
+        <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${renderMarkdown(cleanText)}</div>
         ${embedHTML}
         ${fileHTML}
         <div class="post-actions">
@@ -8456,7 +8559,7 @@ app.get('/admin/support/:id', requireAdmin, (req, res) => {
                     : `${escapeHTML(r.admin_username)} <span style="opacity:0.6;">(admin)</span>`;
                 return `<div style="border-top:1px solid rgba(255,255,255,0.1);${isCustomer ? 'border-left:3px solid var(--warning-color, #d9a441);padding-left:10px;' : ''}padding-top:12px;padding-bottom:12px;">
                 <div style="font-size:0.78em;opacity:0.5;margin-bottom:4px;">${who} · ${escapeHTML(r.created_at || '')}</div>
-                <div style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(r.message)}</div>
+                <div style="word-break:break-word;overflow-wrap:break-word;">${renderMarkdown(r.message)}</div>
             </div>`;
             }).join('');
 
@@ -8492,7 +8595,7 @@ ${renderSupportTopbar('Support Ticket #' + ticket.id)}
         <p style="font-size:0.9em;"><strong>Status:</strong> ${statusLabel}</p>
         ${ipSectionHTML}
         <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
-        <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(ticket.message)}</p>
+        <div style="word-break:break-word;overflow-wrap:break-word;">${renderMarkdown(ticket.message)}</div>
         <form method="POST" action="/admin/support/${ticket.id}/status" class="action-row">
             <input type="hidden" name="status" value="${ticket.status === 'open' ? 'resolved' : 'open'}">
             <button type="submit" class="button" style="width:auto;padding:8px 16px;">${ticket.status === 'open' ? 'Mark Resolved' : 'Reopen'}</button>
@@ -8933,7 +9036,7 @@ function renderGCMessageBubble(m, me, replyMsg) {
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderLabel}
             ${replyBanner}
-            <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${escapeAndLinkify(cleanText)}</div>
+            <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${renderMarkdown(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">

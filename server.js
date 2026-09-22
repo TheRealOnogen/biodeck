@@ -123,42 +123,33 @@ const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 const MAX_FILES_FEED = 5;
 const MAX_FILES_DM = 10;
 const MAX_FILES_GC = 10;
-const uploadFeed = multer({ storage, limits: { fileSize: MAX_FILE_SIZE, files: MAX_FILES_FEED } });
-const uploadDM = multer({ storage, limits: { fileSize: MAX_FILE_SIZE, files: MAX_FILES_DM } });
-const uploadGC = multer({ storage, limits: { fileSize: MAX_FILE_SIZE, files: MAX_FILES_GC } });
+const makeMultiUpload = maxFiles => multer({ storage, limits: { fileSize: MAX_FILE_SIZE, files: maxFiles } });
+const uploadFeed = makeMultiUpload(MAX_FILES_FEED);
+const uploadDM = makeMultiUpload(MAX_FILES_DM);
+const uploadGC = makeMultiUpload(MAX_FILES_GC);
 
 const MSG_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
 
 const MAX_AVATAR_SIZE = 8 * 1024 * 1024;
-const avatarStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => cb(null, `avatar-${req.session.userId}-${Date.now()}${path.extname(file.originalname).toLowerCase()}`)
-});
-const avatarUpload = multer({
-    storage: avatarStorage,
-    limits: { fileSize: MAX_AVATAR_SIZE },
-    fileFilter: (req, file, cb) => {
-        const ext = path.extname(file.originalname).toLowerCase();
-        if (MSG_IMAGE_EXTS.includes(ext)) cb(null, true);
-        else cb(new Error('Only image files are allowed for profile pictures'));
-    }
-});
-// Same constraints as avatarUpload, but the filename is keyed off the target
-// username in the route param (since these uploads come from an admin acting
-// on someone else's profile, not the uploader's own session).
-const adminAvatarStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadsDir),
-    filename: (req, file, cb) => cb(null, `avatar-${req.params.username}-${Date.now()}${path.extname(file.originalname).toLowerCase()}`)
-});
-const adminAvatarUpload = multer({
-    storage: adminAvatarStorage,
-    limits: { fileSize: MAX_AVATAR_SIZE },
-    fileFilter: (req, file, cb) => {
-        const ext = path.extname(file.originalname).toLowerCase();
-        if (MSG_IMAGE_EXTS.includes(ext)) cb(null, true);
-        else cb(new Error('Only image files are allowed for profile pictures'));
-    }
-});
+
+// keyFn: own session id for a normal avatar change, target username for an admin one.
+function makeAvatarUpload(keyFn) {
+    const storage = multer.diskStorage({
+        destination: (req, file, cb) => cb(null, uploadsDir),
+        filename: (req, file, cb) => cb(null, `avatar-${keyFn(req)}-${Date.now()}${path.extname(file.originalname).toLowerCase()}`)
+    });
+    return multer({
+        storage,
+        limits: { fileSize: MAX_AVATAR_SIZE },
+        fileFilter: (req, file, cb) => {
+            const ext = path.extname(file.originalname).toLowerCase();
+            if (MSG_IMAGE_EXTS.includes(ext)) cb(null, true);
+            else cb(new Error('Only image files are allowed for profile pictures'));
+        }
+    });
+}
+const avatarUpload = makeAvatarUpload(req => req.session.userId);
+const adminAvatarUpload = makeAvatarUpload(req => req.params.username);
 const MSG_VIDEO_MIME_TYPES = {
     '.mp4': 'video/mp4',
     '.m4v': 'video/mp4',
@@ -1795,6 +1786,10 @@ app.use(express.json())
 // URL would let something like /%75ploads/<file> or /a/../uploads/<file> slip
 // past this and be served unchecked.
 const publicStatic = express.static(path.join(__dirname, 'public'));
+// 404.html lives beside server.js (not in public/), same as editor.html.
+app.get('/404.html', (req, res) => {
+    res.status(404).sendFile(path.join(__dirname, '404.html'));
+});
 function isUploadsPath(rawPath) {
     let p;
     try { p = decodeURIComponent(rawPath); } catch (e) { return true; }
@@ -3353,7 +3348,7 @@ function renderSupportForm(opts) {
             <textarea class="box" name="message" placeholder="How can we help?" required maxlength="${MAX_SUPPORT_MSG_LENGTH}" rows="6" style="width: 260px; resize: vertical; font-family: inherit; padding: 8px; box-sizing: border-box;">${escapeHTML(v.message || '')}</textarea>
             <button type="submit" class="button" style="width: 180px;">Send</button>
         </form><br>
-        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back</button>`);
+        <button type="button" class="button" style="width: 150px" onclick="history.back()">Back</button>`);
 }
 
 app.get('/support', (req, res) => {
@@ -9975,6 +9970,11 @@ function clampLimit(raw, def, max) {
     return Math.min(n, max);
 }
 
+// SQLite timestamp ("YYYY-MM-DD HH:MM:SS", UTC) -> ISO 8601 for the API layer.
+function toISO(sqliteTimestamp) {
+    return sqliteTimestamp ? sqliteTimestamp.replace(' ', 'T') + 'Z' : null;
+}
+
 function serializeAttachmentJSON(f) {
     return {
         url: `/uploads/${path.basename(f.path)}`,
@@ -9998,7 +9998,7 @@ function serializePostJSON(post, sessionUsername, isAdmin) {
         id: post.id,
         author: serializeAuthorJSON(post.username, post.Nickname, post.avatar_path, post.IsVerified),
         content: post.content || '',
-        createdAt: post.created_at ? post.created_at.replace(' ', 'T') + 'Z' : null,
+        createdAt: toISO(post.created_at),
         edited: !!post.edited,
         pinned: !!post.pinned,
         replyTo: post.reply_to || null,
@@ -10015,7 +10015,7 @@ function serializeMessageJSON(m, meUsername) {
         author: serializeAuthorJSON(m.from_user, m.Nickname, m.avatar_path, m.IsVerified),
         toUser: m.to_user,
         content: m.content || '',
-        createdAt: m.created_at ? m.created_at.replace(' ', 'T') + 'Z' : null,
+        createdAt: toISO(m.created_at),
         edited: !!m.edited,
         replyTo: m.reply_to || null,
         read: !!m.read,
@@ -10030,7 +10030,7 @@ function serializeGroupMessageJSON(m, meUsername) {
         groupId: m.group_id,
         author: serializeAuthorJSON(m.from_user, m.Nickname, m.avatar_path, m.IsVerified),
         content: m.content || '',
-        createdAt: m.created_at ? m.created_at.replace(' ', 'T') + 'Z' : null,
+        createdAt: toISO(m.created_at),
         edited: !!m.edited,
         replyTo: m.reply_to || null,
         mine: m.from_user === meUsername,
@@ -10052,7 +10052,7 @@ function serializeNotificationJSON(n) {
         messageId: n.message_id || null,
         preview: n.content_preview || null,
         read: !!n.read,
-        createdAt: n.created_at ? n.created_at.replace(' ', 'T') + 'Z' : null,
+        createdAt: toISO(n.created_at),
         link: notifLink(n)
     };
 }
@@ -10207,7 +10207,7 @@ app.get('/api/v1/messages', requireApiAuth, (req, res) => {
         res.json({
             conversations: (convos || []).map(c => ({
                 username: c.other_user,
-                lastMessageAt: c.last_at ? c.last_at.replace(' ', 'T') + 'Z' : null
+                lastMessageAt: toISO(c.last_at)
             }))
         });
     });
@@ -10260,7 +10260,7 @@ app.get('/api/v1/groups', requireApiAuth, (req, res) => {
                     id: g.id,
                     name: g.name,
                     createdBy: g.created_by,
-                    createdAt: g.created_at ? g.created_at.replace(' ', 'T') + 'Z' : null,
+                    createdAt: toISO(g.created_at),
                     isPublic: !!g.is_public,
                     members: (members || []).map(m => m.username)
                 });
@@ -10288,7 +10288,7 @@ app.get('/api/v1/groups/public', requireApiAuth, (req, res) => {
                 id: g.id,
                 name: g.name,
                 createdBy: g.created_by,
-                createdAt: g.created_at ? g.created_at.replace(' ', 'T') + 'Z' : null,
+                createdAt: toISO(g.created_at),
                 memberCount: g.member_count,
                 viewerIsMember: !!g.is_member
             }))
@@ -10357,4 +10357,13 @@ app.get('/editor', (req, res) => {
 app.get('/v86', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Catch-all: must stay last so every route/middleware above gets a chance to
+// match first. API callers still get a JSON error; everything else gets the
+// site's themed "not found" page instead of Express's default plaintext
+// "Cannot GET /whatever".
+app.use((req, res) => {
+    if (req.path.startsWith('/api/')) return res.status(404).json({ error: 'Not found' });
+    res.status(404).sendFile(path.join(__dirname, '404.html'));
 });

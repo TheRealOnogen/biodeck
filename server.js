@@ -365,6 +365,150 @@ function applyReportedState() {
 })();
 <\/script>`;
 
+// ----- Attachment previews + drag & drop (feed/replies, DMs, group chats) -----
+// Shared CSS + JS so the "pick files, see chips above the compose box, drag
+// files in from anywhere on the page" behaviour (Discord-style) only has to
+// be written once and is included via ${ATTACH_STYLE_BLOCK} / ${ATTACH_JS_BLOCK}
+// in each compose page below.
+const ATTACH_STYLE_BLOCK = `<style>
+.attach-preview{display:none;flex-wrap:wrap;gap:8px;margin-bottom:6px;}
+.attach-chip{position:relative;display:flex;align-items:center;gap:6px;background:rgba(127,127,127,0.15);border-radius:8px;padding:4px 10px 4px 4px;max-width:200px;}
+.attach-chip.attach-chip-image{background:transparent;border:none;padding:0;max-width:128px;}
+.attach-chip-thumb{width:128px;height:128px;max-width:128px;max-height:128px;object-fit:cover;border-radius:8px;flex-shrink:0;display:block;}
+.attach-chip-icon{width:48px !important;height:48px !important;max-width:48px !important;max-height:48px !important;object-fit:contain !important;padding:6px;box-sizing:border-box;flex-shrink:0;background:rgba(127,127,127,0.25);border-radius:6px !important;}
+.attach-chip-meta{min-width:0;}
+.attach-chip-name{font-size:0.78em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:120px;}
+.attach-chip-size{font-size:0.7em;opacity:0.6;}
+.attach-chip-remove{position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;border:none;background:var(--danger-color,#e33);color:#fff;font-size:0.65em;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;}
+.drag-over{outline:2px dashed var(--accent-color,#7c8fff);outline-offset:-2px;border-radius:8px;}
+#dnd-overlay{display:none;position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;pointer-events:none;}
+#dnd-overlay div{border:3px dashed var(--accent-color,#7c8fff);border-radius:16px;padding:40px 60px;color:#fff;font-size:1.3em;font-weight:600;background:rgba(0,0,0,0.35);}
+</style>`;
+
+// inputId: the hidden <input type=file>. previewId: the chip strip above the
+// compose box. maxFiles: server-side cap for that surface (5 feed / 10 DM /
+// 10 group chat), just used client-side to stop adding past the limit early.
+// Keeps input.files in sync via DataTransfer so the existing FormData(form)
+// submit code elsewhere on each page needs no changes.
+const ATTACH_JS_BLOCK = `
+function biodeckAttachManager(inputId, previewId, maxFiles) {
+    const input = document.getElementById(inputId);
+    const preview = document.getElementById(previewId);
+    let files = [];
+    function fmtSize(b) {
+        if (!b) return '0 B';
+        const u = ['B','KB','MB','GB']; let i = 0; let n = b;
+        while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+        return (i === 0 ? n : n.toFixed(1)) + ' ' + u[i];
+    }
+    // Mirrors the server-side fileIconFor() so the compose-time chip uses the
+    // same pre-made /code.png, /text.png, /archive.png, /file.png icons that
+    // already-posted "other file" attachments use, instead of emoji.
+    const ICON_CODE_EXTS = ['.js','.mjs','.cjs','.ts','.tsx','.jsx','.c','.cpp','.cc','.cxx','.h','.hpp','.html','.htm','.css','.scss','.sass','.less','.java','.py','.rb','.go','.rs','.php','.sh','.bash','.json','.xml','.yml','.yaml','.sql','.swift','.kt','.cs','.lua','.pl'];
+    const ICON_TEXT_EXTS = ['.txt','.md','.markdown','.log','.csv','.rtf','.ini','.conf','.cfg'];
+    const ICON_ARCHIVE_EXTS = ['.zip','.rar','.7z','.tar','.gz','.bz2','.xz','.tgz','.tbz2'];
+    function fileIconForClient(name) {
+        const m = /\.[^.]+$/.exec(String(name || '').toLowerCase());
+        const ext = m ? m[0] : '';
+        if (ICON_CODE_EXTS.indexOf(ext) !== -1) return '/code.png';
+        if (ICON_TEXT_EXTS.indexOf(ext) !== -1) return '/text.png';
+        if (ICON_ARCHIVE_EXTS.indexOf(ext) !== -1) return '/archive.png';
+        return '/file.png';
+    }
+    function sync() {
+        const dt = new DataTransfer();
+        files.forEach(f => dt.items.add(f));
+        input.files = dt.files;
+    }
+    function render() {
+        preview.innerHTML = '';
+        preview.style.display = files.length ? 'flex' : 'none';
+        files.forEach((file, idx) => {
+            const chip = document.createElement('div');
+            const isImage = file.type.startsWith('image/');
+            chip.className = isImage ? 'attach-chip attach-chip-image' : 'attach-chip';
+            if (isImage) {
+                // Images: just the thumbnail, no filename/size clutter.
+                const img = document.createElement('img');
+                img.className = 'attach-chip-thumb';
+                img.src = URL.createObjectURL(file);
+                img.alt = file.name;
+                chip.appendChild(img);
+            } else {
+                const icon = document.createElement('img');
+                icon.className = 'attach-chip-icon';
+                icon.src = fileIconForClient(file.name);
+                icon.alt = '';
+                icon.width = 24;
+                icon.height = 24;
+                chip.appendChild(icon);
+                const meta = document.createElement('div');
+                meta.className = 'attach-chip-meta';
+                const nameEl = document.createElement('div');
+                nameEl.className = 'attach-chip-name';
+                nameEl.title = file.name;
+                nameEl.textContent = file.name;
+                const sizeEl = document.createElement('div');
+                sizeEl.className = 'attach-chip-size';
+                sizeEl.textContent = fmtSize(file.size);
+                meta.appendChild(nameEl);
+                meta.appendChild(sizeEl);
+                chip.appendChild(meta);
+            }
+            const rm = document.createElement('button');
+            rm.type = 'button';
+            rm.className = 'attach-chip-remove';
+            rm.textContent = '✕';
+            rm.title = 'Remove';
+            rm.onclick = function () { files.splice(idx, 1); sync(); render(); };
+            chip.appendChild(rm);
+            preview.appendChild(chip);
+        });
+    }
+    function addFiles(list) {
+        Array.from(list).forEach(f => {
+            if (files.length >= maxFiles) return;
+            if (!files.some(e => e.name === f.name && e.size === f.size && e.lastModified === f.lastModified)) files.push(f);
+        });
+        sync();
+        render();
+    }
+    function clear() { files = []; sync(); render(); }
+    input.addEventListener('change', function () { addFiles(input.files); });
+    return { addFiles: addFiles, clear: clear, getFiles: function () { return files; } };
+}
+function biodeckWireDrop(dropZoneId, attachMgr) {
+    const zone = document.getElementById(dropZoneId);
+    const overlay = document.getElementById('dnd-overlay');
+    let counter = 0;
+    function hasFiles(e) { return e.dataTransfer && e.dataTransfer.types && Array.prototype.indexOf.call(e.dataTransfer.types, 'Files') !== -1; }
+    window.addEventListener('dragenter', function (e) {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        counter++;
+        if (overlay) overlay.style.display = 'flex';
+    });
+    window.addEventListener('dragover', function (e) { if (hasFiles(e)) e.preventDefault(); });
+    window.addEventListener('dragleave', function (e) {
+        if (!hasFiles(e)) return;
+        counter = Math.max(0, counter - 1);
+        if (counter === 0 && overlay) overlay.style.display = 'none';
+    });
+    window.addEventListener('drop', function (e) {
+        if (!hasFiles(e)) return;
+        e.preventDefault();
+        counter = 0;
+        if (overlay) overlay.style.display = 'none';
+        if (e.dataTransfer.files && e.dataTransfer.files.length) attachMgr.addFiles(e.dataTransfer.files);
+    });
+    if (zone) {
+        zone.addEventListener('dragover', function (e) { if (hasFiles(e)) zone.classList.add('drag-over'); });
+        zone.addEventListener('dragleave', function () { zone.classList.remove('drag-over'); });
+        zone.addEventListener('drop', function () { zone.classList.remove('drag-over'); });
+    }
+}
+`;
+
 // Server-push ban enforcement. The server emits a 'banned' event down this SSE
 // stream when an admin bans the user - no polling, nothing the client can fake.
 const USER_EVENTS_SCRIPT = `<script>
@@ -916,12 +1060,12 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
     if (images.length === 1) {
         const f = images[0];
         const url = `/uploads/${path.basename(f.path)}`;
-        html += `<div class="post-file"><img src="${url}" alt="${escapeHTML(f.name || '')}" style="max-height:${maxHeight}px;max-width:${maxWidth};width:auto;height:auto;border-radius:10px;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"></div>`;
+        html += `<div class="post-file"><img class="post-media-boxed" src="${url}" alt="${escapeHTML(f.name || '')}" style="max-height:${maxHeight}px;max-width:${maxWidth};width:auto;height:auto;margin-top:8px;display:block;margin-left:auto;margin-right:auto;"></div>`;
     } else if (images.length > 1) {
         const cols = Math.min(3, images.length);
         const cells = images.map(f => {
             const url = `/uploads/${path.basename(f.path)}`;
-            return `<a href="${downloadUrlFor(f)}" style="display:block;width:100%;aspect-ratio:1/1;overflow:hidden;border-radius:8px;"><img src="${url}" alt="${escapeHTML(f.name || '')}" style="width:100%;height:100%;object-fit:cover;display:block;"></a>`;
+            return `<a class="post-media-grid-item" href="${downloadUrlFor(f)}"><img src="${url}" alt="${escapeHTML(f.name || '')}" style="width:100%;height:100%;object-fit:cover;display:block;"></a>`;
         }).join('');
         html += `<div class="post-file" style="display:grid;grid-template-columns:repeat(${cols},1fr);gap:6px;margin-top:8px;max-width:${maxWidth};margin-left:auto;margin-right:auto;">${cells}</div>`;
     }
@@ -942,7 +1086,7 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
                 try { size = fs.statSync(f.path).size; } catch (e) { /* file missing on disk - just omit size */ }
             }
             const sizeLine = size != null ? `<div style="font-size:0.8em;opacity:0.6;">${formatFileSize(size)}</div>` : '';
-            html += `<a href="${downloadUrlFor(f)}" style="display:inline-flex;align-items:center;justify-content:flex-start;gap:12px;margin-top:8px;padding:10px 12px;border-radius:10px;background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);text-decoration:none;color:inherit;max-width:${maxWidth};box-sizing:border-box;"><img src="${fileIconFor(ext)}" alt="" style="width:auto;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
+            html += `<a class="post-file-link" href="${downloadUrlFor(f)}" style="max-width:${maxWidth};"><img src="${fileIconFor(ext)}" alt="" style="width:auto;height:48px;flex-shrink:0;border-radius:0;"><div style="min-width:0;overflow:hidden;"><div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escapeHTML(f.name)}</div>${sizeLine}</div></a>`;
         }
     });
 
@@ -4032,8 +4176,11 @@ app.get('/feed', (req, res) => {
 <title>Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+${ATTACH_STYLE_BLOCK}
+<script>${ATTACH_JS_BLOCK}</script>
 </head>
 <body class="page-feed">
+    <div id="dnd-overlay"><div>Drop files to attach</div></div>
     <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
@@ -4077,13 +4224,13 @@ app.get('/feed', (req, res) => {
 
         <div id="post-form-container">
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
+                <div id="post-attach-preview" class="attach-preview"></div>
                 <div id="post-form-row">
                     <textarea class="box" name="content" id="post-content" placeholder="What's on your mind?" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
                     <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
                     <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Post</button>
                 </div>
-                <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
             </form>
         </div>
@@ -4133,10 +4280,8 @@ app.get('/feed', (req, res) => {
         })();
         window.addEventListener('resize', layoutPinnedBar);
 
-        document.getElementById('attachment').addEventListener('change', function () {
-            const n = this.files.length;
-            document.getElementById('file-name-display').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 5)';
-        });
+        const postAttachMgr = biodeckAttachManager('attachment', 'post-attach-preview', 5);
+        biodeckWireDrop('post-form-container', postAttachMgr);
 
         const postContent = document.getElementById('post-content');
         const postCounter = document.getElementById('post-char-counter');
@@ -4160,13 +4305,12 @@ app.get('/feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                // Always clear the file input after a submit attempt, success or
+                // Always clear attachments after a submit attempt, success or
                 // not - otherwise a rejected/failed post left the previously
-                // chosen file silently sitting in the input, so the *next*
-                // submit would resend it even though "No file chosen" (or
+                // chosen files silently sitting in the picker, so the *next*
+                // submit would resend them even though the preview strip (or
                 // nothing) is what the person actually sees on screen.
-                attachmentInput.value = '';
-                document.getElementById('file-name-display').textContent = 'No file chosen';
+                postAttachMgr.clear();
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
@@ -4881,8 +5025,11 @@ app.get('/following-feed', (req, res) => {
 <title>Following Feed</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+${ATTACH_STYLE_BLOCK}
+<script>${ATTACH_JS_BLOCK}</script>
 </head>
 <body class="page-following-feed">
+    <div id="dnd-overlay"><div>Drop files to attach</div></div>
     <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${sessionUsername}</strong></div>
@@ -4921,13 +5068,13 @@ app.get('/following-feed', (req, res) => {
             <div id="reply-indicator">> Replying to <span id="reply-to-name"></span> - <a href="#" onclick="clearReply();return false;" style="color:var(--accent-color);">Cancel</a></div>
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <input type="hidden" name="reply_to" id="reply-to-input" value="">
+                <div id="post-attach-preview" class="attach-preview"></div>
                 <div id="post-form-row">
                     <textarea name="content" id="post-content" placeholder="What's on your mind?" maxlength="1000"></textarea>
                     <input type="file" name="attachments" id="attachment" multiple style="display:none;">
                     <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
                     <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Post</button>
                 </div>
-                <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
             </form>
         </div>
@@ -4939,10 +5086,8 @@ app.get('/following-feed', (req, res) => {
             if (ts) el.textContent = new Date(ts).toLocaleString('en-GB');
         });
 
-        document.getElementById('attachment').addEventListener('change', function () {
-            const n = this.files.length;
-            document.getElementById('file-name-display').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 5)';
-        });
+        const postAttachMgr = biodeckAttachManager('attachment', 'post-attach-preview', 5);
+        biodeckWireDrop('post-form-container', postAttachMgr);
 
         const postContent = document.getElementById('post-content');
         const postCounter = document.getElementById('post-char-counter');
@@ -4982,8 +5127,7 @@ app.get('/following-feed', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                attachmentInput.value = '';
-                document.getElementById('file-name-display').textContent = 'No file chosen';
+                postAttachMgr.clear();
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
@@ -5354,8 +5498,11 @@ app.get('/post/:id', (req, res) => {
 <title>Post</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+${ATTACH_STYLE_BLOCK}
+<script>${ATTACH_JS_BLOCK}</script>
 </head>
 <body class="page-post">
+    <div id="dnd-overlay"><div>Drop files to attach</div></div>
     <div id="feed-wrapper" class="box" style="color: var(--text-color); animation: none !important;">
         <div id="feed-topbar">
             <div id="feed-topbar-left">${isLoggedIn ? `Logged in as <strong>${req.session.userUsername}</strong>` : 'Viewing as guest'}</div>
@@ -5401,13 +5548,13 @@ app.get('/post/:id', (req, res) => {
             ${isLoggedIn ? `
             <form action="/feed/post" method="POST" enctype="multipart/form-data" id="post-form">
                 <input type="hidden" name="reply_to" value="${rootPost.id}">
+                <div id="post-attach-preview" class="attach-preview"></div>
                 <div id="post-form-row">
                     <textarea class="box" name="content" id="post-content" placeholder="Write a reply…" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="1000"></textarea>
                     <input type="file" id="attachment" name="attachments" multiple style="display:none;">
                     <label for="attachment" class="button post-action-btn" id="file-label" style="width:70px !important; height: 44px !important; padding: 10px;">Browse</label>
                     <button class="button post-action-btn" type="submit" style="width:60px !important; height: 44px !important;">Reply</button>
                 </div>
-                <div id="file-name-display">No file chosen</div>
                 <div id="post-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 1000</div>
             </form>` : `
             <div style="text-align:center;padding:10px;opacity:0.7;">
@@ -5423,10 +5570,8 @@ app.get('/post/:id', (req, res) => {
         });
 
         ${isLoggedIn ? `
-        document.getElementById('attachment').addEventListener('change', function () {
-            const n = this.files.length;
-            document.getElementById('file-name-display').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 5)';
-        });
+        const postAttachMgr = biodeckAttachManager('attachment', 'post-attach-preview', 5);
+        biodeckWireDrop('post-form-container', postAttachMgr);
 
         const postContent = document.getElementById('post-content');
         const postCounter = document.getElementById('post-char-counter');
@@ -5463,8 +5608,7 @@ app.get('/post/:id', (req, res) => {
             const fd = new FormData(postForm);
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
-                attachmentInput.value = '';
-                document.getElementById('file-name-display').textContent = 'No file chosen';
+                postAttachMgr.clear();
                 if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to reply until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
@@ -6443,8 +6587,11 @@ app.get('/messages/:username', (req, res) => {
 <title>Chat with ${other}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+${ATTACH_STYLE_BLOCK}
+<script>${ATTACH_JS_BLOCK}</script>
 </head>
 <body class="page-chat">
+    <div id="dnd-overlay"><div>Drop files to attach</div></div>
     <div id="chat-topbar">
         <div id="chat-topbar-left">Chat with <strong><a href="/user/${other}" class="msg-sender-name" style="text-decoration:none;">@${other}</a></strong></div>
         <div id="chat-topbar-right" style="position:relative;display:flex;align-items:center;">
@@ -6468,13 +6615,13 @@ app.get('/messages/:username', (req, res) => {
         <div id="chat-reply-indicator">Replying to <span id="chat-reply-to-name"></span> &nbsp;<a href="#" onclick="clearReply();return false;" style="color:var(--accent-color);">cancel</a></div>
         <form action="/messages/${other}/send" method="POST" enctype="multipart/form-data" id="chat-form">
             <input type="hidden" name="reply_to" id="chat-reply-to-input" value="">
+            <div id="chat-attach-preview" class="attach-preview"></div>
             <div id="chat-form-row">
                 <textarea class="box" name="content" id="chat-content" placeholder="Message @${other}..." style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
                 <input type="file" id="chat-attachment" name="attachments" multiple style="display:none;">
                 <label for="chat-attachment" class="button chat-action-btn" style="display:inline-flex;align-items:center;justify-content:center;cursor:pointer;">Browse</label>
                 <button class="button chat-action-btn" type="submit">Send</button>
             </div>
-            <div id="chat-file-name">No file chosen</div>
             <div id="chat-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 4000</div>
         </form>
     </div>
@@ -6560,10 +6707,8 @@ app.get('/messages/:username', (req, res) => {
             if (!document.hidden && (!chatStream || chatStream.readyState === 2)) connectChatStream();
         });
 
-        document.getElementById('chat-attachment').addEventListener('change', function () {
-            const n = this.files.length;
-            document.getElementById('chat-file-name').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 10)';
-        });
+        const chatAttachMgr = biodeckAttachManager('chat-attachment', 'chat-attach-preview', 10);
+        biodeckWireDrop('chat-input-bar', chatAttachMgr);
 
         const chatContent = document.getElementById('chat-content');
         const chatCounter = document.getElementById('chat-char-counter');
@@ -6676,8 +6821,7 @@ app.get('/messages/:username', (req, res) => {
                     chatCounter.textContent = '0 / 4000';
                     chatCounter.style.opacity = '0.5';
                     chatCounter.style.color = '';
-                    fileInput.value = '';
-                    document.getElementById('chat-file-name').textContent = 'No file chosen';
+                    chatAttachMgr.clear();
                     clearReply();
                 }
             } catch (err) {
@@ -9500,8 +9644,11 @@ app.get('/groups/:id', (req, res) => {
 <title>${escapeHTML(group.name)}</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Quicksand:wght@300..700&display=swap">
 <link rel="stylesheet" href="/theme.css">
+${ATTACH_STYLE_BLOCK}
+<script>${ATTACH_JS_BLOCK}</script>
 </head>
 <body class="page-group-chat">
+    <div id="dnd-overlay"><div>Drop files to attach</div></div>
     <div id="gc-chat-topbar">
         <div style="font-weight:bold;">${escapeHTML(group.name)} ${group.is_public ? '<span id="gc-public-badge" style="font-size:0.65em;font-weight:400;opacity:0.6;border:1px solid rgba(255,255,255,0.3);border-radius:10px;padding:1px 7px;vertical-align:middle;">Public</span>' : '<span id="gc-public-badge" style="display:none;font-size:0.65em;font-weight:400;opacity:0.6;border:1px solid rgba(255,255,255,0.3);border-radius:10px;padding:1px 7px;vertical-align:middle;">Public</span>'}</div>
         <div id="gc-chat-topbar-right">
@@ -9548,13 +9695,13 @@ app.get('/groups/:id', (req, res) => {
         <div id="gc-reply-indicator">Replying to <span id="gc-reply-to-name"></span> &nbsp;<a href="#" onclick="clearGCReply();return false;" style="color:var(--accent-color);">cancel</a></div>
         <form action="/groups/${groupId}/send" method="POST" enctype="multipart/form-data" id="gc-form">
             <input type="hidden" name="reply_to" id="gc-reply-to-input" value="">
+            <div id="gc-attach-preview" class="attach-preview"></div>
             <div id="gc-form-row">
                 <textarea class="box" name="content" id="gc-content" placeholder="Message ${escapeHTML(group.name)}…" style="font-family:inherit;font-size:inherit;padding:8px;" maxlength="4000"></textarea>
                 <input type="file" id="gc-attachment" name="attachments" multiple style="display:none;">
                 <label for="gc-attachment" class="button" style="padding: 0 !important;height: 35px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;">Browse</label>
                 <button class="button" style="padding: 0 !important;height: 44px !important;width: 70px !important;font-size: 0.85em !important;line-height: 1 !important;" type="submit">Send</button>
             </div>
-            <div id="gc-file-name">No file chosen</div>
             <div id="gc-char-counter" style="font-size:0.75em;opacity:0.5;text-align:right;margin-top:2px;">0 / 4000</div>
         </form>
     </div>
@@ -9639,10 +9786,8 @@ app.get('/groups/:id', (req, res) => {
             if (!document.hidden && (!gcStream || gcStream.readyState === 2)) connectGCStream();
         });
 
-        document.getElementById('gc-attachment').addEventListener('change', function () {
-            const n = this.files.length;
-            document.getElementById('gc-file-name').textContent = n === 0 ? 'No file chosen' : n === 1 ? this.files[0].name : n + ' files selected (max 10)';
-        });
+        const gcAttachMgr = biodeckAttachManager('gc-attachment', 'gc-attach-preview', 10);
+        biodeckWireDrop('gc-chat-input-bar', gcAttachMgr);
         const gcContent = document.getElementById('gc-content');
         const gcCounter = document.getElementById('gc-char-counter');
         gcContent.addEventListener('input', function () {
@@ -9755,8 +9900,7 @@ app.get('/groups/:id', (req, res) => {
                     gcCounter.textContent = '0 / 4000';
                     gcCounter.style.opacity = '0.5';
                     gcCounter.style.color = '';
-                    fileInput.value = '';
-                    document.getElementById('gc-file-name').textContent = 'No file chosen';
+                    gcAttachMgr.clear();
                     clearGCReply();
                 }
             } catch (err) {

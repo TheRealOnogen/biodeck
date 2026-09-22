@@ -24,6 +24,46 @@
   --msg-other-bg: rgba(0, 0, 0, 0.05); /* other people's DM/GC message bubble */
   --msg-other-border: rgba(0, 0, 0, 0.15);
   --post-border-color: rgba(0, 0, 0, 0.15); /* profile page post border */
+  --file-box-bg: rgba(0, 0, 0, 0.05);   /* box behind uploaded images/files in posts & messages */
+  --file-box-border: rgba(0, 0, 0, 0.15);
+}
+
+/* Uploaded image/file attachment framing, built by renderAttachmentsHTML() in
+   server.js. A visible box/border keeps an attachment legible even when its
+   own colors blend into the theme background (e.g. a light image on a light
+   theme). */
+.post-media-boxed {
+  background: var(--file-box-bg);
+  border: 1px solid var(--file-box-border);
+  border-radius: 10px;
+  padding: 6px;
+  box-sizing: border-box;
+}
+
+.post-media-grid-item {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--file-box-bg);
+  border: 1px solid var(--file-box-border);
+  box-sizing: border-box;
+}
+
+.post-file-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: var(--file-box-bg);
+  border: 1px solid var(--file-box-border);
+  text-decoration: none;
+  color: inherit;
+  box-sizing: border-box;
 }
 
 @keyframes slideInFromUp {

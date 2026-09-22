@@ -3369,7 +3369,7 @@ function renderSupportForm(opts) {
             <textarea class="box" name="message" placeholder="How can we help?" required maxlength="${MAX_SUPPORT_MSG_LENGTH}" rows="6" style="width: 260px; resize: vertical; font-family: inherit; padding: 8px; box-sizing: border-box;">${escapeHTML(v.message || '')}</textarea>
             <button type="submit" class="button" style="width: 180px;">Send</button>
         </form><br>
-        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back</button>`);
+        <button type="button" class="button" style="width: 150px" onclick="history.back()">Back</button>`);
 }
 
 app.get('/support', (req, res) => {

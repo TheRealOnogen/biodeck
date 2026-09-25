@@ -8439,6 +8439,11 @@ function hardDeleteAccount(username, reason, callback) {
             db.run(`DELETE FROM Notifications WHERE username = ? OR actor_username = ?`, [username, username]);
             db.run(`DELETE FROM Group_Chat_Members WHERE username = ?`, [username]);
             db.run(`DELETE FROM Group_Chat_Messages WHERE from_user = ?`, [username]);
+            // Warnings are keyed by username (not user_id), and hard-delete frees
+            // the username for reuse - without this, a brand new account created
+            // with the same username would inherit the deleted user's entire
+            // warning history and standing.
+            db.run(`DELETE FROM Warnings WHERE username = ?`, [username]);
             db.run(`DELETE FROM User_Data WHERE username = ?`, [username], function (err2) {
                 if (err2) return callback(err2);
                 if (this.changes === 0) return callback(new Error('user not found'));

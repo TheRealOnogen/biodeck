@@ -840,19 +840,19 @@ body.page-post .post-action-btn {
   margin: 0;
   text-align: center;
   color: var(--text-color);
-  background-color: white;
+  background-color: black;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
 body.page-post .post-action-btn:hover {
-  background-color: black;
-  color: white;
+  background-color: white;
+  color: black;
 }
 body.page-post .post-action-btn.clicked {
-  background-color: white !important;
-  color: black !important;
+  background-color: black !important;
+  color: white !important;
 }
 body.page-post #thread-root {
   max-width: 600px;

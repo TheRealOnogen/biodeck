@@ -4,6 +4,7 @@
 $ git clone https://git.onogenatedwater.dpdns.org/GizmoTM_Inc/Biodeck
 $ cd Biodeck
 $ npm install
+$ cp vars.env.public vars.env 
 $ node server.js
 ```
 Boom, biodeck works

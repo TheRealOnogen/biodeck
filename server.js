@@ -4464,7 +4464,16 @@ ${ATTACH_STYLE_BLOCK}
             return max;
         })();
 
+        let pollFeedInFlight = false;
         function pollFeed() {
+            // Guard against overlapping calls: submitPostForm() calls this right
+            // after a successful post, and setInterval/visibilitychange can also
+            // fire it around the same moment. Without this guard, two requests
+            // could both be sent with the same after=lastPostId value before either
+            // resolves, so both responses would contain the same new post(s) and
+            // both would get inserted - showing the post twice on screen.
+            if (pollFeedInFlight) return;
+            pollFeedInFlight = true;
             fetch('/feed/poll?after=' + lastPostId)
                 .then(r => r.ok ? r.json() : null)
                 .then(data => {
@@ -4483,7 +4492,8 @@ ${ATTACH_STYLE_BLOCK}
                         if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
                     });
                 })
-                .catch(() => {});
+                .catch(() => {})
+                .finally(() => { pollFeedInFlight = false; });
         }
 
         function pollDeletions() {
@@ -5253,7 +5263,12 @@ ${ATTACH_STYLE_BLOCK}
             return max;
         })();
 
+        let pollFeedInFlight = false;
         function pollFeed() {
+            // Same overlapping-request race as /feed's pollFeed - guard it the
+            // same way so a just-submitted post can't get inserted twice.
+            if (pollFeedInFlight) return;
+            pollFeedInFlight = true;
             fetch('/following-feed/poll?after=' + lastPostId)
                 .then(r => r.ok ? r.json() : null)
                 .then(data => {
@@ -5271,7 +5286,8 @@ ${ATTACH_STYLE_BLOCK}
                         if (!el.textContent.trim()) el.textContent = new Date(el.getAttribute('data-ts')).toLocaleString('en-GB');
                     });
                 })
-                .catch(() => {});
+                .catch(() => {})
+                .finally(() => { pollFeedInFlight = false; });
         }
 
         function pollDeletions() {

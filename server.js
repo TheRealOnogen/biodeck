@@ -5776,7 +5776,16 @@ ${ATTACH_STYLE_BLOCK}
             return max;
         })();
 
+        let pollRepliesInFlight = false;
         function pollReplies() {
+            // Same overlapping-request race as the feed's pollFeed: submitPostForm()
+            // calls this right after a reply posts, and setInterval/visibilitychange
+            // can also fire it around the same moment. Without this guard, two
+            // requests can both go out with the same after=lastReplyId before either
+            // resolves, so both responses contain the same new reply and it gets
+            // inserted twice.
+            if (pollRepliesInFlight) return;
+            pollRepliesInFlight = true;
             fetch('/post/' + ROOT_ID + '/poll?after=' + lastReplyId)
                 .then(r => r.ok ? r.json() : null)
                 .then(data => {
@@ -5801,7 +5810,8 @@ ${ATTACH_STYLE_BLOCK}
                         if (counterEl) counterEl.textContent = (parseInt(counterEl.textContent) || 0) + addedCount;
                     }
                 })
-                .catch(() => {});
+                .catch(() => {})
+                .finally(() => { pollRepliesInFlight = false; });
         }
 
         function pollDeletions() {

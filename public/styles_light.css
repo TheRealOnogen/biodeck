@@ -26,6 +26,9 @@
   --post-border-color: rgba(0, 0, 0, 0.15); /* profile page post border */
   --file-box-bg: rgba(0, 0, 0, 0.05);   /* box behind uploaded images/files in posts & messages */
   --file-box-border: rgba(0, 0, 0, 0.15);
+  --popover-bg: white;  /* solid/opaque surface for floating menus, e.g. the reaction picker */
+  --popover-border: rgb(77, 77, 77);
+  --popover-border-radius: 10px;
 }
 
 /* Uploaded image/file attachment framing, built by renderAttachmentsHTML() in
@@ -91,7 +94,7 @@ body {
 }
 .box {
   padding: 10px;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   animation: slideInFromUp 1s ease-out forwards;
@@ -105,7 +108,7 @@ textarea.box {
   width: 80px;
   height: 20px;
   padding: 10px;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -119,12 +122,12 @@ textarea.box {
   transition: 0.2s;
 }
 .button:hover {
-  background-color: black;
+  background-color: rgb(77, 77, 77);
   color: white;
 }
 .button.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 .post-content {
   word-break: break-word;
@@ -149,7 +152,7 @@ textarea.box {
   color: var(--accent-color);
 }
 .msg-reply-banner {
-  border-left: 3px solid black;
+  border-left: 3px solid rgb(77, 77, 77);
 }
 .msg-delete-link {
   color: var(--danger-color);
@@ -186,7 +189,7 @@ input[type="password"] {
   box-sizing: border-box;
   height: 20px;
   padding: 10px;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   border-radius: 10px;
   color: var(--text-color);
   background-color: white;
@@ -225,7 +228,7 @@ body.page-edit .dash-textarea {
   box-sizing: border-box;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -268,7 +271,7 @@ body.page-feed #feed-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-feed #feed-topbar-left {
@@ -331,7 +334,7 @@ body.page-feed #feed-topbar-right a.active {
 body.page-feed #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -346,7 +349,7 @@ body.page-feed #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -447,7 +450,7 @@ body.page-feed #post-form-container {
   left: 0;
   right: 0;
   background: white;
-  border-top: 2px solid black;
+  border-top: 2px solid rgb(77, 77, 77);
   padding: 10px 20px;
   z-index: 100;
 }
@@ -472,7 +475,7 @@ body.page-feed #post-form-row textarea {
   min-width: 0;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -503,7 +506,7 @@ body.page-feed .post-action-btn {
   font-size: 0.85em !important;
   line-height: 1 !important;
   box-sizing: border-box !important;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -516,12 +519,12 @@ body.page-feed .post-action-btn {
   transition: 0.2s;
 }
 body.page-feed .post-action-btn:hover {
-  background-color: black;
+  background-color: rgb(77, 77, 77);
   color: white;
 }
 body.page-feed .post-action-btn.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 
 /* ===== /following-feed ===== */
@@ -551,7 +554,7 @@ body.page-following-feed #feed-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
   gap: 12px;
 }
@@ -576,7 +579,7 @@ body.page-following-feed #feed-topbar-right a.active {
 body.page-following-feed #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -591,7 +594,7 @@ body.page-following-feed #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -637,7 +640,7 @@ body.page-following-feed #post-form-container {
   left: 0;
   right: 0;
   background: white;
-  border-top: 2px solid black;
+  border-top: 2px solid rgb(77, 77, 77);
   padding: 10px 20px;
   z-index: 100;
 }
@@ -662,7 +665,7 @@ body.page-following-feed #post-form-row textarea {
   min-width: 0;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -693,7 +696,7 @@ body.page-following-feed .post-action-btn {
   font-size: 0.85em !important;
   line-height: 1 !important;
   box-sizing: border-box !important;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -706,12 +709,12 @@ body.page-following-feed .post-action-btn {
   transition: 0.2s;
 }
 body.page-following-feed .post-action-btn:hover {
-  background-color: black;
+  background-color: rgb(77, 77, 77);
   color: white;
 }
 body.page-following-feed .post-action-btn.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 
 /* ===== /post/:id ===== */
@@ -741,7 +744,7 @@ body.page-post #feed-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-post #feed-topbar-left {
@@ -763,7 +766,7 @@ body.page-post #feed-topbar-right a:hover {
 body.page-post #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -779,7 +782,7 @@ body.page-post #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -820,7 +823,7 @@ body.page-post #post-form-container {
   left: 0;
   right: 0;
   background: white;
-  border-top: 2px solid black;
+  border-top: 2px solid rgb(77, 77, 77);
   padding: 10px 20px;
   z-index: 100;
 }
@@ -838,7 +841,7 @@ body.page-post #post-form-row textarea {
   min-width: 0;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -869,7 +872,7 @@ body.page-post .post-action-btn {
   font-size: 0.85em !important;
   line-height: 1 !important;
   box-sizing: border-box !important;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -882,12 +885,12 @@ body.page-post .post-action-btn {
   transition: 0.2s;
 }
 body.page-post .post-action-btn:hover {
-  background-color: black;
+  background-color: rgb(77, 77, 77);
   color: white;
 }
 body.page-post .post-action-btn.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 body.page-post #thread-root {
   max-width: 600px;
@@ -936,7 +939,7 @@ body.page-friends #friends-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-friends #friends-topbar-left {
@@ -958,7 +961,7 @@ body.page-friends #friends-content {
 body.page-friends #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -974,7 +977,7 @@ body.page-friends #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1041,7 +1044,7 @@ body.page-followers #followers-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-followers #followers-topbar-left {
@@ -1063,7 +1066,7 @@ body.page-followers #followers-topbar-right a:hover {
 body.page-followers #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1079,7 +1082,7 @@ body.page-followers #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1138,7 +1141,7 @@ body.page-profile #profile-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
   gap: 12px;
 }
@@ -1167,7 +1170,7 @@ body.page-profile #profile-topbar-right a:hover {
 body.page-profile #profile-nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1183,7 +1186,7 @@ body.page-profile #profile-nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1269,7 +1272,7 @@ body.page-messages #msg-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-messages #msg-topbar-left {
@@ -1286,7 +1289,7 @@ body.page-messages #msg-topbar-right a:hover {
 body.page-messages #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1302,7 +1305,7 @@ body.page-messages #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1365,7 +1368,7 @@ body.page-chat #chat-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
   flex-shrink: 0;
 }
@@ -1383,7 +1386,7 @@ body.page-chat #chat-topbar-right a:hover {
 body.page-chat #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1399,7 +1402,7 @@ body.page-chat #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1443,7 +1446,7 @@ body.page-chat #chat-input-bar {
   left: 0;
   right: 0;
   background: white;
-  border-top: 2px solid black;
+  border-top: 2px solid rgb(77, 77, 77);
   padding: 10px 20px;
   z-index: 100;
 }
@@ -1468,7 +1471,7 @@ body.page-chat #chat-form-row textarea {
   min-width: 0;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -1488,7 +1491,7 @@ body.page-chat .chat-action-btn {
   font-size: 0.85em !important;
   line-height: 1 !important;
   box-sizing: border-box !important;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -1502,12 +1505,12 @@ body.page-chat .chat-action-btn {
   transition: 0.2s;
 }
 body.page-chat .chat-action-btn:hover {
-  background-color: black;
+  background-color: rgb(77, 77, 77);
   color: white;
 }
 body.page-chat .chat-action-btn.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 
 /* ===== /notifications ===== */
@@ -1532,7 +1535,7 @@ body.page-notifications #notif-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-notifications #notif-topbar-left {
@@ -1554,7 +1557,7 @@ body.page-notifications #notif-topbar-right a.active {
 body.page-notifications #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1570,7 +1573,7 @@ body.page-notifications #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1618,7 +1621,7 @@ body.page-notifications .notif-item:hover {
   background: rgba(0, 0, 0, 0.06) !important;
 }
 body.page-notifications .active-filter {
-  background: black !important;
+  background: rgb(77, 77, 77) !important;
   color: white !important;
 }
 
@@ -1643,7 +1646,7 @@ body.page-admin #topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-admin #topbar a {
@@ -1657,7 +1660,7 @@ body.page-admin #topbar a:hover {
 body.page-admin #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1673,7 +1676,7 @@ body.page-admin #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1740,7 +1743,7 @@ body.page-admin select {
   box-sizing: border-box;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 8px;
   padding: 8px 10px;
   font-family: inherit;
@@ -1820,7 +1823,7 @@ body.page-groups #gc-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
 }
 body.page-groups #gc-topbar-right {
@@ -1839,7 +1842,7 @@ body.page-groups #gc-topbar-right a:hover {
 body.page-groups #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -1855,7 +1858,7 @@ body.page-groups #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -1901,7 +1904,7 @@ body.page-groups #create-gc-form {
 body.page-groups #create-gc-form input {
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 8px;
   padding: 8px 12px;
   font-family: inherit;
@@ -1921,7 +1924,7 @@ body.page-groups #friends-picker-modal.open {
 }
 body.page-groups #friends-picker-box {
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 14px;
   padding: 24px;
   width: 340px;
@@ -1961,7 +1964,7 @@ body.page-groups .friend-pick-row input[type="checkbox"] {
 body.page-groups #friends-picker-search {
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 8px;
   padding: 6px 10px;
   font-family: inherit;
@@ -2008,7 +2011,7 @@ body.page-groups #gc-add-picker-modal.open {
 }
 body.page-groups #gc-add-picker-box {
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 14px;
   padding: 24px;
   width: 340px;
@@ -2028,7 +2031,7 @@ body.page-groups #gc-add-picker-list {
 body.page-groups #gc-add-picker-search {
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 8px;
   padding: 6px 10px;
   font-family: inherit;
@@ -2058,7 +2061,7 @@ body.page-group-chat #gc-chat-topbar {
   align-items: center;
   padding: 10px 20px;
   background: white;
-  border-bottom: 2px solid black;
+  border-bottom: 2px solid rgb(77, 77, 77);
   z-index: 100;
   gap: 12px;
 }
@@ -2078,7 +2081,7 @@ body.page-group-chat #gc-chat-topbar-right a:hover {
 body.page-group-chat #nav-hamburger {
   display: none;
   background: none;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 6px;
   color: var(--text-color);
   font-size: 1.1em;
@@ -2094,7 +2097,7 @@ body.page-group-chat #nav-dropdown {
   top: 100%;
   right: 0;
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px 0;
   min-width: 160px;
@@ -2153,7 +2156,7 @@ body.page-group-chat #gc-chat-input-bar {
   left: 0;
   right: 0;
   background: white;
-  border-top: 2px solid black;
+  border-top: 2px solid rgb(77, 77, 77);
   padding: 10px 20px;
   z-index: 100;
 }
@@ -2178,7 +2181,7 @@ body.page-group-chat #gc-form-row textarea {
   min-width: 0;
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 10px;
   padding: 8px;
   font-family: inherit;
@@ -2198,7 +2201,7 @@ body.page-group-chat .gc-action-btn {
   font-size: 0.85em !important;
   line-height: 1 !important;
   box-sizing: border-box !important;
-  border: 5px solid black;
+  border: 5px solid rgb(77, 77, 77);
   margin: 0;
   text-align: center;
   border-radius: 15px;
@@ -2216,7 +2219,7 @@ body.page-group-chat .gc-action-btn:hover {
 }
 body.page-group-chat .gc-action-btn.clicked {
   background-color: white !important;
-  color: black !important;
+  color: rgb(77, 77, 77) !important;
 }
 body.page-group-chat #add-member-row {
   display: flex;
@@ -2238,7 +2241,7 @@ body.page-group-chat #gc-add-picker-modal.open {
 }
 body.page-group-chat #gc-add-picker-box {
   background: white;
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 14px;
   padding: 24px;
   width: 320px;
@@ -2258,7 +2261,7 @@ body.page-group-chat #gc-add-picker-list {
 body.page-group-chat #gc-add-picker-search {
   background: white;
   color: var(--text-color);
-  border: 2px solid black;
+  border: 2px solid rgb(77, 77, 77);
   border-radius: 8px;
   padding: 6px 10px;
   font-family: inherit;

@@ -26,6 +26,9 @@
   --post-border-color: rgba(255, 255, 255, 0.2); /* profile page post border */
   --file-box-bg: rgba(255, 255, 255, 0.05);   /* box behind uploaded images/files in posts & messages */
   --file-box-border: rgba(255, 255, 255, 0.12);
+  --popover-bg: rgb(32, 32, 32);     /* solid/opaque surface for floating menus, e.g. the reaction picker */
+  --popover-border: rgba(255, 255, 255, 0.15);
+  --popover-border-radius: 10px;
 }
 
 /* Uploaded image/file attachment framing, built by renderAttachmentsHTML() in

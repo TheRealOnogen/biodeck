@@ -26,6 +26,9 @@
   --post-border-color: rgba(0, 0, 0, 0.15); /* profile page post border */
   --file-box-bg: rgba(0, 0, 0, 0.05);   /* box behind uploaded images/files in posts & messages */
   --file-box-border: rgba(0, 0, 0, 0.15);
+  --popover-bg: white;  /* solid/opaque surface for floating menus, e.g. the reaction picker */
+  --popover-border: black;           /* matches this theme's 1px solid black .box border */
+  --popover-border-radius: 0px;
 }
 
 /* Uploaded image/file attachment framing, built by renderAttachmentsHTML() in

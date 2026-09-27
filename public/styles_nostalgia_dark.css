@@ -26,6 +26,9 @@
   --post-border-color: rgba(255, 255, 255, 0.15); /* profile page post border */
   --file-box-bg: rgba(255, 255, 255, 0.05);   /* box behind uploaded images/files in posts & messages */
   --file-box-border: rgba(255, 255, 255, 0.15);
+  --popover-bg: black;     /* solid/opaque surface for floating menus, e.g. the reaction picker */
+  --popover-border: white;        /* matches this theme's 1px solid white .box border */
+  --popover-border-radius: 0px;
 }
 
 /* Uploaded image/file attachment framing, built by renderAttachmentsHTML() in
@@ -247,7 +250,7 @@ body.page-feed #feed-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-feed #feed-topbar-left {
@@ -711,7 +714,7 @@ body.page-post #feed-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-post #feed-topbar-left {
@@ -900,7 +903,7 @@ body.page-friends #friends-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-friends #friends-topbar-left {
@@ -1001,7 +1004,7 @@ body.page-followers #followers-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-followers #followers-topbar-left {
@@ -1095,7 +1098,7 @@ body.page-profile #profile-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
   gap: 12px;
 }
@@ -1224,7 +1227,7 @@ body.page-messages #msg-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-messages #msg-topbar-left {
@@ -1317,7 +1320,7 @@ body.page-chat #chat-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
   flex-shrink: 0;
 }
@@ -1393,7 +1396,7 @@ body.page-chat #chat-input-bar {
   left: 0;
   right: 0;
   background: black;
-  border-top: 1px solid black;
+  border-top: 1px solid white;
   padding: 10px 20px;
   z-index: 100;
 }
@@ -1441,19 +1444,19 @@ body.page-chat .chat-action-btn {
   margin: 0;
   text-align: center;
   color: var(--text-color);
-  background-color: white;
+  background-color: black;
   cursor: pointer;
   display: inline-flex;
   align-items: center;
   justify-content: center;
 }
 body.page-chat .chat-action-btn:hover {
-  background-color: black;
-  color: white;
+  background-color: white;
+  color: black;
 }
 body.page-chat .chat-action-btn.clicked {
-  background-color: white !important;
-  color: black !important;
+  background-color: black !important;
+  color: white !important;
 }
 
 /* ===== /notifications ===== */
@@ -1477,7 +1480,7 @@ body.page-notifications #notif-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-notifications #notif-topbar-left {
@@ -1585,7 +1588,7 @@ body.page-admin #topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-admin #topbar a {
@@ -1727,11 +1730,11 @@ body.page-admin th {
   opacity: 0.5;
   font-weight: 600;
   padding: 6px 8px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.15);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
 }
 body.page-admin td {
   padding: 7px 8px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.07);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.07);
   vertical-align: middle;
 }
 body.page-admin tr:last-child td {
@@ -1757,7 +1760,7 @@ body.page-groups #gc-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
 }
 body.page-groups #gc-topbar-right {
@@ -1983,7 +1986,7 @@ body.page-group-chat #gc-chat-topbar {
   align-items: center;
   padding: 10px 20px;
   background: black;
-  border-bottom: 1px solid black;
+  border-bottom: 1px solid white;
   z-index: 100;
   gap: 12px;
 }
@@ -2124,7 +2127,7 @@ body.page-group-chat .gc-action-btn {
   margin: 0;
   text-align: center;
   color: var(--text-color);
-  background-color: white;
+  background-color: black;
   cursor: pointer;
   display: inline-flex;
   align-items: center;

@@ -114,6 +114,16 @@ const MAX_FILE_SIZE = 90 * 1024 * 1024;
 const MAX_MSG_LENGTH = 4000;
 const MAX_POST_LENGTH = 1000;
 const MAX_BIO_LENGTH = 1000;
+// A reaction is meant to be a single emoji, but some emoji (flags, family/
+// skin-tone ZWJ sequences) are several UTF-16 code units long, so this is
+// generous rather than exact. Capped at 100 characters as the hard ceiling
+// on what can be typed into the custom-reaction box.
+const MAX_REACTION_EMOJI_LENGTH = 100;
+// Caps distinct emoji per post (not total reactions) so one post can't
+// accumulate an unbounded number of different reaction chips.
+const MAX_DISTINCT_REACTIONS_PER_POST = 24;
+// Same cap, applied to DM messages (see Message_Reactions).
+const MAX_DISTINCT_REACTIONS_PER_MESSAGE = 24;
 
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 
@@ -205,6 +215,16 @@ function broadcastDMEdit(fromUser, toUser, row, replyMsg) {
     dmBus.emit(`${fromUser}::${toUser}`, { event: 'edit', html: renderMessageBubble(row, fromUser, replyMsg), id: row.id });
     dmBus.emit(`${toUser}::${fromUser}`, { event: 'edit', html: renderMessageBubble(row, toUser, replyMsg), id: row.id });
 }
+// Pushes an updated reaction-chip row for one message to both participants'
+// open chat streams. Rendered separately per viewer (like the message/edit
+// broadcasts above) since "reacted_by_me" highlighting depends on who's
+// looking - only the chip row is sent, not the whole bubble, so this swaps
+// in the same lightweight fragment the REST response already returns to the
+// person who clicked.
+function broadcastDMReaction(fromUser, toUser, msgId) {
+    dmBus.emit(`${fromUser}::${toUser}`, { event: 'reaction', id: msgId, html: renderMsgReactionsHTML(msgId, getMessageReactions(msgId, fromUser), fromUser) });
+    dmBus.emit(`${toUser}::${fromUser}`, { event: 'reaction', id: msgId, html: renderMsgReactionsHTML(msgId, getMessageReactions(msgId, toUser), toUser) });
+}
 
 function broadcastGCMessage(groupId, fromUser, row, replyMsg, memberUsernames) {
     const htmlForSender = renderGCMessageBubble(row, fromUser, replyMsg);
@@ -225,6 +245,15 @@ function broadcastGCEdit(groupId, fromUser, row, replyMsg, memberUsernames) {
     gcBus.emit(`${groupId}::${fromUser}`, { event: 'edit', html: htmlForSender, id: row.id });
     memberUsernames.filter(u => u !== fromUser).forEach(u => {
         gcBus.emit(`${groupId}::${u}`, { event: 'edit', html: htmlForOthers, id: row.id });
+    });
+}
+// Unlike message/edit above, this can't use the sentinel-"me" shortcut -
+// reaction highlighting is genuinely per-viewer (not just mine/not-mine), so
+// every current member gets their own render. Groups are small enough that
+// one render per member per reaction toggle is cheap.
+function broadcastGCReaction(groupId, msgId, memberUsernames) {
+    memberUsernames.forEach(u => {
+        gcBus.emit(`${groupId}::${u}`, { event: 'reaction', id: msgId, html: renderGCMsgReactionsHTML(msgId, getGCMessageReactions(msgId, u), u) });
     });
 }
 
@@ -363,6 +392,193 @@ function applyReportedState() {
         reportStateDebounce = setTimeout(applyReportedState, 150);
     }).observe(document.documentElement, { childList: true, subtree: true });
 })();
+<\/script>`;
+
+// Reaction chips under each post (see renderReactionsHTML/getPostReactions).
+// Clicking an existing chip, or picking/typing an emoji from the "+"
+// popover, both go through toggleReactionValue(), which POSTs to
+// /post/:id/react and swaps in the HTML the server sends back - same
+// swap-the-fragment-in pattern used by editPost()/deletePost() elsewhere on
+// these pages, so no full page/feed reload is needed.
+const REACTION_SCRIPT = `<script>
+var REACTION_QUICK_PICKS = ['👍','❤️','😂','😮','😢','🎉','🔥','👀'];
+
+function closeReactionPicker() {
+    var existing = document.getElementById('reaction-picker-popover');
+    if (existing) existing.remove();
+    document.removeEventListener('click', reactionPickerOutsideClick, true);
+}
+
+function reactionPickerOutsideClick(e) {
+    var popover = document.getElementById('reaction-picker-popover');
+    if (popover && !popover.contains(e.target) && !e.target.closest('.reaction-add-btn')) {
+        closeReactionPicker();
+    }
+}
+
+function openReactionPicker(postId, btn) {
+    var reopening = document.getElementById('reaction-picker-popover');
+    var wasForSamePost = reopening && reopening.dataset.postId == String(postId);
+    closeReactionPicker();
+    if (wasForSamePost) return; // clicking the same "+" again just closes it
+
+    var popover = document.createElement('div');
+    popover.id = 'reaction-picker-popover';
+    // Uses the dedicated --popover-bg/--popover-border theme variables
+    // (defined per theme alongside --file-box-bg etc.) rather than the
+    // page's .box class: .box has no background of its own, so a floating
+    // overlay built from it let post content underneath show through
+    // instead of being covered. --popover-bg is always a solid, opaque
+    // color per theme, so it keeps the "floating card" look while still
+    // matching each theme.
+    popover.style.cssText = 'position:absolute;top:100%;left:0;margin-top:6px;z-index:500;padding:10px;width:220px;max-width:80vw;box-sizing:border-box;background:var(--popover-bg);border:1px solid var(--popover-border);border-radius: var(--popover-border-radius);color:var(--text-color);';
+    popover.dataset.postId = postId;
+    popover.innerHTML =
+        '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">' +
+        REACTION_QUICK_PICKS.map(function(e) {
+            return '<button type="button" class="reaction-picker-emoji" data-emoji="' + e + '" style="width:30px;height:30px;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;">' + e + '</button>';
+        }).join('') +
+        '</div>' +
+        '<div style="display:flex;gap:6px;">' +
+        // No color/background/border here - the global input[type="text"]
+        // rule (styles.css) already carries each theme's own input colors,
+        // same as every other text input in this app.
+        '<input type="text" maxlength="' + ${MAX_REACTION_EMOJI_LENGTH} + '" placeholder="or type it here" style="flex:1;min-width:0;height:30px !important;box-sizing:border-box !important;padding:0 6px !important;line-height:1;">' +
+        // "button" reuses the site-wide themed button (bg/border/hover-invert
+        // per theme). The base .button class never sets box-sizing, so it
+        // defaults to content-box - its own height:20px + padding + border
+        // renders at ~50px regardless of this override unless box-sizing is
+        // forced to border-box here too (same trick .post-action-btn uses
+        // elsewhere in this file).
+        '<button type="button" class="button reaction-picker-add" style="width:auto;height:30px !important;box-sizing:border-box !important;padding:0 12px !important;line-height:1;">Add</button>' +
+        '</div>';
+
+    popover.querySelectorAll('.reaction-picker-emoji').forEach(function(el) {
+        el.addEventListener('click', function() {
+            toggleReactionValue(postId, el.getAttribute('data-emoji'));
+            closeReactionPicker();
+        });
+    });
+    var input = popover.querySelector('input');
+    var submitCustom = function() {
+        var val = input.value.trim();
+        if (!val) return;
+        toggleReactionValue(postId, val);
+        closeReactionPicker();
+    };
+    popover.querySelector('.reaction-picker-add').addEventListener('click', submitCustom);
+    input.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); submitCustom(); } });
+    input.addEventListener('click', function(e) { e.stopPropagation(); });
+
+    var container = document.getElementById('post-reactions-' + postId);
+    (container || btn.parentElement).appendChild(popover);
+    setTimeout(function() { document.addEventListener('click', reactionPickerOutsideClick, true); }, 0);
+    input.focus();
+}
+
+function toggleReaction(postId, chipEl) {
+    toggleReactionValue(postId, chipEl.getAttribute('data-emoji'));
+}
+
+function toggleReactionValue(postId, emoji) {
+    if (!emoji) return;
+    fetch('/post/' + postId + '/react', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emoji: emoji })
+    }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+      .then(function(res) {
+        if (!res.ok) { alert('Error: ' + (res.data && res.data.error || 'failed to react')); return; }
+        var container = document.getElementById('post-reactions-' + postId);
+        if (container && res.data && res.data.html) container.outerHTML = res.data.html;
+    }).catch(function() { alert('Network error.'); });
+}
+<\/script>`;
+
+// Reaction chips on DM messages - same UX and swap-the-fragment pattern as
+// REACTION_SCRIPT above (and reuses its REACTION_QUICK_PICKS list, so this
+// must be included alongside REACTION_SCRIPT, never alone), just pointed at
+// /messages/:username/react/:id instead of /post/:id/react, and keyed by
+// "msg-reactions-<id>" containers instead of "post-reactions-<id>" so the
+// two features never collide on a page that happens to have both. The page
+// that includes this must set window.MSG_REACT_BASE (e.g.
+// '/messages/someuser/react/') before this script runs. Unlike post
+// reactions, other-user updates arrive over the chat's existing SSE stream
+// (the 'reaction' event) rather than a page reload, since DMs already have
+// that live-push channel open.
+const MSG_REACTION_SCRIPT = `<script>
+function closeMsgReactionPicker() {
+    var existing = document.getElementById('msg-reaction-picker-popover');
+    if (existing) existing.remove();
+    document.removeEventListener('click', msgReactionPickerOutsideClick, true);
+}
+function msgReactionPickerOutsideClick(e) {
+    var popover = document.getElementById('msg-reaction-picker-popover');
+    if (popover && !popover.contains(e.target) && !e.target.closest('.msg-react-link')) {
+        closeMsgReactionPicker();
+    }
+}
+function openMsgReactionPicker(msgId, btn) {
+    var reopening = document.getElementById('msg-reaction-picker-popover');
+    var wasForSame = reopening && reopening.dataset.msgId == String(msgId);
+    closeMsgReactionPicker();
+    if (wasForSame) return; // clicking React again on the same message just closes it
+
+    var popover = document.createElement('div');
+    popover.id = 'msg-reaction-picker-popover';
+    popover.style.cssText = 'position:absolute;bottom:100%;right:0;margin-bottom:6px;z-index:500;padding:10px;width:220px;max-width:80vw;box-sizing:border-box;background:var(--popover-bg);border:1px solid var(--popover-border);border-radius:var(--popover-border-radius);color:var(--text-color);';
+    popover.dataset.msgId = msgId;
+    popover.innerHTML =
+        '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">' +
+        REACTION_QUICK_PICKS.map(function(e) {
+            return '<button type="button" class="msg-reaction-picker-emoji" data-emoji="' + e + '" style="width:30px;height:30px;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;">' + e + '</button>';
+        }).join('') +
+        '</div>' +
+        '<div style="display:flex;gap:6px;">' +
+        '<input type="text" maxlength="' + ${MAX_REACTION_EMOJI_LENGTH} + '" placeholder="or type it here" style="flex:1;min-width:0;height:30px !important;box-sizing:border-box !important;padding:0 6px !important;line-height:1;">' +
+        '<button type="button" class="button msg-reaction-picker-add" style="width:auto;height:30px !important;box-sizing:border-box !important;padding:0 12px !important;line-height:1;">Add</button>' +
+        '</div>';
+
+    popover.querySelectorAll('.msg-reaction-picker-emoji').forEach(function(el) {
+        el.addEventListener('click', function() {
+            toggleMsgReactionValue(msgId, el.getAttribute('data-emoji'));
+            closeMsgReactionPicker();
+        });
+    });
+    var input = popover.querySelector('input');
+    var submitCustom = function() {
+        var val = input.value.trim();
+        if (!val) return;
+        toggleMsgReactionValue(msgId, val);
+        closeMsgReactionPicker();
+    };
+    popover.querySelector('.msg-reaction-picker-add').addEventListener('click', submitCustom);
+    input.addEventListener('keydown', function(e) { if (e.key === 'Enter') { e.preventDefault(); submitCustom(); } });
+    input.addEventListener('click', function(e) { e.stopPropagation(); });
+
+    var container = document.getElementById('msg-reactions-' + msgId);
+    (container || btn.parentElement).appendChild(popover);
+    setTimeout(function() { document.addEventListener('click', msgReactionPickerOutsideClick, true); }, 0);
+    input.focus();
+}
+
+function toggleMsgReaction(msgId, chipEl) {
+    toggleMsgReactionValue(msgId, chipEl.getAttribute('data-emoji'));
+}
+
+function toggleMsgReactionValue(msgId, emoji) {
+    if (!emoji) return;
+    fetch(window.MSG_REACT_BASE + msgId, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ emoji: emoji })
+    }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+      .then(function(res) {
+        if (!res.ok) { alert('Error: ' + (res.data && res.data.error || 'failed to react')); return; }
+        var container = document.getElementById('msg-reactions-' + msgId);
+        if (container && res.data && res.data.html) container.outerHTML = res.data.html;
+    }).catch(function() { alert('Network error.'); });
+}
 <\/script>`;
 
 // ----- Attachment previews + drag & drop (feed/replies, DMs, group chats) -----
@@ -800,6 +1016,7 @@ function renderMessageBubble(m, me, replyMsg) {
     const editLink = mine ? `<a href="#" onclick="editMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
     const reportLink = !mine ? `<a href="#" onclick="reportContent('dm', ${m.id}, this);return false;" class="msg-delete-link report-action" data-report-type="dm" data-report-id="${m.id}" style="text-decoration:none;">Report</a>` : '';
+    const reactLink = `<a href="#" onclick="openMsgReactionPicker(${m.id}, this);return false;" class="msg-react-link" style="text-decoration:none;color: var(--accent-color)">React</a>`;
     const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
@@ -808,8 +1025,10 @@ function renderMessageBubble(m, me, replyMsg) {
             <div class="post-content" id="msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${renderMarkdown(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
+            ${renderMsgReactionsHTML(m.id, getMessageReactions(m.id, me), me)}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
+                ${reactLink}
                 ${editLink}
                 ${deleteLink}
                 ${reportLink}
@@ -1490,6 +1709,106 @@ function renderNotificationItem(n) {
     </div>`;
 }
 
+// Aggregated per-emoji reaction counts for a post, plus whether the given
+// session user is one of the reactors for each emoji. renderFeedPost is
+// synchronous (it runs inside posts.map(...) all over this file), so this
+// queries the underlying better-sqlite3 handle directly through the same
+// prepared-statement cache the db.* shim uses, rather than going through the
+// callback-style db.all().
+function getPostReactions(postId, sessionUsername) {
+    try {
+        return getStmt(
+            `SELECT emoji, COUNT(*) AS cnt, MAX(username = ?) AS reacted_by_me
+             FROM Reactions WHERE post_id = ? GROUP BY emoji ORDER BY MIN(id) ASC`
+        ).all(sessionUsername || '', postId);
+    } catch (e) {
+        console.error('getPostReactions error:', e.message);
+        return [];
+    }
+}
+
+// Renders the reaction-chip row for a post: one small circular chip per
+// distinct emoji (with its count), highlighted if the current session user
+// is one of the reactors, plus a "+" button to add a new one. Logged-out
+// visitors get read-only chips (no onclick, no add button) since reacting
+// requires an account.
+function renderReactionsHTML(postId, reactions, sessionUsername) {
+    const loggedIn = !!sessionUsername;
+    const chips = (reactions || []).map(r => {
+        const mine = !!r.reacted_by_me;
+        const tag = loggedIn ? 'button' : 'span';
+        const typeAttr = loggedIn ? ' type="button"' : '';
+        const clickAttr = loggedIn ? ` onclick="toggleReaction(${postId}, this)"` : '';
+        return `<${tag}${typeAttr} class="reaction-chip" data-emoji="${escapeHTML(r.emoji)}"${clickAttr} title="${r.cnt} reaction${r.cnt === 1 ? '' : 's'}"
+            style="display:inline-flex;align-items:center;gap:4px;height:26px;padding:0 10px;border-radius:14px;border:1px solid ${mine ? 'var(--accent-color)' : 'var(--post-border-color)'};background:${mine ? 'var(--msg-mine-bg)' : 'transparent'};color:var(--text-color);${loggedIn ? 'cursor:pointer;' : ''}font-size:0.85em;line-height:1;box-sizing:border-box;">
+            <span style="font-size:1.05em;">${escapeHTML(r.emoji)}</span><span style="opacity:0.7;">${r.cnt}</span>
+        </${tag}>`;
+    }).join('');
+    const addBtn = loggedIn ? `<button type="button" class="reaction-add-btn" onclick="openReactionPicker(${postId}, this)" title="Add reaction"
+        style="display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border-radius:50%;border:1px dashed var(--post-border-color);background:transparent;color:var(--text-color);opacity:0.6;cursor:pointer;font-size:0.9em;line-height:1;">+</button>` : '';
+    if (!chips && !addBtn) return `<div class="post-reactions" id="post-reactions-${postId}" style="position:relative;"></div>`;
+    return `<div class="post-reactions" id="post-reactions-${postId}" style="position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin-top:8px;">${chips}${addBtn}</div>`;
+}
+
+// Message_Reactions equivalent of getPostReactions - aggregated per-emoji
+// counts for one DM message, plus whether sessionUsername (the viewer, not
+// necessarily the sender) is one of the reactors for each emoji.
+function getMessageReactions(messageId, sessionUsername) {
+    try {
+        return getStmt(
+            `SELECT emoji, COUNT(*) AS cnt, MAX(username = ?) AS reacted_by_me
+             FROM Message_Reactions WHERE message_id = ? GROUP BY emoji ORDER BY MIN(id) ASC`
+        ).all(sessionUsername || '', messageId);
+    } catch (e) {
+        console.error('getMessageReactions error:', e.message);
+        return [];
+    }
+}
+
+// Message_Reactions equivalent of renderReactionsHTML. Both DM participants
+// are always logged in (the chat page itself requires a session), so unlike
+// renderReactionsHTML there's no logged-out read-only path here.
+function renderMsgReactionsHTML(messageId, reactions, sessionUsername) {
+    const chips = (reactions || []).map(r => {
+        const mine = !!r.reacted_by_me;
+        return `<button type="button" class="reaction-chip" data-emoji="${escapeHTML(r.emoji)}" onclick="toggleMsgReaction(${messageId}, this)" title="${r.cnt} reaction${r.cnt === 1 ? '' : 's'}"
+            style="display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 8px;border-radius:12px;border:1px solid ${mine ? 'var(--accent-color)' : 'var(--post-border-color)'};background:${mine ? 'var(--msg-mine-bg)' : 'transparent'};color:var(--text-color);cursor:pointer;font-size:0.78em;line-height:1;box-sizing:border-box;">
+            <span style="font-size:1.05em;">${escapeHTML(r.emoji)}</span><span style="opacity:0.7;">${r.cnt}</span>
+        </button>`;
+    }).join('');
+    if (!chips) return `<div class="msg-reactions" id="msg-reactions-${messageId}" style="position:relative;"></div>`;
+    return `<div class="msg-reactions" id="msg-reactions-${messageId}" style="position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:6px;">${chips}</div>`;
+}
+
+// Group_Chat_Message_Reactions equivalent of getMessageReactions.
+function getGCMessageReactions(messageId, sessionUsername) {
+    try {
+        return getStmt(
+            `SELECT emoji, COUNT(*) AS cnt, MAX(username = ?) AS reacted_by_me
+             FROM Group_Chat_Message_Reactions WHERE message_id = ? GROUP BY emoji ORDER BY MIN(id) ASC`
+        ).all(sessionUsername || '', messageId);
+    } catch (e) {
+        console.error('getGCMessageReactions error:', e.message);
+        return [];
+    }
+}
+
+// Renders the same "msg-reactions-<id>" fragment as renderMsgReactionsHTML
+// (deliberately the same container id / chip markup, so the DM and group
+// chat pages can share MSG_REACTION_SCRIPT unmodified - they're never on the
+// same page at once, so there's no id collision risk).
+function renderGCMsgReactionsHTML(messageId, reactions, sessionUsername) {
+    const chips = (reactions || []).map(r => {
+        const mine = !!r.reacted_by_me;
+        return `<button type="button" class="reaction-chip" data-emoji="${escapeHTML(r.emoji)}" onclick="toggleMsgReaction(${messageId}, this)" title="${r.cnt} reaction${r.cnt === 1 ? '' : 's'}"
+            style="display:inline-flex;align-items:center;gap:4px;height:22px;padding:0 8px;border-radius:12px;border:1px solid ${mine ? 'var(--accent-color)' : 'var(--post-border-color)'};background:${mine ? 'var(--msg-mine-bg)' : 'transparent'};color:var(--text-color);cursor:pointer;font-size:0.78em;line-height:1;box-sizing:border-box;">
+            <span style="font-size:1.05em;">${escapeHTML(r.emoji)}</span><span style="opacity:0.7;">${r.cnt}</span>
+        </button>`;
+    }).join('');
+    if (!chips) return `<div class="msg-reactions" id="msg-reactions-${messageId}" style="position:relative;"></div>`;
+    return `<div class="msg-reactions" id="msg-reactions-${messageId}" style="position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin-top:6px;">${chips}</div>`;
+}
+
 function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
     const fileHTML = renderAttachmentsHTML(getAttachments(post), fileMaxHeight);
     const isOwner = post.username === sessionUsername;
@@ -1512,6 +1831,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
         <div class="post-content" id="post-content-${post.id}" data-raw="${escapeHTML(post.content || '')}">${renderMarkdown(cleanText)}</div>
         ${embedHTML}
         ${fileHTML}
+        ${renderReactionsHTML(post.id, getPostReactions(post.id, sessionUsername), sessionUsername)}
         <div class="post-actions">
             <a href="/post/${post.id}" class="button post-action-btn reply-count-btn" data-post-id="${post.id}" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">${(post.reply_count || 0)} Replies</a>
             ${pinBtn}
@@ -1994,6 +2314,11 @@ db.serialize(() => {
             // tickets that came in by email instead of the web form - there's
             // no meaningful client IP for those.
             db.run(`ALTER TABLE Support_Tickets ADD COLUMN ip TEXT DEFAULT NULL`, () => {});
+            // Optional note an admin can leave when marking a ticket resolved,
+            // explaining what was done/why - shown on the ticket detail page.
+            // Cleared when the ticket is reopened so a stale note from a
+            // previous resolution doesn't linger.
+            db.run(`ALTER TABLE Support_Tickets ADD COLUMN resolution_note TEXT DEFAULT NULL`, () => {});
             // Admin replies sent from the /admin/support/:id ticket page. Kept as
             // history alongside the ticket even though the actual reply goes out
             // by email, not through any in-app messaging.
@@ -2034,7 +2359,52 @@ db.serialize(() => {
             // so an admin reviewing the report can see any reported image/file
             // even if the original post/message is edited or deleted later.
             db.run(`ALTER TABLE Reports ADD COLUMN attachments_json TEXT DEFAULT NULL`, () => {});
+            // Same resolution-note pattern as Support_Tickets.resolution_note -
+            // optional admin note shown on the report detail page, cleared on
+            // reopen.
+            db.run(`ALTER TABLE Reports ADD COLUMN resolution_note TEXT DEFAULT NULL`, () => {});
             db.run(`CREATE INDEX IF NOT EXISTS idx_reports_status ON Reports(status)`);
+            // Emoji reactions on a post - one row per (post, user, emoji), so a
+            // user can react to the same post with several different emoji, but
+            // not stack the same emoji twice. The emoji itself is free text (the
+            // user picks whatever they want, not a fixed set), always rendered
+            // through escapeHTML like any other user content.
+            db.run(`CREATE TABLE IF NOT EXISTS Reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(post_id, username, emoji)
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_reactions_post ON Reactions(post_id)`);
+            // Emoji reactions on a DM message - same shape/semantics as
+            // Reactions above (one row per message/user/emoji, so a user can
+            // stack several different emoji but not the same one twice), just
+            // keyed by message_id against the Messages table instead of posts.
+            db.run(`CREATE TABLE IF NOT EXISTS Message_Reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(message_id, username, emoji)
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_message_reactions_message ON Message_Reactions(message_id)`);
+            // Same again for group chat messages - kept as its own table
+            // (rather than reusing Message_Reactions) since Group_Chat_Messages
+            // and Messages are separate id spaces; a shared reactions table
+            // keyed only by message_id would conflate a DM message and a GC
+            // message that happen to share an id.
+            db.run(`CREATE TABLE IF NOT EXISTS Group_Chat_Message_Reactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(message_id, username, emoji)
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_gc_message_reactions_message ON Group_Chat_Message_Reactions(message_id)`);
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -3908,7 +4278,7 @@ app.get('/edit', (req, res) => {
             window.history.replaceState(null, '', '/edit');
         }
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -4691,7 +5061,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -4857,6 +5227,7 @@ app.post('/feed/delete/:id', (req, res) => {
         if (err || !post) return res.status(404).end();
         if (post.username !== req.session.userUsername && !req.isAdmin) return res.status(403).end();
         const attachments = getAttachments(post);
+        db.run(`DELETE FROM Reactions WHERE post_id = ?`, [postId]);
         db.run(`DELETE FROM Posts WHERE id = ?`, [postId], (err) => {
             if (err) console.error('Delete error:', err.message);
             else cleanupAttachmentFiles(attachments);
@@ -4879,6 +5250,57 @@ app.post('/feed/edit/:id', (req, res) => {
             db.get(`SELECT Posts.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified, (WITH RECURSIVE descendants(id) AS (SELECT id FROM Posts AS r WHERE r.reply_to = Posts.id UNION ALL SELECT p.id FROM Posts p JOIN descendants d ON p.reply_to = d.id) SELECT COUNT(*) FROM descendants) AS reply_count FROM Posts LEFT JOIN User_Data ON Posts.username = User_Data.username WHERE Posts.id = ?`, [postId], (err3, row) => {
                 if (err3 || !row) return res.json({ ok: true });
                 res.json({ ok: true, html: renderFeedPost(row, req.session.userUsername, 350, req.isAdmin) });
+            });
+        });
+    });
+});
+
+// Toggles the session user's reaction with a given emoji on a post: adds it
+// if they haven't reacted with that emoji yet, removes it if they have.
+// Returns the freshly-rendered reaction-chip row so the client can just swap
+// it in, rather than re-fetching/re-rendering the whole post.
+app.post('/post/:id/react', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const postId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(postId)) return res.status(404).json({ error: 'Post not found.' });
+    const emoji = ((req.body && req.body.emoji) || '').trim();
+    if (!emoji) return res.status(400).json({ error: 'Pick an emoji first.' });
+    if (/[\r\n\t]/.test(emoji)) return res.status(400).json({ error: 'Reactions must be a single emoji, not text.' });
+    if (emoji.length > MAX_REACTION_EMOJI_LENGTH) return res.status(400).json({ error: `Reaction too long - ${MAX_REACTION_EMOJI_LENGTH} character limit.` });
+    const username = req.session.userUsername;
+
+    isUserMuted(username, (errMute, mute) => {
+        if (!errMute && mute) return res.status(403).json({ error: 'Muted users cannot react to posts.' });
+
+        db.get(`SELECT id FROM Posts WHERE id = ?`, [postId], (err, post) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            if (!post) return res.status(404).json({ error: 'Post not found.' });
+
+            db.get(`SELECT id FROM Reactions WHERE post_id = ? AND username = ? AND emoji = ?`, [postId, username, emoji], (err2, existing) => {
+                if (err2) return res.status(500).json({ error: 'db error' });
+
+                const respond = () => {
+                    const reactions = getPostReactions(postId, username);
+                    res.json({ ok: true, html: renderReactionsHTML(postId, reactions, username) });
+                };
+
+                if (existing) {
+                    db.run(`DELETE FROM Reactions WHERE id = ?`, [existing.id], (err3) => {
+                        if (err3) return res.status(500).json({ error: 'db error' });
+                        respond();
+                    });
+                } else {
+                    db.get(`SELECT COUNT(DISTINCT emoji) AS n FROM Reactions WHERE post_id = ?`, [postId], (err3, cntRow) => {
+                        if (err3) return res.status(500).json({ error: 'db error' });
+                        if (cntRow && cntRow.n >= MAX_DISTINCT_REACTIONS_PER_POST) {
+                            return res.status(400).json({ error: 'This post already has the maximum number of different reactions.' });
+                        }
+                        db.run(`INSERT INTO Reactions (post_id, username, emoji) VALUES (?, ?, ?)`, [postId, username, emoji], (err4) => {
+                            if (err4) return res.status(500).json({ error: 'db error' });
+                            respond();
+                        });
+                    });
+                }
             });
         });
     });
@@ -5433,7 +5855,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -5914,7 +6336,7 @@ ${ATTACH_STYLE_BLOCK}
             if (nearBottom) loadOlderReplies();
         });
     </script>
-${isLoggedIn ? `${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}` : ''}
+${isLoggedIn ? `${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}` : ''}
 
 </body>
 </html>`);
@@ -6251,7 +6673,7 @@ app.get('/friends', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6338,7 +6760,7 @@ app.get('/followers', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6502,7 +6924,7 @@ app.get('/user/:username', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6588,7 +7010,7 @@ app.get('/messages', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6719,6 +7141,13 @@ ${ATTACH_STYLE_BLOCK}
                 try {
                     const data = JSON.parse(e.data);
                     replaceMessage(data.id, data.html);
+                } catch (err) {}
+            });
+            chatStream.addEventListener('reaction', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    const container = document.getElementById('msg-reactions-' + data.id);
+                    if (container && data.html) container.outerHTML = data.html;
                 } catch (err) {}
             });
             chatStream.onerror = () => {
@@ -6872,7 +7301,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${REPORT_SCRIPT}
+${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/messages/${other}/react/';</script>${MSG_REACTION_SCRIPT}
 </body>
 </html>`);
     });
@@ -6971,6 +7400,7 @@ app.post('/messages/:username/delete/:id', (req, res) => {
         if (err || !msg) return res.status(404).end();
         if (msg.from_user !== me) return res.status(403).end();
         const attachments = getAttachments(msg);
+        db.run(`DELETE FROM Message_Reactions WHERE message_id = ?`, [msgId]);
         db.run(`DELETE FROM Messages WHERE id = ?`, [msgId], (err2) => {
             if (err2) { console.error('Message delete error:', err2.message); return res.status(500).end(); }
             cleanupAttachmentFiles(attachments);
@@ -7004,6 +7434,63 @@ app.post('/messages/:username/edit/:id', (req, res) => {
                     finish(null);
                 }
             });
+        });
+    });
+});
+
+// Toggles the session user's reaction with a given emoji on a DM message -
+// same add-if-missing/remove-if-present semantics as /post/:id/react. Only
+// the two people in the conversation may react (checked against the
+// message's own from_user/to_user rather than trusting :username, so a
+// crafted request against someone else's thread can't slip a reaction in).
+// Returns the freshly-rendered chip row for the person who clicked, and also
+// pushes the same fragment (rendered from each side's own point of view, for
+// correct "reacted by me" highlighting) down both participants' open chat
+// SSE streams so it updates instantly without a refresh.
+app.post('/messages/:username/react/:id', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const me = req.session.userUsername;
+    const other = req.params.username;
+    const msgId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(msgId)) return res.status(404).json({ error: 'Message not found.' });
+    const emoji = ((req.body && req.body.emoji) || '').trim();
+    if (!emoji) return res.status(400).json({ error: 'Pick an emoji first.' });
+    if (/[\r\n\t]/.test(emoji)) return res.status(400).json({ error: 'Reactions must be a single emoji, not text.' });
+    if (emoji.length > MAX_REACTION_EMOJI_LENGTH) return res.status(400).json({ error: `Reaction too long - ${MAX_REACTION_EMOJI_LENGTH} character limit.` });
+
+    db.get(`SELECT id, from_user, to_user FROM Messages WHERE id = ?`, [msgId], (err, msg) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!msg) return res.status(404).json({ error: 'Message not found.' });
+        const participants = [msg.from_user, msg.to_user];
+        if (me === other || !participants.includes(me) || !participants.includes(other)) {
+            return res.status(403).json({ error: 'Not part of this conversation.' });
+        }
+
+        db.get(`SELECT id FROM Message_Reactions WHERE message_id = ? AND username = ? AND emoji = ?`, [msgId, me, emoji], (err2, existing) => {
+            if (err2) return res.status(500).json({ error: 'db error' });
+
+            const respond = () => {
+                broadcastDMReaction(msg.from_user, msg.to_user, msgId);
+                res.json({ ok: true, html: renderMsgReactionsHTML(msgId, getMessageReactions(msgId, me), me) });
+            };
+
+            if (existing) {
+                db.run(`DELETE FROM Message_Reactions WHERE id = ?`, [existing.id], (err3) => {
+                    if (err3) return res.status(500).json({ error: 'db error' });
+                    respond();
+                });
+            } else {
+                db.get(`SELECT COUNT(DISTINCT emoji) AS n FROM Message_Reactions WHERE message_id = ?`, [msgId], (err3, cntRow) => {
+                    if (err3) return res.status(500).json({ error: 'db error' });
+                    if (cntRow && cntRow.n >= MAX_DISTINCT_REACTIONS_PER_MESSAGE) {
+                        return res.status(400).json({ error: 'This message already has the maximum number of different reactions.' });
+                    }
+                    db.run(`INSERT INTO Message_Reactions (message_id, username, emoji) VALUES (?, ?, ?)`, [msgId, me, emoji], (err4) => {
+                        if (err4) return res.status(500).json({ error: 'db error' });
+                        respond();
+                    });
+                });
+            }
         });
     });
 });
@@ -7158,7 +7645,7 @@ app.get('/notifications', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -8399,6 +8886,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
             if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
             db.all(`SELECT file_path, file_name, files_json FROM Posts WHERE username = ?`, [target], (errPre, postRows) => {
             const attachments = (postRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []);
+            db.run(`DELETE FROM Reactions WHERE post_id IN (SELECT id FROM Posts WHERE username = ?)`, [target]);
             db.run(`DELETE FROM Posts WHERE username = ?`, [target], (err2) => {
                 if (err2) return res.status(500).json({ error: 'db error deleting posts' });
                 cleanupAttachmentFiles(attachments);
@@ -8438,17 +8926,36 @@ function hardDeleteAccount(username, reason, callback) {
                 .concat((postRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []))
                 .concat((gcRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []));
         db.serialize(() => {
+            // Same ordering concern as the Reactions/Posts pair below - clear
+            // Message_Reactions attached to this user's messages before the
+            // messages themselves are gone (harmless if it runs a beat late,
+            // since it's plain a cleanup of now-orphaned rows either way).
+            db.run(`DELETE FROM Message_Reactions WHERE message_id IN (SELECT id FROM Messages WHERE from_user = ? OR to_user = ?)`, [username, username]);
+            db.run(`DELETE FROM Message_Reactions WHERE username = ?`, [username]);
             db.run(`DELETE FROM Messages WHERE from_user = ? OR to_user = ?`, [username, username]);
             db.run(`DELETE FROM Password_Resets WHERE user_id = ?`, [userId]);
             db.run(`DELETE FROM Email_Changes WHERE user_id = ?`, [userId]);
             db.run(`DELETE FROM Email_Verifications WHERE user_id = ?`, [userId]);
+            // Reactions on this user's own posts must be cleared before Posts
+            // itself, since the subquery below needs those rows to still exist
+            // to know which post_ids were theirs.
+            db.run(`DELETE FROM Reactions WHERE post_id IN (SELECT id FROM Posts WHERE username = ?)`, [username]);
             db.run(`DELETE FROM Posts WHERE username = ?`, [username]);
             db.run(`DELETE FROM Follows WHERE follower_username = ? OR following_username = ?`, [username, username]);
             db.run(`DELETE FROM Friend_Requests WHERE from_user = ? OR to_user = ?`, [username, username]);
             db.run(`DELETE FROM Friends WHERE user_a = ? OR user_b = ?`, [username, username]);
             db.run(`DELETE FROM Notifications WHERE username = ? OR actor_username = ?`, [username, username]);
             db.run(`DELETE FROM Group_Chat_Members WHERE username = ?`, [username]);
+            // Same ordering note as Message_Reactions above - clear this
+            // user's GC messages' reactions (and their own reactions on
+            // other people's GC messages) before/alongside the messages.
+            db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE message_id IN (SELECT id FROM Group_Chat_Messages WHERE from_user = ?)`, [username]);
+            db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE username = ?`, [username]);
             db.run(`DELETE FROM Group_Chat_Messages WHERE from_user = ?`, [username]);
+            // Reactions the deleted user made on other people's posts (order
+            // doesn't matter for this one - it's keyed by username, not
+            // post_id).
+            db.run(`DELETE FROM Reactions WHERE username = ?`, [username]);
             // Warnings are keyed by username (not user_id), and hard-delete frees
             // the username for reuse - without this, a brand new account created
             // with the same username would inherit the deleted user's entire
@@ -8700,7 +9207,7 @@ app.get('/admin/support/:id', requireAdmin, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(404).send(renderMessagePage('Not Found', 'Ticket not found', `<h3>That ticket doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/support';">Back to tickets</button>`));
 
-    db.get(`SELECT id, username, email, subject, message, status, created_at, ip FROM Support_Tickets WHERE id = ?`, [id], (err, ticket) => {
+    db.get(`SELECT id, username, email, subject, message, status, created_at, ip, resolution_note FROM Support_Tickets WHERE id = ?`, [id], (err, ticket) => {
         if (err) return res.status(500).send('DB error');
         if (!ticket) return res.status(404).send(renderMessagePage('Not Found', 'Ticket not found', `<h3>That ticket doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/support';">Back to tickets</button>`));
 
@@ -8768,10 +9275,15 @@ ${renderSupportTopbar('Support Ticket #' + ticket.id)}
         <p style="font-size:0.9em;"><strong>Account:</strong> <a href="/user/${escapeHTML(ticket.username)}" style="color:var(--text-color);">@${escapeHTML(ticket.username)}</a></p>
         <p style="font-size:0.9em;"><strong>Contact email:</strong> ${escapeHTML(ticket.email)}</p>
         <p style="font-size:0.9em;"><strong>Status:</strong> ${statusLabel}</p>
+        ${ticket.status === 'resolved' && ticket.resolution_note ? `<p style="font-size:0.9em;"><strong>Resolution note:</strong> <span style="white-space:pre-wrap;word-break:break-word;">${escapeHTML(ticket.resolution_note)}</span></p>` : ''}
         ${ipSectionHTML}
         <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
         <div style="word-break:break-word;overflow-wrap:break-word;">${renderMarkdown(ticket.message)}</div>
-        <form method="POST" action="/admin/support/${ticket.id}/status" class="action-row">
+        <form method="POST" action="/admin/support/${ticket.id}/status" class="action-row" style="display:block;">
+            ${ticket.status === 'open' ? `
+            <label>Resolution note <span style="opacity:0.4;">(optional)</span></label>
+            <textarea name="reason" rows="2" maxlength="${MAX_SUPPORT_MSG_LENGTH}" placeholder="What was done to resolve this..." style="width:100%;box-sizing:border-box;font-family:inherit;padding:6px;margin-bottom:8px;resize:vertical;"></textarea>
+            ` : ''}
             <input type="hidden" name="status" value="${ticket.status === 'open' ? 'resolved' : 'open'}">
             <button type="submit" class="button" style="width:auto;padding:8px 16px;">${ticket.status === 'open' ? 'Mark Resolved' : 'Reopen'}</button>
         </form>
@@ -8803,9 +9315,13 @@ app.post('/admin/support/:id/status', requireAdmin, (req, res) => {
     if (!Number.isInteger(id)) return res.status(404).send('Ticket not found.');
     const status = req.body.status;
     if (status !== 'open' && status !== 'resolved') return res.redirect(`/admin/support/${id}?error=` + encodeURIComponent("Status must be 'open' or 'resolved'."));
-    db.run(`UPDATE Support_Tickets SET status = ? WHERE id = ?`, [status, id], function (err) {
+    const reason = (req.body.reason || '').trim().slice(0, MAX_SUPPORT_MSG_LENGTH);
+    // Reopening clears any note from a previous resolution rather than
+    // leaving a stale one attached to a now-open ticket.
+    const resolutionNote = status === 'resolved' ? (reason || null) : null;
+    db.run(`UPDATE Support_Tickets SET status = ?, resolution_note = ? WHERE id = ?`, [status, resolutionNote, id], function (err) {
         if (err || this.changes === 0) return res.redirect(`/admin/support/${id}?error=` + encodeURIComponent('Failed to update ticket.'));
-        logAudit(status === 'resolved' ? 'support_ticket_resolved' : 'support_ticket_reopened', req.session.userUsername, null, `ticket #${id}`);
+        logAudit(status === 'resolved' ? 'support_ticket_resolved' : 'support_ticket_reopened', req.session.userUsername, null, `ticket #${id}` + (resolutionNote ? ` - ${resolutionNote}` : ''));
         res.redirect(`/admin/support/${id}`);
     });
 });
@@ -8901,7 +9417,7 @@ app.get('/admin/reports/:id', requireAdmin, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
 
-    db.get(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at FROM Reports WHERE id = ?`, [id], (err, report) => {
+    db.get(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at, resolution_note FROM Reports WHERE id = ?`, [id], (err, report) => {
         if (err) return res.status(500).send('DB error');
         if (!report) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
 
@@ -8949,11 +9465,16 @@ ${renderSupportTopbar('Report #' + report.id)}
         <p style="font-size:0.9em;"><strong>Reported by:</strong> <a href="/user/${escapeHTML(report.reporter_username)}" style="color:var(--text-color);">@${escapeHTML(report.reporter_username)}</a></p>
         <p style="font-size:0.9em;"><strong>Source:</strong> ${REPORT_SOURCE_LABELS[report.source_type] || report.source_type} ${reportSourceLink(report)}</p>
         <p style="font-size:0.9em;"><strong>Status:</strong> <span id="report-status-label">${statusLabel}</span></p>
+        ${report.status === 'resolved' && report.resolution_note ? `<p style="font-size:0.9em;"><strong>Resolution note:</strong> <span style="white-space:pre-wrap;word-break:break-word;">${escapeHTML(report.resolution_note)}</span></p>` : ''}
         <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
         <p style="opacity:0.5;font-size:0.8em;margin-bottom:4px;">Content at time of report:</p>
         <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(report.content) || '<span style="opacity:0.4;">(no text)</span>'}</p>
         ${attachmentsHTML}
-        <form method="POST" action="/admin/reports/${report.id}/status" class="action-row">
+        <form method="POST" action="/admin/reports/${report.id}/status" class="action-row" style="display:block;">
+            ${report.status === 'open' ? `
+            <label>Resolution note <span style="opacity:0.4;">(optional)</span></label>
+            <textarea name="reason" rows="2" maxlength="${MAX_SUPPORT_MSG_LENGTH}" placeholder="What was done to resolve this..." style="width:100%;box-sizing:border-box;font-family:inherit;padding:6px;margin-bottom:8px;resize:vertical;"></textarea>
+            ` : ''}
             <input type="hidden" name="status" value="${report.status === 'open' ? 'resolved' : 'open'}">
             <button type="submit" class="button" style="width:auto;padding:8px 16px;">${report.status === 'open' ? 'Mark Resolved' : 'Reopen'}</button>
         </form>
@@ -9118,10 +9639,12 @@ app.post('/admin/reports/:id/status', requireAdmin, (req, res) => {
     if (!Number.isInteger(id)) return res.status(404).send('Report not found.');
     const status = req.body.status;
     if (status !== 'open' && status !== 'resolved') return res.redirect(`/admin/reports/${id}?error=` + encodeURIComponent("Status must be 'open' or 'resolved'."));
+    const reason = (req.body.reason || '').trim().slice(0, MAX_SUPPORT_MSG_LENGTH);
+    const resolutionNote = status === 'resolved' ? (reason || null) : null;
     db.get(`SELECT reported_username FROM Reports WHERE id = ?`, [id], (err0, report) => {
-        db.run(`UPDATE Reports SET status = ? WHERE id = ?`, [status, id], function (err) {
+        db.run(`UPDATE Reports SET status = ?, resolution_note = ? WHERE id = ?`, [status, resolutionNote, id], function (err) {
             if (err || this.changes === 0) return res.redirect(`/admin/reports/${id}?error=` + encodeURIComponent('Failed to update report.'));
-            logAudit(status === 'resolved' ? 'report_resolved' : 'report_reopened', req.session.userUsername, report && report.reported_username, `report #${id}`);
+            logAudit(status === 'resolved' ? 'report_resolved' : 'report_reopened', req.session.userUsername, report && report.reported_username, `report #${id}` + (resolutionNote ? ` - ${resolutionNote}` : ''));
             res.redirect(`/admin/reports/${id}`);
         });
     });
@@ -9147,6 +9670,7 @@ app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
         if (source_type === 'post') {
             db.get(`SELECT file_path, file_name, files_json FROM Posts WHERE id = ?`, [source_id], (errPre, postRow) => {
                 const attachments = getAttachments(postRow);
+                db.run(`DELETE FROM Reactions WHERE post_id = ?`, [source_id]);
                 db.run(`DELETE FROM Posts WHERE id = ?`, [source_id], function (err2) {
                     if (err2) return res.status(500).json({ error: 'db error' });
                     const deleted = this.changes > 0;
@@ -9162,6 +9686,7 @@ app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
                 if (err2) return res.status(500).json({ error: 'db error' });
                 if (!msg) return res.json({ ok: true, deleted: false });
                 const attachments = getAttachments(msg);
+                db.run(`DELETE FROM Message_Reactions WHERE message_id = ?`, [source_id]);
                 db.run(`DELETE FROM Messages WHERE id = ?`, [source_id], (err3) => {
                     if (err3) return res.status(500).json({ error: 'db error' });
                     cleanupAttachmentFiles(attachments);
@@ -9175,6 +9700,7 @@ app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
                 if (err2) return res.status(500).json({ error: 'db error' });
                 if (!msg) return res.json({ ok: true, deleted: false });
                 const attachments = getAttachments(msg);
+                db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE message_id = ?`, [source_id]);
                 db.run(`DELETE FROM Group_Chat_Messages WHERE id = ?`, [source_id], (err3) => {
                     if (err3) return res.status(500).json({ error: 'db error' });
                     cleanupAttachmentFiles(attachments);
@@ -9206,7 +9732,16 @@ function renderGCMessageBubble(m, me, replyMsg) {
     const editLink = mine ? `<a href="#" onclick="editGCMessage(${m.id});return false;" class="msg-edit-link" style="text-decoration:none;">Edit</a>` : '';
     const deleteLink = mine ? `<a href="#" onclick="deleteGCMessage(${m.id});return false;" class="msg-delete-link" style="text-decoration:none;">Delete</a>` : '';
     const reportLink = !mine ? `<a href="#" onclick="reportContent('gc', ${m.id}, this);return false;" class="msg-delete-link report-action" data-report-type="gc" data-report-id="${m.id}" style="text-decoration:none;">Report</a>` : '';
+    const reactLink = `<a href="#" onclick="openMsgReactionPicker(${m.id}, this);return false;" class="msg-react-link" style="text-decoration:none;color: var(--accent-color)">React</a>`;
     const editedMarker = m.edited ? `<span style="opacity:0.7;">(edited)</span>` : '';
+    // Reaction highlighting is rendered against whatever "me" this bubble was
+    // built for - correct for the actor's own copy and for a real viewer's
+    // page load (GET /groups/:id always passes the real session user), but
+    // broadcastGCMessage/broadcastGCEdit build the "other members" copy once
+    // against a sentinel that matches nobody, so a message already carrying
+    // reactions will show them un-highlighted to every other member right
+    // after an edit, until they reload or react themselves. Not worth an
+    // O(members) re-render per edit/send just to keep that one moment exact.
     return `<div class="chat-msg-row" data-id="${m.id}" style="display:flex;justify-content:${mine ? 'flex-end' : 'flex-start'};margin-bottom:10px;">
         <div class="${mine ? 'msg-bubble-mine' : 'msg-bubble-other'}" style="max-width:70%;border-radius:12px;padding:8px 12px;">
             ${senderLabel}
@@ -9214,8 +9749,10 @@ function renderGCMessageBubble(m, me, replyMsg) {
             <div class="post-content" id="gc-msg-content-${m.id}" data-raw="${escapeHTML(m.content || '')}">${renderMarkdown(cleanText)}</div>
             ${embedHTML}
             ${fileHTML}
+            ${renderGCMsgReactionsHTML(m.id, getGCMessageReactions(m.id, me), me)}
             <div style="font-size:0.7em;opacity:0.5;margin-top:4px;display:flex;justify-content:flex-end;align-items:center;gap:10px;">
                 <a href="#" onclick="setGCReply(${m.id}, '${escapeHTML(m.from_user)}');return false;" class="msg-reply-link" style="text-decoration:none;">Reply</a>
+                ${reactLink}
                 ${editLink}
                 ${deleteLink}
                 ${reportLink}
@@ -9405,7 +9942,7 @@ app.get('/groups', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -9506,7 +10043,7 @@ app.get('/discover', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -9586,6 +10123,7 @@ app.post('/groups/:id/leave', (req, res) => {
                 if (!err3 && row && row.cnt === 0) {
                     db.all(`SELECT file_path, file_name, files_json FROM Group_Chat_Messages WHERE group_id = ?`, [groupId], (errPre, gcRows) => {
                         const attachments = (gcRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []);
+                        db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE message_id IN (SELECT id FROM Group_Chat_Messages WHERE group_id = ?)`, [groupId]);
                         db.run(`DELETE FROM Group_Chat_Messages WHERE group_id = ?`, [groupId], () => cleanupAttachmentFiles(attachments));
                     });
                     db.run(`DELETE FROM Group_Chats WHERE id = ?`, [groupId]);
@@ -9803,6 +10341,13 @@ ${ATTACH_STYLE_BLOCK}
                 try {
                     const data = JSON.parse(e.data);
                     replaceGCMessage(data.id, data.html);
+                } catch (err) {}
+            });
+            gcStream.addEventListener('reaction', (e) => {
+                try {
+                    const data = JSON.parse(e.data);
+                    const container = document.getElementById('msg-reactions-' + data.id);
+                    if (container && data.html) container.outerHTML = data.html;
                 } catch (err) {}
             });
             gcStream.onerror = () => {
@@ -10094,7 +10639,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/groups/${groupId}/react/';</script>${MSG_REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -10203,6 +10748,7 @@ app.post('/groups/:id/delete/:msgId', (req, res) => {
         if (err || !msg) return res.status(404).end();
         if (msg.from_user !== me) return res.status(403).end();
         const attachments = getAttachments(msg);
+        db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE message_id = ?`, [msgId]);
         db.run(`DELETE FROM Group_Chat_Messages WHERE id = ?`, [msgId], (err2) => {
             if (err2) return res.status(500).end();
             cleanupAttachmentFiles(attachments);
@@ -10241,6 +10787,63 @@ app.post('/groups/:id/edit/:msgId', (req, res) => {
                         finish(null);
                     }
                 });
+            });
+        });
+    });
+});
+
+// Group chat equivalent of /messages/:username/react/:id - same
+// add-if-missing/remove-if-present toggle, just checked against current
+// Group_Chat_Members instead of the two-party DM check. Broadcasts the
+// updated chip row to every current member's open stream (see
+// broadcastGCReaction) and returns the same fragment to the person who
+// clicked so their own view updates immediately too.
+app.post('/groups/:id/react/:msgId', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id);
+    const msgId = parseInt(req.params.msgId, 10);
+    if (!Number.isInteger(msgId)) return res.status(404).json({ error: 'Message not found.' });
+    const emoji = ((req.body && req.body.emoji) || '').trim();
+    if (!emoji) return res.status(400).json({ error: 'Pick an emoji first.' });
+    if (/[\r\n\t]/.test(emoji)) return res.status(400).json({ error: 'Reactions must be a single emoji, not text.' });
+    if (emoji.length > MAX_REACTION_EMOJI_LENGTH) return res.status(400).json({ error: `Reaction too long - ${MAX_REACTION_EMOJI_LENGTH} character limit.` });
+
+    db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (errMem, memberRow) => {
+        if (errMem) return res.status(500).json({ error: 'db error' });
+        if (!memberRow) return res.status(403).json({ error: 'Not a member of this group.' });
+
+        db.get(`SELECT id FROM Group_Chat_Messages WHERE id = ? AND group_id = ?`, [msgId, groupId], (err, msg) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            if (!msg) return res.status(404).json({ error: 'Message not found.' });
+
+            db.get(`SELECT id FROM Group_Chat_Message_Reactions WHERE message_id = ? AND username = ? AND emoji = ?`, [msgId, me, emoji], (err2, existing) => {
+                if (err2) return res.status(500).json({ error: 'db error' });
+
+                const respond = () => {
+                    db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (errMembers, memberRows) => {
+                        broadcastGCReaction(groupId, msgId, (memberRows || []).map(r => r.username));
+                        res.json({ ok: true, html: renderGCMsgReactionsHTML(msgId, getGCMessageReactions(msgId, me), me) });
+                    });
+                };
+
+                if (existing) {
+                    db.run(`DELETE FROM Group_Chat_Message_Reactions WHERE id = ?`, [existing.id], (err3) => {
+                        if (err3) return res.status(500).json({ error: 'db error' });
+                        respond();
+                    });
+                } else {
+                    db.get(`SELECT COUNT(DISTINCT emoji) AS n FROM Group_Chat_Message_Reactions WHERE message_id = ?`, [msgId], (err3, cntRow) => {
+                        if (err3) return res.status(500).json({ error: 'db error' });
+                        if (cntRow && cntRow.n >= MAX_DISTINCT_REACTIONS_PER_MESSAGE) {
+                            return res.status(400).json({ error: 'This message already has the maximum number of different reactions.' });
+                        }
+                        db.run(`INSERT INTO Group_Chat_Message_Reactions (message_id, username, emoji) VALUES (?, ?, ?)`, [msgId, me, emoji], (err4) => {
+                            if (err4) return res.status(500).json({ error: 'db error' });
+                            respond();
+                        });
+                    });
+                }
             });
         });
     });

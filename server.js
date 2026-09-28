@@ -401,7 +401,7 @@ function applyReportedState() {
 // swap-the-fragment-in pattern used by editPost()/deletePost() elsewhere on
 // these pages, so no full page/feed reload is needed.
 const REACTION_SCRIPT = `<script>
-var REACTION_QUICK_PICKS = ['👍','❤️','😂','😮','😢','🎉','🔥','👀'];
+var REACTION_QUICK_PICKS = ['👍','❤️','😂','😮','✅','❌','🎉','🔥','👀'];
 
 function closeReactionPicker() {
     var existing = document.getElementById('reaction-picker-popover');

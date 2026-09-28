@@ -1833,7 +1833,7 @@ function renderFeedPost(post, sessionUsername, fileMaxHeight, isAdmin) {
         ${fileHTML}
         ${renderReactionsHTML(post.id, getPostReactions(post.id, sessionUsername), sessionUsername)}
         <div class="post-actions">
-            <a href="/post/${post.id}" class="button post-action-btn reply-count-btn" data-post-id="${post.id}" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;">${(post.reply_count || 0)} Replies</a>
+            <a href="/post/${post.id}" class="button post-action-btn reply-count-btn" data-post-id="${post.id}" style="text-decoration:none;display:inline-flex;align-items:center;justify-content:center;width:auto !important;white-space:nowrap;padding-left:5px !important;padding-right:5px !important;box-sizing:border-box;">${(post.reply_count || 0)} Replies</a>
             ${pinBtn}
             ${editBtn}
             ${deleteBtn}

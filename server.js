@@ -436,7 +436,7 @@ function openReactionPicker(postId, btn) {
     popover.innerHTML =
         '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">' +
         REACTION_QUICK_PICKS.map(function(e) {
-            return '<button type="button" class="reaction-picker-emoji" data-emoji="' + e + '" style="width:30px;height:30px;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;">' + e + '</button>';
+            return '<button type="button" class="reaction-picker-emoji" data-emoji="' + e + '" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0 !important;margin:0;box-sizing:border-box;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;text-align:center;">' + e + '</button>';
         }).join('') +
         '</div>' +
         '<div style="display:flex;gap:6px;">' +
@@ -531,7 +531,7 @@ function openMsgReactionPicker(msgId, btn) {
     popover.innerHTML =
         '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:8px;">' +
         REACTION_QUICK_PICKS.map(function(e) {
-            return '<button type="button" class="msg-reaction-picker-emoji" data-emoji="' + e + '" style="width:30px;height:30px;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;">' + e + '</button>';
+            return '<button type="button" class="msg-reaction-picker-emoji" data-emoji="' + e + '" style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;padding:0 !important;margin:0;box-sizing:border-box;border-radius:50%;border:1px solid var(--post-border-color);background:transparent;color:var(--text-color);cursor:pointer;font-size:1.1em;line-height:1;text-align:center;">' + e + '</button>';
         }).join('') +
         '</div>' +
         '<div style="display:flex;gap:6px;">' +

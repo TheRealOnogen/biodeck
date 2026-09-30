@@ -1,13 +1,13 @@
 <h1><div align="center"><img src="public/Ellie.png" height="256"></div></h1>
 
-Biodeck is a kewl website. idek wat to explain
+Biodeck is a twitter like social media website, but open source and just better
 
 ## What it uses
 - nodejs
 - express
 - html5
 - css3
-- sqlite3
+- better-sqlite3
 - dotenv
 - nodemailer
 

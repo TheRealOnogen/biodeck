@@ -200,12 +200,44 @@ function sseSend(res, event, data) {
     res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
+// Who is currently LOOKING at a DM chat page. Each open chat tab registers its
+// /messages/:username/stream connection here under "viewer::other" with a
+// client-generated id and a `visible` flag the page keeps up to date (tab shown
+// vs. hidden). A "sent you a message" notification is skipped when the recipient
+// has that chat open in a visible tab - they're already seeing the message live.
+// A chat tab left open in the background still gets the notification.
+const dmViewers = new Map(); // "viewer::other" -> Map(cid -> { visible })
+function registerDMViewer(viewer, other, cid, visible) {
+    const key = `${viewer}::${other}`;
+    let conns = dmViewers.get(key);
+    if (!conns) { conns = new Map(); dmViewers.set(key, conns); }
+    const entry = { visible: !!visible };
+    conns.set(cid, entry);
+    return () => { // unregister (ignore if a newer connection reused this cid)
+        const cur = dmViewers.get(key);
+        if (!cur) return;
+        if (cur.get(cid) === entry) cur.delete(cid);
+        if (!cur.size) dmViewers.delete(key);
+    };
+}
+function setDMViewerVisible(viewer, other, cid, visible) {
+    const conns = dmViewers.get(`${viewer}::${other}`);
+    const entry = conns && conns.get(cid);
+    if (entry) entry.visible = !!visible;
+}
+function isViewingDMChat(viewer, other) {
+    const conns = dmViewers.get(`${viewer}::${other}`);
+    if (!conns) return false;
+    for (const e of conns.values()) if (e.visible) return true;
+    return false;
+}
+
 // Each viewer subscribes to their own "me::other" channel so we can render
 // the message bubble from their point of view (alignment, delete link, etc)
 // without leaking another user's perspective.
 function broadcastDMMessage(fromUser, toUser, row, replyMsg) {
-    dmBus.emit(`${fromUser}::${toUser}`, { event: 'message', html: renderMessageBubble(row, fromUser, replyMsg), id: row.id });
-    dmBus.emit(`${toUser}::${fromUser}`, { event: 'message', html: renderMessageBubble(row, toUser, replyMsg), id: row.id });
+    dmBus.emit(`${fromUser}::${toUser}`, { event: 'message', html: renderMessageBubble(row, fromUser, replyMsg), id: row.id, from: fromUser });
+    dmBus.emit(`${toUser}::${fromUser}`, { event: 'message', html: renderMessageBubble(row, toUser, replyMsg), id: row.id, from: fromUser });
 }
 function broadcastDMDelete(fromUser, toUser, msgId) {
     dmBus.emit(`${fromUser}::${toUser}`, { event: 'delete', id: msgId });
@@ -229,9 +261,9 @@ function broadcastDMReaction(fromUser, toUser, msgId) {
 function broadcastGCMessage(groupId, fromUser, row, replyMsg, memberUsernames) {
     const htmlForSender = renderGCMessageBubble(row, fromUser, replyMsg);
     const htmlForOthers = renderGCMessageBubble(row, `\u0000${fromUser}`, replyMsg); // sentinel "me" that never matches a real username
-    gcBus.emit(`${groupId}::${fromUser}`, { event: 'message', html: htmlForSender, id: row.id });
+    gcBus.emit(`${groupId}::${fromUser}`, { event: 'message', html: htmlForSender, id: row.id, from: fromUser });
     memberUsernames.filter(u => u !== fromUser).forEach(u => {
-        gcBus.emit(`${groupId}::${u}`, { event: 'message', html: htmlForOthers, id: row.id });
+        gcBus.emit(`${groupId}::${u}`, { event: 'message', html: htmlForOthers, id: row.id, from: fromUser });
     });
 }
 function broadcastGCDelete(groupId, msgId, memberUsernames) {
@@ -276,13 +308,114 @@ function postSystemGCMessage(groupId, content) {
 }
 
 
+// ----- Emoji shortcodes (":smile:" -> 😄) -----
+// The map + typing/autocomplete logic is served as one cacheable script so it
+// isn't repeated inside every page's HTML. It hooks every <textarea> on the
+// page through event delegation, so textareas created later (e.g. the inline
+// "edit message" box) work too.
+const EMOJI_SHORTCODE_JS = "/* Emoji shortcode support (\":smile:\" -> 😄) + autocomplete. Served from server.js */\n(function () {\nvar MAP = {\"smile\":\"😄\",\"smiley\":\"😃\",\"grin\":\"😁\",\"grinning\":\"😀\",\"laughing\":\"😆\",\"joy\":\"😂\",\"rofl\":\"🤣\",\"sweat_smile\":\"😅\",\"blush\":\"😊\",\"innocent\":\"😇\",\"wink\":\"😉\",\"slight_smile\":\"🙂\",\"upside_down\":\"🙃\",\"relieved\":\"😌\",\"heart_eyes\":\"😍\",\"smiling_face_with_hearts\":\"🥰\",\"kissing_heart\":\"😘\",\"yum\":\"😋\",\"stuck_out_tongue\":\"😛\",\"stuck_out_tongue_winking_eye\":\"😜\",\"zany_face\":\"🤪\",\"nerd\":\"🤓\",\"sunglasses\":\"😎\",\"star_struck\":\"🤩\",\"partying_face\":\"🥳\",\"smirk\":\"😏\",\"unamused\":\"😒\",\"disappointed\":\"😞\",\"pensive\":\"😔\",\"worried\":\"😟\",\"confused\":\"😕\",\"slight_frown\":\"🙁\",\"frowning\":\"☹️\",\"persevere\":\"😣\",\"cry\":\"😢\",\"sob\":\"😭\",\"triumph\":\"😤\",\"angry\":\"😠\",\"rage\":\"😡\",\"cursing\":\"🤬\",\"exploding_head\":\"🤯\",\"flushed\":\"😳\",\"scream\":\"😱\",\"fearful\":\"😨\",\"cold_sweat\":\"😰\",\"sweat\":\"😓\",\"hugs\":\"🤗\",\"thinking\":\"🤔\",\"shushing_face\":\"🤫\",\"lying_face\":\"🤥\",\"neutral_face\":\"😐\",\"expressionless\":\"😑\",\"no_mouth\":\"😶\",\"rolling_eyes\":\"🙄\",\"grimacing\":\"😬\",\"sleeping\":\"😴\",\"sleepy\":\"😪\",\"drooling_face\":\"🤤\",\"mask\":\"😷\",\"nauseated_face\":\"🤢\",\"vomiting\":\"🤮\",\"sneezing_face\":\"🤧\",\"hot_face\":\"🥵\",\"cold_face\":\"🥶\",\"woozy_face\":\"🥴\",\"dizzy_face\":\"😵\",\"cowboy\":\"🤠\",\"clown\":\"🤡\",\"ghost\":\"👻\",\"skull\":\"💀\",\"skull_and_crossbones\":\"☠️\",\"alien\":\"👽\",\"robot\":\"🤖\",\"poop\":\"💩\",\"imp\":\"👿\",\"smiling_imp\":\"😈\",\"pleading\":\"🥺\",\"melting_face\":\"🫠\",\"salute\":\"🫡\",\"face_holding_back_tears\":\"🥹\",\"yawning_face\":\"🥱\",\"monocle\":\"🧐\",\"zipper_mouth\":\"🤐\",\"money_mouth\":\"🤑\",\"face_with_raised_eyebrow\":\"🤨\",\"smiling_face_with_tear\":\"🥲\",\"thumbsup\":\"👍\",\"+1\":\"👍\",\"thumbsdown\":\"👎\",\"-1\":\"👎\",\"ok_hand\":\"👌\",\"pinched_fingers\":\"🤌\",\"v\":\"✌️\",\"crossed_fingers\":\"🤞\",\"metal\":\"🤘\",\"call_me\":\"🤙\",\"point_left\":\"👈\",\"point_right\":\"👉\",\"point_up\":\"👆\",\"point_down\":\"👇\",\"raised_hand\":\"✋\",\"wave\":\"👋\",\"clap\":\"👏\",\"raised_hands\":\"🙌\",\"open_hands\":\"👐\",\"pray\":\"🙏\",\"handshake\":\"🤝\",\"muscle\":\"💪\",\"fist\":\"✊\",\"punch\":\"👊\",\"writing_hand\":\"✍️\",\"nail_care\":\"💅\",\"eyes\":\"👀\",\"eye\":\"👁️\",\"brain\":\"🧠\",\"tongue\":\"👅\",\"lips\":\"👄\",\"ear\":\"👂\",\"nose\":\"👃\",\"facepalm\":\"🤦\",\"shrug\":\"🤷\",\"bow\":\"🙇\",\"100\":\"💯\",\"heart\":\"❤️\",\"orange_heart\":\"🧡\",\"yellow_heart\":\"💛\",\"green_heart\":\"💚\",\"blue_heart\":\"💙\",\"purple_heart\":\"💜\",\"black_heart\":\"🖤\",\"white_heart\":\"🤍\",\"brown_heart\":\"🤎\",\"broken_heart\":\"💔\",\"sparkling_heart\":\"💖\",\"heartpulse\":\"💗\",\"two_hearts\":\"💕\",\"revolving_hearts\":\"💞\",\"heart_exclamation\":\"❣️\",\"fire\":\"🔥\",\"sparkles\":\"✨\",\"star\":\"⭐\",\"star2\":\"🌟\",\"boom\":\"💥\",\"collision\":\"💥\",\"zap\":\"⚡\",\"dizzy\":\"💫\",\"sweat_drops\":\"💦\",\"dash\":\"💨\",\"zzz\":\"💤\",\"anger\":\"💢\",\"speech_balloon\":\"💬\",\"thought_balloon\":\"💭\",\"bulb\":\"💡\",\"bell\":\"🔔\",\"no_bell\":\"🔕\",\"warning\":\"⚠️\",\"no_entry\":\"⛔\",\"x\":\"❌\",\"white_check_mark\":\"✅\",\"heavy_check_mark\":\"✔️\",\"question\":\"❓\",\"exclamation\":\"❗\",\"grey_question\":\"❔\",\"infinity\":\"♾️\",\"recycle\":\"♻️\",\"peace\":\"☮️\",\"yin_yang\":\"☯️\",\"radioactive\":\"☢️\",\"biohazard\":\"☣️\",\"dog\":\"🐶\",\"cat\":\"🐱\",\"mouse\":\"🐭\",\"hamster\":\"🐹\",\"rabbit\":\"🐰\",\"fox\":\"🦊\",\"bear\":\"🐻\",\"panda\":\"🐼\",\"koala\":\"🐨\",\"tiger\":\"🐯\",\"lion\":\"🦁\",\"cow\":\"🐮\",\"pig\":\"🐷\",\"frog\":\"🐸\",\"monkey\":\"🐵\",\"see_no_evil\":\"🙈\",\"hear_no_evil\":\"🙉\",\"speak_no_evil\":\"🙊\",\"chicken\":\"🐔\",\"penguin\":\"🐧\",\"bird\":\"🐦\",\"duck\":\"🦆\",\"eagle\":\"🦅\",\"owl\":\"🦉\",\"bat\":\"🦇\",\"wolf\":\"🐺\",\"horse\":\"🐴\",\"unicorn\":\"🦄\",\"bee\":\"🐝\",\"bug\":\"🐛\",\"butterfly\":\"🦋\",\"snail\":\"🐌\",\"ladybug\":\"🐞\",\"spider\":\"🕷️\",\"scorpion\":\"🦂\",\"turtle\":\"🐢\",\"snake\":\"🐍\",\"lizard\":\"🦎\",\"octopus\":\"🐙\",\"squid\":\"🦑\",\"shrimp\":\"🦐\",\"crab\":\"🦀\",\"fish\":\"🐟\",\"tropical_fish\":\"🐠\",\"dolphin\":\"🐬\",\"whale\":\"🐳\",\"shark\":\"🦈\",\"crocodile\":\"🐊\",\"elephant\":\"🐘\",\"giraffe\":\"🦒\",\"kangaroo\":\"🦘\",\"sloth\":\"🦥\",\"otter\":\"🦦\",\"dragon\":\"🐉\",\"t_rex\":\"🦖\",\"dino\":\"🦕\",\"sunny\":\"☀️\",\"cloud\":\"☁️\",\"rainbow\":\"🌈\",\"snowflake\":\"❄️\",\"snowman\":\"⛄\",\"umbrella\":\"☂️\",\"ocean\":\"🌊\",\"earth_americas\":\"🌎\",\"earth_africa\":\"🌍\",\"earth_asia\":\"🌏\",\"moon\":\"🌙\",\"full_moon\":\"🌕\",\"new_moon\":\"🌑\",\"sun_with_face\":\"🌞\",\"comet\":\"☄️\",\"rose\":\"🌹\",\"sunflower\":\"🌻\",\"tulip\":\"🌷\",\"cherry_blossom\":\"🌸\",\"hibiscus\":\"🌺\",\"seedling\":\"🌱\",\"evergreen_tree\":\"🌲\",\"palm_tree\":\"🌴\",\"cactus\":\"🌵\",\"four_leaf_clover\":\"🍀\",\"maple_leaf\":\"🍁\",\"fallen_leaf\":\"🍂\",\"mushroom\":\"🍄\",\"volcano\":\"🌋\",\"apple\":\"🍎\",\"green_apple\":\"🍏\",\"banana\":\"🍌\",\"grapes\":\"🍇\",\"watermelon\":\"🍉\",\"strawberry\":\"🍓\",\"cherries\":\"🍒\",\"peach\":\"🍑\",\"pineapple\":\"🍍\",\"lemon\":\"🍋\",\"orange\":\"🍊\",\"avocado\":\"🥑\",\"eggplant\":\"🍆\",\"carrot\":\"🥕\",\"corn\":\"🌽\",\"hot_pepper\":\"🌶️\",\"broccoli\":\"🥦\",\"potato\":\"🥔\",\"tomato\":\"🍅\",\"bread\":\"🍞\",\"croissant\":\"🥐\",\"cheese\":\"🧀\",\"egg\":\"🥚\",\"bacon\":\"🥓\",\"hamburger\":\"🍔\",\"fries\":\"🍟\",\"pizza\":\"🍕\",\"hotdog\":\"🌭\",\"sandwich\":\"🥪\",\"taco\":\"🌮\",\"burrito\":\"🌯\",\"spaghetti\":\"🍝\",\"ramen\":\"🍜\",\"sushi\":\"🍣\",\"rice\":\"🍚\",\"curry\":\"🍛\",\"dumpling\":\"🥟\",\"popcorn\":\"🍿\",\"doughnut\":\"🍩\",\"cookie\":\"🍪\",\"cake\":\"🎂\",\"cupcake\":\"🧁\",\"pie\":\"🥧\",\"chocolate_bar\":\"🍫\",\"candy\":\"🍬\",\"lollipop\":\"🍭\",\"icecream\":\"🍦\",\"coffee\":\"☕\",\"tea\":\"🍵\",\"beer\":\"🍺\",\"beers\":\"🍻\",\"wine_glass\":\"🍷\",\"cocktail\":\"🍸\",\"champagne\":\"🍾\",\"milk\":\"🥛\",\"cup_with_straw\":\"🥤\",\"boba\":\"🧋\",\"soccer\":\"⚽\",\"basketball\":\"🏀\",\"football\":\"🏈\",\"baseball\":\"⚾\",\"tennis\":\"🎾\",\"volleyball\":\"🏐\",\"8ball\":\"🎱\",\"trophy\":\"🏆\",\"medal\":\"🏅\",\"dart\":\"🎯\",\"video_game\":\"🎮\",\"joystick\":\"🕹️\",\"game_die\":\"🎲\",\"chess_pawn\":\"♟️\",\"puzzle\":\"🧩\",\"guitar\":\"🎸\",\"piano\":\"🎹\",\"drum\":\"🥁\",\"trumpet\":\"🎺\",\"violin\":\"🎻\",\"microphone\":\"🎤\",\"headphones\":\"🎧\",\"musical_note\":\"🎵\",\"notes\":\"🎶\",\"art\":\"🎨\",\"clapper\":\"🎬\",\"tada\":\"🎉\",\"confetti_ball\":\"🎊\",\"balloon\":\"🎈\",\"gift\":\"🎁\",\"ribbon\":\"🎀\",\"crown\":\"👑\",\"gem\":\"💎\",\"ring\":\"💍\",\"moneybag\":\"💰\",\"dollar\":\"💵\",\"credit_card\":\"💳\",\"key\":\"🔑\",\"lock\":\"🔒\",\"unlock\":\"🔓\",\"hammer\":\"🔨\",\"wrench\":\"🔧\",\"gear\":\"⚙️\",\"link\":\"🔗\",\"paperclip\":\"📎\",\"pushpin\":\"📌\",\"scissors\":\"✂️\",\"pencil\":\"✏️\",\"pen\":\"🖊️\",\"memo\":\"📝\",\"book\":\"📖\",\"books\":\"📚\",\"newspaper\":\"📰\",\"calendar\":\"📅\",\"chart_with_upwards_trend\":\"📈\",\"chart_with_downwards_trend\":\"📉\",\"clipboard\":\"📋\",\"file_folder\":\"📁\",\"package\":\"📦\",\"mailbox\":\"📫\",\"email\":\"📧\",\"inbox_tray\":\"📥\",\"outbox_tray\":\"📤\",\"phone\":\"📱\",\"telephone\":\"☎️\",\"computer\":\"💻\",\"desktop\":\"🖥️\",\"keyboard\":\"⌨️\",\"mouse_computer\":\"🖱️\",\"floppy_disk\":\"💾\",\"cd\":\"💿\",\"tv\":\"📺\",\"camera\":\"📷\",\"video_camera\":\"📹\",\"movie_camera\":\"🎥\",\"battery\":\"🔋\",\"electric_plug\":\"🔌\",\"flashlight\":\"🔦\",\"candle\":\"🕯️\",\"telescope\":\"🔭\",\"microscope\":\"🔬\",\"pill\":\"💊\",\"syringe\":\"💉\",\"dna\":\"🧬\",\"magnet\":\"🧲\",\"bomb\":\"💣\",\"shield\":\"🛡️\",\"dagger\":\"🗡️\",\"crossed_swords\":\"⚔️\",\"gun\":\"🔫\",\"hourglass\":\"⌛\",\"alarm_clock\":\"⏰\",\"stopwatch\":\"⏱️\",\"watch\":\"⌚\",\"mag\":\"🔍\",\"mag_right\":\"🔎\",\"loud_sound\":\"🔊\",\"mute\":\"🔇\",\"mega\":\"📣\",\"loudspeaker\":\"📢\",\"flag_white\":\"🏳️\",\"flag_black\":\"🏴\",\"checkered_flag\":\"🏁\",\"pirate_flag\":\"🏴‍☠️\",\"rainbow_flag\":\"🏳️‍🌈\",\"ua\":\"🇺🇦\",\"us\":\"🇺🇸\",\"gb\":\"🇬🇧\",\"de\":\"🇩🇪\",\"fr\":\"🇫🇷\",\"es\":\"🇪🇸\",\"it\":\"🇮🇹\",\"jp\":\"🇯🇵\",\"kr\":\"🇰🇷\",\"cn\":\"🇨🇳\",\"ca\":\"🇨🇦\",\"pl\":\"🇵🇱\",\"br\":\"🇧🇷\",\"car\":\"🚗\",\"taxi\":\"🚕\",\"bus\":\"🚌\",\"racing_car\":\"🏎️\",\"bike\":\"🚲\",\"motorcycle\":\"🏍️\",\"train\":\"🚆\",\"airplane\":\"✈️\",\"rocket\":\"🚀\",\"ufo\":\"🛸\",\"helicopter\":\"🚁\",\"ship\":\"🚢\",\"boat\":\"⛵\",\"anchor\":\"⚓\",\"house\":\"🏠\",\"office\":\"🏢\",\"school\":\"🏫\",\"hospital\":\"🏥\",\"castle\":\"🏰\",\"tent\":\"⛺\",\"mountain\":\"⛰️\",\"beach\":\"🏖️\",\"statue_of_liberty\":\"🗽\",\"tokyo_tower\":\"🗼\",\"ferris_wheel\":\"🎡\",\"roller_coaster\":\"🎢\",\"baby\":\"👶\",\"boy\":\"👦\",\"girl\":\"👧\",\"man\":\"👨\",\"woman\":\"👩\",\"older_man\":\"👴\",\"older_woman\":\"👵\",\"santa\":\"🎅\",\"mage\":\"🧙\",\"vampire\":\"🧛\",\"zombie\":\"🧟\",\"genie\":\"🧞\",\"fairy\":\"🧚\",\"ninja\":\"🥷\",\"detective\":\"🕵️\",\"astronaut\":\"🧑‍🚀\",\"angel\":\"👼\",\"princess\":\"👸\",\"prince\":\"🤴\",\"superhero\":\"🦸\",\"supervillain\":\"🦹\",\"dancer\":\"💃\",\"man_dancing\":\"🕺\",\"runner\":\"🏃\",\"walking\":\"🚶\",\"swimmer\":\"🏊\",\"skier\":\"⛷️\",\"surfer\":\"🏄\",\"bath\":\"🛀\",\"sleeping_accommodation\":\"🛌\",\"footprints\":\"👣\",\"busts_in_silhouette\":\"👥\",\"bust_in_silhouette\":\"👤\",\"couple\":\"👫\",\"family\":\"👪\",\"tshirt\":\"👕\",\"jeans\":\"👖\",\"dress\":\"👗\",\"bikini\":\"👙\",\"shoe\":\"👞\",\"sneaker\":\"👟\",\"high_heel\":\"👠\",\"boot\":\"👢\",\"tophat\":\"🎩\",\"mortar_board\":\"🎓\",\"crown_hat\":\"👑\",\"glasses\":\"👓\",\"dark_sunglasses\":\"🕶️\",\"lipstick\":\"💄\",\"arrow_up\":\"⬆️\",\"arrow_down\":\"⬇️\",\"arrow_left\":\"⬅️\",\"arrow_right\":\"➡️\",\"arrows_counterclockwise\":\"🔄\",\"repeat\":\"🔁\",\"red_circle\":\"🔴\",\"orange_circle\":\"🟠\",\"yellow_circle\":\"🟡\",\"green_circle\":\"🟢\",\"blue_circle\":\"🔵\",\"purple_circle\":\"🟣\",\"black_circle\":\"⚫\",\"white_circle\":\"⚪\",\"red_square\":\"🟥\",\"blue_square\":\"🟦\",\"green_square\":\"🟩\",\"black_large_square\":\"⬛\",\"white_large_square\":\"⬜\",\"diamond\":\"🔷\",\"small_orange_diamond\":\"🔸\",\"tm\":\"™️\",\"copyright\":\"©️\",\"registered\":\"®️\"};\n\nvar NAMES = Object.keys(MAP).sort();\nvar busy = false;\nvar pop = null, popItems = [], popIndex = 0, popTarget = null, popRange = null;\n\nfunction isTextTarget(el) {\n    if (!el || el.dataset && el.dataset.noEmoji !== undefined) return false;\n    if (el.tagName === 'TEXTAREA') return true;\n    return el.tagName === 'INPUT' && (el.type === 'text' || el.type === 'search') && el.name !== 'username' && el.name !== 'password';\n}\n\n// Finds a \":partial\" token that ends exactly at the caret. Requires the colon\n// to be at the start of the text or after whitespace, so things like \"12:30\"\n// or \"https://...\" are left alone.\nfunction currentToken(el) {\n    var pos = el.selectionStart;\n    if (pos == null || pos !== el.selectionEnd) return null;\n    var before = el.value.slice(0, pos);\n    var m = /(^|[\\s(])(:([a-z0-9_+\\-]{1,32}))$/i.exec(before);\n    if (!m) return null;\n    return { start: pos - m[2].length, end: pos, name: m[3].toLowerCase() };\n}\n\nfunction replaceRange(el, start, end, text) {\n    busy = true;\n    try {\n        el.focus();\n        el.setSelectionRange(start, end);\n        if (typeof el.setRangeText === 'function') el.setRangeText(text, start, end, 'end');\n        else { el.value = el.value.slice(0, start) + text + el.value.slice(end); el.setSelectionRange(start + text.length, start + text.length); }\n        // Let existing listeners (character counters etc.) know the value changed.\n        el.dispatchEvent(new Event('input', { bubbles: true }));\n    } finally { busy = false; }\n}\n\nfunction closePopup() {\n    if (pop) { pop.remove(); pop = null; }\n    popItems = []; popTarget = null; popRange = null;\n}\n\nfunction renderPopup() {\n    if (!pop) return;\n    pop.innerHTML = '';\n    popItems.forEach(function (name, i) {\n        var row = document.createElement('div');\n        row.className = 'emoji-ac-row';\n        row.style.cssText = 'display:flex;align-items:center;gap:8px;padding:5px 10px;cursor:pointer;border-radius:6px;' +\n            (i === popIndex ? 'background:rgba(127,127,127,0.25);' : '');\n        var ico = document.createElement('span');\n        ico.textContent = MAP[name];\n        ico.style.cssText = 'font-size:1.25em;width:1.6em;text-align:center;';\n        var lbl = document.createElement('span');\n        lbl.textContent = ':' + name + ':';\n        row.appendChild(ico); row.appendChild(lbl);\n        row.addEventListener('mousedown', function (e) { e.preventDefault(); pick(i); });\n        row.addEventListener('mouseenter', function () { popIndex = i; renderPopup(); });\n        pop.appendChild(row);\n    });\n}\n\nfunction positionPopup(el) {\n    var r = el.getBoundingClientRect();\n    pop.style.left = Math.max(4, Math.min(r.left, window.innerWidth - 260)) + 'px';\n    if (r.top > 260) { pop.style.bottom = (window.innerHeight - r.top + 4) + 'px'; pop.style.top = 'auto'; }\n    else { pop.style.top = (r.bottom + 4) + 'px'; pop.style.bottom = 'auto'; }\n}\n\nfunction openPopup(el, tok, matches) {\n    if (!pop) {\n        pop = document.createElement('div');\n        pop.id = 'emoji-autocomplete';\n        pop.style.cssText = 'position:fixed;z-index:10000;min-width:200px;max-width:260px;padding:4px;font-size:0.9em;' +\n            'color:var(--text-color);background:var(--popover-bg, #222);border:var(--popover-border, 1px solid rgba(127,127,127,0.4));' +\n            'border-radius:var(--popover-border-radius, 8px);box-shadow:0 4px 16px rgba(0,0,0,0.35);';\n        document.body.appendChild(pop);\n    }\n    popItems = matches; popIndex = 0; popTarget = el; popRange = tok;\n    renderPopup();\n    positionPopup(el);\n}\n\nfunction pick(i) {\n    var name = popItems[i];\n    if (!name || !popTarget) return closePopup();\n    var el = popTarget;\n    var tok = currentToken(el) || popRange;\n    closePopup();\n    // Insert the emoji plus a trailing space, like Discord's picker does.\n    replaceRange(el, tok.start, tok.end, MAP[name] + ' ');\n}\n\ndocument.addEventListener('input', function (e) {\n    if (busy) return;\n    var el = e.target;\n    if (!isTextTarget(el)) return;\n\n    // 1) Finished shortcode \":name:\" right before the caret -> swap for the emoji.\n    var pos = el.selectionStart;\n    if (pos != null && pos === el.selectionEnd) {\n        var before = el.value.slice(0, pos);\n        var m = /(^|[\\s(]):([a-z0-9_+\\-]{1,32}):$/i.exec(before);\n        if (m) {\n            var name = m[2].toLowerCase();\n            if (Object.prototype.hasOwnProperty.call(MAP, name)) {\n                closePopup();\n                var start = pos - name.length - 2;\n                replaceRange(el, start, pos, MAP[name]);\n                return;\n            }\n        }\n    }\n\n    // 2) Still typing \":par\" -> show suggestions (needs 2+ characters).\n    var tok = currentToken(el);\n    if (!tok || tok.name.length < 2) return closePopup();\n    var starts = [], contains = [];\n    for (var i = 0; i < NAMES.length; i++) {\n        var n = NAMES[i];\n        if (n.indexOf(tok.name) === 0) starts.push(n);\n        else if (n.indexOf(tok.name) > 0) contains.push(n);\n    }\n    var matches = starts.concat(contains).slice(0, 8);\n    if (!matches.length) return closePopup();\n    openPopup(el, tok, matches);\n});\n\n// Capture phase so we run before the chat boxes' own \"Enter = send\" handlers.\ndocument.addEventListener('keydown', function (e) {\n    if (!pop) return;\n    if (e.key === 'ArrowDown') { e.preventDefault(); e.stopImmediatePropagation(); popIndex = (popIndex + 1) % popItems.length; renderPopup(); }\n    else if (e.key === 'ArrowUp') { e.preventDefault(); e.stopImmediatePropagation(); popIndex = (popIndex - 1 + popItems.length) % popItems.length; renderPopup(); }\n    else if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) { e.preventDefault(); e.stopImmediatePropagation(); pick(popIndex); }\n    else if (e.key === 'Escape') { e.preventDefault(); e.stopImmediatePropagation(); closePopup(); }\n}, true);\n\ndocument.addEventListener('focusout', function (e) { if (e.target === popTarget) setTimeout(closePopup, 120); });\nwindow.addEventListener('resize', closePopup);\ndocument.addEventListener('scroll', function () { if (pop && popTarget) positionPopup(popTarget); }, true);\n})();\n";
+app.get('/emoji-shortcodes.js', (req, res) => {
+    res.type('application/javascript; charset=utf-8');
+    res.set('Cache-Control', 'public, max-age=3600');
+    res.send(EMOJI_SHORTCODE_JS);
+});
+const EMOJI_SCRIPT = `<script src="/emoji-shortcodes.js" defer><\/script>`;
+
+// ----- Sounds -----
+// Both files live in public/ (served statically). Browsers block audio until
+// the user has interacted with the page once, so the first click/keypress
+// "unlocks" playback; play() failures (autoplay block, file missing) are
+// swallowed on purpose so a sound problem can never break the page.
+//   public/notif.mp3   -> plays when the unread-notification count goes up
+//   public/message.mp3 -> plays when a message arrives in an open DM / group chat
+const SOUND_SCRIPT = `<script>
+(function() {
+    if (window.biodeckPlaySound) return;
+    var files = { notif: '/notif.mp3', message: '/message.mp3' };
+    var audio = {}, lastPlayed = {};
+    // Quiet window: sounds are dropped until this time. It is set on page load and
+    // every time the page wakes up (tab shown again, restored from bfcache, laptop
+    // wakes, network returns) so a backlog of queued events / poll results that
+    // lands all at once on resume can't ping.
+    var QUIET_MS = 2500;
+    var quietUntil = Date.now() + QUIET_MS;
+    var priming = false;
+    function quiet() { quietUntil = Math.max(quietUntil, Date.now() + QUIET_MS); }
+    function get(kind) {
+        if (!files[kind]) return null;
+        if (!audio[kind]) { audio[kind] = new Audio(files[kind]); audio[kind].preload = 'auto'; }
+        return audio[kind];
+    }
+    window.biodeckPlaySound = function(kind) {
+        try {
+            if (priming || Date.now() < quietUntil) return;
+            var a = get(kind);
+            if (!a) return;
+            var now = Date.now();
+            if (lastPlayed[kind] && now - lastPlayed[kind] < 400) return; // don't stack rapid-fire sounds
+            lastPlayed[kind] = now;
+            a.currentTime = 0;
+            var p = a.play();
+            if (p && p.catch) p.catch(function() {});
+        } catch (e) {}
+    };
+    function unlock() {
+        document.removeEventListener('pointerdown', unlock, true);
+        document.removeEventListener('keydown', unlock, true);
+        // Prime each element once so later play() calls are allowed. Priming is
+        // fully silent (muted + volume 0) and real sounds are blocked meanwhile.
+        var kinds = Object.keys(files), pending = kinds.length;
+        priming = true;
+        function finish() { if (--pending <= 0) priming = false; }
+        setTimeout(function() { priming = false; }, 3000); // safety net
+        kinds.forEach(function(kind) {
+            var a;
+            try { a = get(kind); a.muted = true; a.volume = 0; } catch (e) { finish(); return; }
+            var restore = function() {
+                try { a.pause(); a.currentTime = 0; a.muted = false; a.volume = 1; } catch (e) {}
+                finish();
+            };
+            try {
+                var p = a.play();
+                if (p && p.then) p.then(restore, restore); else restore();
+            } catch (e) { restore(); }
+        });
+    }
+    function wake() {
+        quiet();
+        try { window.dispatchEvent(new Event('biodeck:wake')); } catch (e) {}
+    }
+    document.addEventListener('visibilitychange', function() { if (!document.hidden) wake(); });
+    window.addEventListener('pageshow', wake);
+    window.addEventListener('online', wake);
+    document.addEventListener('resume', wake);
+    // Timer gap = the machine slept / the tab was frozen. Hidden tabs are throttled
+    // to ~1 tick/min by browsers, so use a much larger threshold while hidden.
+    var lastTick = Date.now();
+    setInterval(function() {
+        var n = Date.now();
+        if (n - lastTick > (document.hidden ? 120000 : 5000)) wake();
+        lastTick = n;
+    }, 1000);
+    document.addEventListener('pointerdown', unlock, true);
+    document.addEventListener('keydown', unlock, true);
+})();
+<\/script>`;
+
 const NOTIF_BADGE_SCRIPT = `<script>
 (function() {
+    var lastNotifCount = null;
+    var resync = false; // next poll only re-baselines the count, no sound
     function updateNotifBadges() {
         fetch('/notifications/count', { cache: 'no-store' })
             .then(function(r) { return r.json(); })
             .then(function(d) {
                 var count = (d && d.count) || 0;
+                // Ping only when the unread count goes UP after the first load,
+                // so opening a page that already has unread items stays silent.
+                if (lastNotifCount !== null && !resync && count > lastNotifCount && window.biodeckPlaySound) window.biodeckPlaySound('notif');
+                resync = false;
+                lastNotifCount = count;
                 var label = count + (count === 1 ? ' Notification' : ' Notifications');
                 document.querySelectorAll('.notif-nav-link').forEach(function(el) {
                     el.textContent = label;
@@ -305,6 +438,9 @@ const NOTIF_BADGE_SCRIPT = `<script>
     }
     updateNotifBadges();
     setInterval(updateNotifBadges, 8000);
+    // After the page wakes up, re-read the count silently instead of treating the
+    // jump since the last poll as a brand-new notification.
+    window.addEventListener('biodeck:wake', function() { resync = true; updateNotifBadges(); });
 })();
 <\/script>`;
 
@@ -1338,7 +1474,9 @@ function sendSystemDM(toUsername, content) {
         [toUsername, content], function (err) {
             if (err) { console.error('System DM insert error:', err.message); return; }
             const newId = this.lastID;
-            createNotification({ username: toUsername, type: 'dm', actor_username: 'System', message_id: newId, content_preview: content.slice(0, 140) });
+            if (!isViewingDMChat(toUsername, 'System')) {
+                createNotification({ username: toUsername, type: 'dm', actor_username: 'System', message_id: newId, content_preview: content.slice(0, 140) });
+            }
             db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
                 if (err2 || !row) return;
                 broadcastDMMessage('System', toUsername, row, null);
@@ -4278,7 +4416,7 @@ app.get('/edit', (req, res) => {
             window.history.replaceState(null, '', '/edit');
         }
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -5061,7 +5199,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -5855,7 +5993,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6336,7 +6474,7 @@ ${ATTACH_STYLE_BLOCK}
             if (nearBottom) loadOlderReplies();
         });
     </script>
-${isLoggedIn ? `${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}` : ''}
+${isLoggedIn ? `${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}` : ''}
 
 </body>
 </html>`);
@@ -6673,7 +6811,7 @@ app.get('/friends', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6760,7 +6898,7 @@ app.get('/followers', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -6924,7 +7062,7 @@ app.get('/user/:username', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -7010,7 +7148,7 @@ app.get('/messages', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -7117,9 +7255,17 @@ ${ATTACH_STYLE_BLOCK}
         // --- Live updates over Server-Sent Events (push, not polling) ---
         let chatStream = null;
         let chatReconnectDelay = 1000;
+        // Presence: tells the server this chat is open and whether the tab is visible,
+        // so it doesn't raise a "sent you a message" notification while you're reading.
+        const chatCid = Math.random().toString(36).slice(2) + Date.now().toString(36);
+        function chatVisibleFlag() { return document.hidden ? '0' : '1'; }
+        function reportChatPresence() {
+            fetch('/messages/${other}/presence?cid=' + chatCid + '&v=' + chatVisibleFlag(), { method: 'POST', keepalive: true }).catch(() => {});
+        }
+        document.addEventListener('visibilitychange', reportChatPresence);
         const connIndicator = document.getElementById('chat-conn-indicator');
         function connectChatStream() {
-            chatStream = new EventSource('/messages/${other}/stream');
+            chatStream = new EventSource('/messages/${other}/stream?cid=' + chatCid + '&v=' + chatVisibleFlag());
             chatStream.addEventListener('open', () => {
                 chatReconnectDelay = 1000;
                 connIndicator.style.display = 'none';
@@ -7127,7 +7273,10 @@ ${ATTACH_STYLE_BLOCK}
             chatStream.addEventListener('message', (e) => {
                 try {
                     const data = JSON.parse(e.data);
+                    const isNewMsg = !seenMsgIds.has(data.id);
                     appendNewMessage(data.id, data.html);
+                    // Sound only for messages from the other person, never for your own sends.
+                    if (isNewMsg && data.from && data.from !== ${JSON.stringify(me).replace(/</g, '\\u003c')} && window.biodeckPlaySound) window.biodeckPlaySound('message');
                     if (!document.hidden) fetch('/messages/${other}/mark-read', { method: 'POST' }).catch(() => {});
                 } catch (err) {}
             });
@@ -7301,7 +7450,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/messages/${other}/react/';</script>${MSG_REACTION_SCRIPT}
+${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/messages/${other}/react/';</script>${MSG_REACTION_SCRIPT}
 </body>
 </html>`);
     });
@@ -7324,12 +7473,26 @@ app.get('/messages/:username/stream', (req, res) => {
     const onEvent = (payload) => sseSend(res, payload.event, payload);
     dmBus.on(channel, onEvent);
 
+    // Presence: lets the send route know this chat is open (and visible) so it
+    // can skip the "sent you a message" notification.
+    const cid = String(req.query.cid || '').slice(0, 64);
+    const unregisterViewer = cid ? registerDMViewer(me, other, cid, req.query.v === '1') : null;
+
     const keepAlive = setInterval(() => res.write(': ping\n\n'), 20000);
 
     req.on('close', () => {
         clearInterval(keepAlive);
         dmBus.removeListener(channel, onEvent);
+        if (unregisterViewer) unregisterViewer();
     });
+});
+
+// The chat page calls this whenever its tab is shown/hidden so presence stays accurate.
+app.post('/messages/:username/presence', (req, res) => {
+    if (!req.session.userId) return res.status(401).end();
+    const cid = String(req.query.cid || '').slice(0, 64);
+    if (cid) setDMViewerVisible(req.session.userUsername, req.params.username, cid, req.query.v === '1');
+    res.status(204).end();
 });
 
 app.post('/messages/:username/send', (req, res, next) => {
@@ -7365,7 +7528,10 @@ app.post('/messages/:username/send', (req, res, next) => {
             if (err) return res.status(500).json({ error: 'Failed to send message.' });
             const newId = this.lastID;
             const preview = (content || '').trim().slice(0, 140) || (filesMeta.length ? `Sent ${filesMeta.length > 1 ? filesMeta.length + ' files' : 'a file: ' + filesMeta[0].name}` : '');
-            createNotification({ username: other, type: 'dm', actor_username: me, message_id: newId, content_preview: preview });
+            // No "sent you a message" notification if they're looking at this chat right now.
+            if (!isViewingDMChat(other, me)) {
+                createNotification({ username: other, type: 'dm', actor_username: me, message_id: newId, content_preview: preview });
+            }
             processMentions(content, me, { type: 'mention_dm', message_id: newId, skipUsernames: [other] });
 
             db.get(`SELECT Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Messages LEFT JOIN User_Data ON Messages.from_user = User_Data.username WHERE Messages.id = ?`, [newId], (err2, row) => {
@@ -7645,7 +7811,7 @@ app.get('/notifications', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -9942,7 +10108,7 @@ app.get('/groups', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -10043,7 +10209,7 @@ app.get('/discover', (req, res) => {
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}
 
 </body>
 </html>`);
@@ -10328,7 +10494,10 @@ ${ATTACH_STYLE_BLOCK}
             gcStream.addEventListener('message', (e) => {
                 try {
                     const data = JSON.parse(e.data);
+                    const isNewGCMsg = !seenGCMsgIds.has(data.id);
                     appendGCMessage(data.id, data.html);
+                    // Sound for messages from other members (not your own sends).
+                    if (isNewGCMsg && data.from && data.from !== ${JSON.stringify(me).replace(/</g, '\\u003c')} && window.biodeckPlaySound) window.biodeckPlaySound('message');
                 } catch (err) {}
             });
             gcStream.addEventListener('delete', (e) => {
@@ -10639,7 +10808,7 @@ ${ATTACH_STYLE_BLOCK}
             }
         });
     </script>
-${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/groups/${groupId}/react/';</script>${MSG_REACTION_SCRIPT}
+${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT_SCRIPT}${REACTION_SCRIPT}<script>window.MSG_REACT_BASE = '/groups/${groupId}/react/';</script>${MSG_REACTION_SCRIPT}
 
 </body>
 </html>`);

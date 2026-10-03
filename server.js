@@ -7313,7 +7313,7 @@ app.get('/user/:username', (req, res) => {
                         const fileHTML = renderAttachmentsHTML(getAttachments(post), 300);
                         return `<div class="post" style="border:1px solid var(--post-border-color);border-radius:10px;padding:10px;margin-bottom:14px;text-align:left;">
                             <span class="post-time" data-ts="${post.created_at ? post.created_at.replace(' ', 'T') + 'Z' : ''}" style="font-size:0.8em;opacity:0.6;"></span>
-                            <div class="post-content" style="margin-top:4px;">${escapeHTML(post.content)}</div>
+                            <div class="post-content" style="margin-top:4px;">${renderMarkdown(post.content)}</div>
                             ${fileHTML}
                         </div>`;
                     }).join('');
@@ -7364,7 +7364,7 @@ app.get('/user/:username', (req, res) => {
         <h1>${user.Nickname && user.Nickname.trim() ? escapeHTML(user.Nickname.trim()) : '@' + escapeHTML(user.username)}${renderVerifiedBadge(user.IsVerified)}</h1>
         ${user.Nickname && user.Nickname.trim() ? `<div style="opacity:0.5;font-size:0.9em;margin-top:-10px;margin-bottom:6px;">@${escapeHTML(user.username)}</div>` : ''}
         <div style="margin-bottom:8px;">${followersLink}</div>
-        <div id="profile-bio">${user.bio ? escapeHTML(user.bio) : '<span style="opacity:0.4;">No bio yet.</span>'}</div>
+        <div id="profile-bio">${user.bio ? renderMarkdown(user.bio) : '<span style="opacity:0.4;">No bio yet.</span>'}</div>
         <div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:20px;">
             ${dmBtn}
             ${followBtn}

@@ -11462,7 +11462,47 @@ function serializePostJSON(post, sessionUsername, isAdmin) {
     };
 }
 
-function serializeMessageJSON(m, meUsername) {
+// Reactions for a whole page of DM or group chat messages in ONE query (not
+// one per message). `table` is only ever one of the two internal constants
+// below, never request input. Returns Map(messageId -> [{ emoji, count, mine,
+// users, customEmojiUrl }]) with emoji in first-reacted order (same ordering
+// as the in-app chips). `customEmojiUrl` is set when the reaction is a
+// ":name:" that still exists in emojis.json, so a client can show the image
+// instead of the raw ":name:" text.
+const REACTION_TABLES = { dm: 'Message_Reactions', gc: 'Group_Chat_Message_Reactions' };
+function fetchReactionsJSON(kind, messageIds, meUsername) {
+    const byMessage = new Map();
+    const table = REACTION_TABLES[kind];
+    if (!table || !messageIds || !messageIds.length) return byMessage;
+    let rows;
+    try {
+        const placeholders = messageIds.map(() => '?').join(',');
+        rows = sqliteDb.prepare(
+            `SELECT message_id, emoji, username FROM ${table} WHERE message_id IN (${placeholders}) ORDER BY id ASC`
+        ).all(...messageIds);
+    } catch (e) {
+        console.error('fetchReactionsJSON error:', e.message);
+        return byMessage;
+    }
+    const customEmojis = loadCustomEmojis();
+    rows.forEach(r => {
+        let list = byMessage.get(r.message_id);
+        if (!list) { list = []; byMessage.set(r.message_id, list); }
+        let entry = list.find(x => x.emoji === r.emoji);
+        if (!entry) {
+            const m = /^:([A-Za-z0-9_-]{1,32}):$/.exec(r.emoji);
+            const custom = m && customEmojis.get(m[1].toLowerCase());
+            entry = { emoji: r.emoji, count: 0, mine: false, users: [], customEmojiUrl: custom ? custom.url : null };
+            list.push(entry);
+        }
+        entry.count++;
+        entry.users.push(r.username);
+        if (r.username === meUsername) entry.mine = true;
+    });
+    return byMessage;
+}
+
+function serializeMessageJSON(m, meUsername, reactions) {
     return {
         id: m.id,
         author: serializeAuthorJSON(m.from_user, m.Nickname, m.avatar_path, m.IsVerified),
@@ -11473,11 +11513,12 @@ function serializeMessageJSON(m, meUsername) {
         replyTo: m.reply_to || null,
         read: !!m.read,
         mine: m.from_user === meUsername,
-        attachments: getAttachments(m).map(serializeAttachmentJSON)
+        attachments: getAttachments(m).map(serializeAttachmentJSON),
+        reactions: reactions || []
     };
 }
 
-function serializeGroupMessageJSON(m, meUsername) {
+function serializeGroupMessageJSON(m, meUsername, reactions) {
     return {
         id: m.id,
         groupId: m.group_id,
@@ -11487,7 +11528,8 @@ function serializeGroupMessageJSON(m, meUsername) {
         edited: !!m.edited,
         replyTo: m.reply_to || null,
         mine: m.from_user === meUsername,
-        attachments: getAttachments(m).map(serializeAttachmentJSON)
+        attachments: getAttachments(m).map(serializeAttachmentJSON),
+        reactions: reactions || []
     };
 }
 
@@ -11679,8 +11721,9 @@ app.get('/api/v1/messages/:username', requireApiAuth, (req, res) => {
             ORDER BY Messages.id DESC LIMIT ?`, [...params, limit], (err, msgs) => {
         if (err) return res.status(500).json({ error: 'db error' });
         const ordered = (msgs || []).slice().reverse();
+        const reactionMap = fetchReactionsJSON('dm', ordered.map(m => m.id), me);
         res.json({
-            messages: ordered.map(m => serializeMessageJSON(m, me)),
+            messages: ordered.map(m => serializeMessageJSON(m, me, reactionMap.get(m.id))),
             hasMore: msgs.length === limit
         });
     });
@@ -11769,8 +11812,9 @@ app.get('/api/v1/groups/:id/messages', requireApiAuth, (req, res) => {
                 ORDER BY Group_Chat_Messages.id DESC LIMIT ?`, [...params, limit], (err, msgs) => {
             if (err) return res.status(500).json({ error: 'db error' });
             const ordered = (msgs || []).slice().reverse();
+            const reactionMap = fetchReactionsJSON('gc', ordered.map(m => m.id), me);
             res.json({
-                messages: ordered.map(m => serializeGroupMessageJSON(m, me)),
+                messages: ordered.map(m => serializeGroupMessageJSON(m, me, reactionMap.get(m.id))),
                 hasMore: msgs.length === limit
             });
         });

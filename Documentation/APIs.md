@@ -19,11 +19,11 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 | GET | `/api/v1/post/:id` | — | `{ post: Post }` - a single post by id |
 | GET | `/api/v1/post/:id/replies` | `before`, `limit` (default 20, max 50) | `{ replies: [Post...], hasMore }` |
 | GET | `/api/v1/messages` | — | `{ conversations: [{ username, lastMessageAt }, ...] }` - your DM inbox |
-| GET | `/api/v1/messages/:username` | `before`, `limit` (default 50, max 100) | `{ messages: [Message...], hasMore }` - oldest first |
+| GET | `/api/v1/messages/:username` | `before`, `limit` (default 50, max 100) | `{ messages: [Message...], hasMore }` - oldest first. Each message includes its `reactions` (see shapes below) |
 | POST | `/api/v1/messages/:username/mark-read` | — | `{ ok: true }` |
 | GET | `/api/v1/groups` | — | `{ groups: [{ id, name, createdBy, createdAt, isPublic, members: [username,...] }, ...] }` |
 | GET | `/api/v1/groups/public` | — | `{ groups: [{ id, name, createdBy, createdAt, memberCount, viewerIsMember }, ...] }` — every group chat that's currently public, for building a Discover view. Not scoped to your own groups; `viewerIsMember` tells you whether you're already in it |
-| GET | `/api/v1/groups/:id/messages` | `before`, `limit` (default 50, max 100) | `{ messages: [GroupMessage...], hasMore }`. `403` if you're not a member |
+| GET | `/api/v1/groups/:id/messages` | `before`, `limit` (default 50, max 100) | `{ messages: [GroupMessage...], hasMore }`. Each message includes its `reactions`. `403` if you're not a member |
 | GET | `/api/v1/notifications` | `before`, `limit` (default 50, max 100) | `{ notifications: [Notification...], hasMore }`. **Does not** mark anything as read (unlike the HTML `/notifications` page) - call `POST /notifications/mark-read` when you actually want that |
 
 **Shapes referenced above:**
@@ -55,10 +55,23 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
   "replyTo": null,
   "read": true,
   "mine": true,              // true if you sent it
-  "attachments": [ ... ]
+  "attachments": [ ... ],
+  "reactions": [ ... ]       // see Reaction below; always present, [] when there are none
 }
 
 // GroupMessage - same as Message but with "groupId" instead of "toUser"/"read"
+// (it has the same "reactions" array)
+
+// Reaction - one entry per distinct emoji on a message, in the order each emoji was first used
+{
+  "emoji": "👍",             // the reaction exactly as stored: a Unicode emoji, or ":name:" for a custom emoji
+  "count": 2,
+  "mine": true,              // true if YOU are one of the people who reacted with this emoji
+  "users": ["alice", "bob"], // usernames of everyone who reacted with it
+  "customEmojiUrl": null     // e.g. "/emojis/party_cat.gif" when emoji is ":party_cat:" and that custom emoji still
+                             // exists; null for Unicode emoji, or for a custom emoji that has since been removed
+                             // (in which case just show the ":name:" text)
+}
 
 // Notification
 {
@@ -74,7 +87,7 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 }
 ```
 
-**What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
+**What's still missing from `/api/v1`:** reactions on **feed posts** (`Post` has no `reactions` field; only DM and group chat messages do), adding/removing a reaction (use the legacy `react` routes below), posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
 
 ---
 
@@ -133,6 +146,7 @@ Posts support optional file attachments (up to 5 per post, `multipart/form-data`
 | GET | `/feed/reply-counts`, `/feed/poll`, etc. all require login | | 401 JSON `{ error }` otherwise |
 | POST | `/report` | body: `type: 'post'|'dm'|'gc', id` | **JSON.** `{ ok: true }` / `409 { error, alreadyReported: true }` on duplicate. Validates you actually had access to the content |
 | GET | `/api/my-reports` | — | **JSON, real data.** `{ reports: [{ type, id }, ...] }` — content you've already reported, for graying out report buttons |
+| POST | `/post/:id/react` | JSON body: `{ emoji }` | **Toggle** your reaction on a post: adds it if you haven't used that emoji on this post, removes it if you have. Returns **JSON (HTML fragment).** `{ ok: true, html }` — the freshly rendered reaction-chip row. See [Reactions](#reactions) for the rules |
 
 ## Following feed
 
@@ -179,7 +193,31 @@ Max message length **4000 characters**, up to **10 attachments** per message.
 | POST | `/messages/:username/mark-read` | — | Plain 200, no body |
 | POST | `/messages/:username/delete/:id` | — | Plain 200/403/404. Sender-only. Pushes SSE `delete` event |
 | POST | `/messages/:username/edit/:id` | body: `content` | **JSON.** `{ ok: true }`. Pushes SSE `edit` event |
-| GET | `/messages/:username/stream` | — | **SSE.** Events: `message`, `edit`, `delete` — each carries `{ event, html, id }` (delete only has `id`) |
+| POST | `/messages/:username/react/:id` | JSON body: `{ emoji }` | **Toggle** your reaction on a DM message (either participant can react). **JSON (HTML fragment).** `{ ok: true, html }`. Pushes an SSE `reaction` event to both participants. `403` if you're not part of that conversation. See [Reactions](#reactions) |
+| GET | `/messages/:username/stream` | — | **SSE.** Events: `message`, `edit`, `delete`, `reaction` — each carries `{ event, html, id }` (delete only has `id`). For `reaction`, `html` is the message's updated reaction-chip row (rendered from your point of view) — it's a fragment, not data; re-fetch `/api/v1/messages/:username` if you need the structured `reactions` |
+
+## Reactions
+
+Posts, DM messages and group chat messages can all be reacted to. There's one write endpoint per kind (documented in the Feed, Direct messages and Group chats tables): `POST /post/:id/react`, `POST /messages/:username/react/:id` and `POST /groups/:id/react/:msgId`. They all work the same way:
+
+- Body is JSON `{ "emoji": "<emoji>" }`. It's a **toggle**: sending an emoji you haven't used on that item adds your reaction; sending it again removes it. A person can stack several *different* emoji on one item, but not the same one twice.
+- `emoji` is trimmed and must be non-empty, contain no tabs/newlines, and be at most **100 characters**. (Anything else is accepted as-is — a Unicode emoji, or `:name:` for a custom emoji, see below.) Violations return `400 { error }`.
+- Each item can hold at most **24 different emoji** (the limit counts distinct emoji, not total reactions); adding a 25th returns `400 { error }`. Removing is always allowed.
+- Muted users can't react to posts (`403`). Not logged in returns `401 { error }`.
+- The response is `{ ok: true, html }` where `html` is the updated reaction-chip row. That's a server-rendered fragment, so a custom client should treat a successful response as "it worked" and re-read the structured `reactions` from `GET /api/v1/messages/:username` or `GET /api/v1/groups/:id/messages`. (Feed posts have no structured reactions field yet.)
+
+DM and group messages **read** reactions through `/api/v1` (the `reactions` array — see the Reaction shape above), and get live updates through the SSE `reaction` event on the chat's stream.
+
+### Custom emoji
+
+Admins can add custom emoji images (see `emojis.json` / `public/emojis/` on the server). Anyone can use them by typing `:name:` in a post, DM, group message or ticket, and they can also be used as reactions — a custom reaction is stored and returned as the literal text `:name:`.
+
+| Method | Path | Response |
+|---|---|---|
+| GET | `/custom-emojis.json` | **JSON, real data, no login needed.** `[{ name, url }, ...]`, e.g. `[{ "name": "party_cat", "url": "/emojis/party_cat.gif" }]`. Sent with `Cache-Control: no-cache`; the list updates without a server restart |
+| GET | `/emojis/:filename` | The image file itself (the `url` from the list above, already URL-encoded) |
+
+Rendering `:name:` in message text: names are letters, numbers, `_` and `-` (max 32 chars) and are **case-insensitive**. The server only converts a token when it's a known emoji and isn't directly preceded by a letter, digit or `/` (so `12:30:45` and `https://host/:thing:` are untouched), and never inside `` `code` `` spans. Message `content` in `/api/v1` is the **raw** text, so a custom client has to do this substitution itself using `/custom-emojis.json`. A message made of nothing but emoji (custom or Unicode, up to 27) is shown larger in the web UI.
 
 ## Notifications
 
@@ -205,7 +243,8 @@ Members must be friends with the inviter to be added, *unless* the group is publ
 | POST | `/groups/:id/send` | multipart: `content, reply_to?, attachments[]` | **JSON.** Pushes SSE `message` event to all members |
 | POST | `/groups/:id/delete/:msgId` | — | Plain 200/403/404 |
 | POST | `/groups/:id/edit/:msgId` | body: `content` | **JSON.** `{ ok: true }` |
-| GET | `/groups/:id/stream` | — | **SSE.** Events: `message`, `edit`, `delete`, same shape as DM stream |
+| POST | `/groups/:id/react/:msgId` | JSON body: `{ emoji }` | **Toggle** your reaction on a group message (members only). **JSON (HTML fragment).** `{ ok: true, html }`. Pushes an SSE `reaction` event to every member. `403` if you're not a member, `404` if the message isn't in that group. See [Reactions](#reactions) |
+| GET | `/groups/:id/stream` | — | **SSE.** Events: `message`, `edit`, `delete`, `reaction`, same shape as DM stream |
 | POST | `/groups/:id/toggle-public` | — | **JSON.** `{ ok: true, isPublic }`. Creator-only, flips the group's public/private flag. `403` if you're not the creator |
 | POST | `/groups/:id/join` | — | **JSON.** `{ ok: true, id }`. Joins a **public** group without needing a friendship or invite. `403 { error: "This group is not public." }` if it isn't public |
 
@@ -226,6 +265,7 @@ A few admin routes (`/admin/support`, `/admin/support/:id`, `/admin/reports`, an
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/uploads/download/:filename?name=...` | Serves an uploaded attachment for download |
+| GET | `/custom-emojis.json`, `/emojis/:filename` | Custom emoji list and images — see [Custom emoji](#custom-emoji) |
 | GET | `/theme.css` | Dynamic CSS based on saved theme preference |
 | GET | `/support`, POST `/support` | Support ticket form |
 | GET | `/404.html` | Themed "not found" page (matches `/theme.css`). Any unmatched non-`/api/*` route serves this with a `404` status, URL unchanged - not a redirect |
@@ -238,4 +278,5 @@ A few admin routes (`/admin/support`, `/admin/support/:id`, `/admin/reports`, an
 - **CSRF/forms**: none of the JSON POST endpoints appear to require a CSRF token beyond the session cookie itself — but note several endpoints (`/feed/post`, `/edit/*`, `/feed/delete/:id`) respond with redirects/empty bodies rather than JSON, since they're designed for a `<form>` POST or `fetch` where the frontend just reloads the relevant DOM section.
 - **File uploads**: any endpoint accepting `attachments[]`/`avatar` needs `multipart/form-data`, not JSON.
 - **Polling model**: there's no single "get full feed as JSON" endpoint — the initial page load (`GET /feed`, `GET /messages/:username`, etc.) renders the first batch server-side as part of the HTML page itself, then `.../poll` and `.../older` (or SSE) handle the rest. If you want the initial batch as data, you'd need to scrape it out of the HTML of the page route rather than an API call.
+- **Emoji and UTF-8**: the server sends emoji as raw UTF-8, but JSON also allows them as escaped surrogate pairs (like `\ud83d\udd25` for 🔥), so use a decoder that handles both. A hand-rolled decoder that only copes with ASCII `\uXXXX` escapes will turn emoji into `?`.
 - **IDs, not cursors**: pagination/polling everywhere uses numeric post/message IDs (`after`, `before`) rather than timestamps or opaque cursors.

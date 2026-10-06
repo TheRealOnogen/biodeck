@@ -24,6 +24,9 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 | GET | `/api/v1/groups` | — | `{ groups: [{ id, name, createdBy, createdAt, isPublic, members: [username,...] }, ...] }` |
 | GET | `/api/v1/groups/public` | — | `{ groups: [{ id, name, createdBy, createdAt, memberCount, viewerIsMember }, ...] }` — every group chat that's currently public, for building a Discover view. Not scoped to your own groups; `viewerIsMember` tells you whether you're already in it |
 | GET | `/api/v1/groups/:id/messages` | `before`, `limit` (default 50, max 100) | `{ messages: [GroupMessage...], hasMore }`. Each message includes its `reactions`. `403` if you're not a member |
+| POST | `/api/v1/post/:id/react` | body `{ emoji }` | **Toggle** your reaction on a post. `{ ok: true, added, reactions: [Reaction...] }` - `added` is `true` if the reaction was added, `false` if it was removed; `reactions` is the post's full, updated reaction list. `403` if you're muted, `404` if the post doesn't exist |
+| POST | `/api/v1/messages/:username/react/:id` | body `{ emoji }` | Same, for a DM message. `403` if you're not part of that conversation. Also pushes the SSE `reaction` event to both participants |
+| POST | `/api/v1/groups/:id/react/:msgId` | body `{ emoji }` | Same, for a group message. `403` if you're not a member, `404` if the message isn't in that group. Also pushes the SSE `reaction` event to every member |
 | GET | `/api/v1/notifications` | `before`, `limit` (default 50, max 100) | `{ notifications: [Notification...], hasMore }`. **Does not** mark anything as read (unlike the HTML `/notifications` page) - call `POST /notifications/mark-read` when you actually want that |
 
 **Shapes referenced above:**
@@ -41,7 +44,8 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
   "replyCount": 3,
   "attachments": [ { "url": "/uploads/xyz.png", "downloadUrl": "/uploads/download/xyz.png?name=...", "name": "xyz.png" } ],
   "viewerCanEdit": true,     // true only if this is your own post
-  "viewerCanDelete": true    // true if it's yours, or you're an admin
+  "viewerCanDelete": true,   // true if it's yours, or you're an admin
+  "reactions": [ ... ]       // see Reaction below; always present, [] when there are none
 }
 
 // Message (DM)
@@ -62,7 +66,7 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 // GroupMessage - same as Message but with "groupId" instead of "toUser"/"read"
 // (it has the same "reactions" array)
 
-// Reaction - one entry per distinct emoji on a message, in the order each emoji was first used
+// Reaction - one entry per distinct emoji on a post or message, in the order each emoji was first used
 {
   "emoji": "👍",             // the reaction exactly as stored: a Unicode emoji, or ":name:" for a custom emoji
   "count": 2,
@@ -87,7 +91,9 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 }
 ```
 
-**What's still missing from `/api/v1`:** reactions on **feed posts** (`Post` has no `reactions` field; only DM and group chat messages do), adding/removing a reaction (use the legacy `react` routes below), posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
+**Reactions in `/api/v1`:** posts, DMs and group messages all carry a structured `reactions` array on read, and each has a JSON react endpoint (the three `POST .../react` rows above) that returns the updated array instead of an HTML chip row. Rules are identical to the legacy routes - see [Reactions](#reactions).
+
+**What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
 
 ---
 
@@ -198,15 +204,15 @@ Max message length **4000 characters**, up to **10 attachments** per message.
 
 ## Reactions
 
-Posts, DM messages and group chat messages can all be reacted to. There's one write endpoint per kind (documented in the Feed, Direct messages and Group chats tables): `POST /post/:id/react`, `POST /messages/:username/react/:id` and `POST /groups/:id/react/:msgId`. They all work the same way:
+Posts, DM messages and group chat messages can all be reacted to. There's one write endpoint per kind (documented in the Feed, Direct messages and Group chats tables): `POST /post/:id/react`, `POST /messages/:username/react/:id` and `POST /groups/:id/react/:msgId`. Each also has a structured-JSON twin under `/api/v1` (`POST /api/v1/post/:id/react`, `POST /api/v1/messages/:username/react/:id`, `POST /api/v1/groups/:id/react/:msgId`) that custom clients should prefer. They all work the same way:
 
 - Body is JSON `{ "emoji": "<emoji>" }`. It's a **toggle**: sending an emoji you haven't used on that item adds your reaction; sending it again removes it. A person can stack several *different* emoji on one item, but not the same one twice.
 - `emoji` is trimmed and must be non-empty, contain no tabs/newlines, and be at most **100 characters**. (Anything else is accepted as-is — a Unicode emoji, or `:name:` for a custom emoji, see below.) Violations return `400 { error }`.
 - Each item can hold at most **24 different emoji** (the limit counts distinct emoji, not total reactions); adding a 25th returns `400 { error }`. Removing is always allowed.
 - Muted users can't react to posts (`403`). Not logged in returns `401 { error }`.
-- The response is `{ ok: true, html }` where `html` is the updated reaction-chip row. That's a server-rendered fragment, so a custom client should treat a successful response as "it worked" and re-read the structured `reactions` from `GET /api/v1/messages/:username` or `GET /api/v1/groups/:id/messages`. (Feed posts have no structured reactions field yet.)
+- The legacy routes respond `{ ok: true, html }` where `html` is the updated reaction-chip row (a server-rendered fragment). The `/api/v1` routes respond `{ ok: true, added, reactions }` instead: `added` is `true` when the call added your reaction and `false` when it removed it, and `reactions` is the item's full updated [Reaction](#shapes-referenced-above) array, so no re-fetch is needed. Error bodies are the same `{ error }` shape (the `/api/v1` messages have no trailing period).
 
-DM and group messages **read** reactions through `/api/v1` (the `reactions` array — see the Reaction shape above), and get live updates through the SSE `reaction` event on the chat's stream.
+Posts, DM messages and group messages all **read** reactions through `/api/v1` (the `reactions` array on every `Post`, `Message` and `GroupMessage` — see the Reaction shape above). DM and group chats also get live updates through the SSE `reaction` event on the chat's stream; feed posts have no live reaction push, so poll or re-fetch.
 
 ### Custom emoji
 

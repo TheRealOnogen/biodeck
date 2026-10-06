@@ -11446,7 +11446,7 @@ function serializeAuthorJSON(username, nickname, avatarPath, isVerified) {
     };
 }
 
-function serializePostJSON(post, sessionUsername, isAdmin) {
+function serializePostJSON(post, sessionUsername, isAdmin, reactions) {
     return {
         id: post.id,
         author: serializeAuthorJSON(post.username, post.Nickname, post.avatar_path, post.IsVerified),
@@ -11458,27 +11458,33 @@ function serializePostJSON(post, sessionUsername, isAdmin) {
         replyCount: post.reply_count || 0,
         attachments: getAttachments(post).map(serializeAttachmentJSON),
         viewerCanEdit: !!sessionUsername && post.username === sessionUsername,
-        viewerCanDelete: !!sessionUsername && (post.username === sessionUsername || !!isAdmin)
+        viewerCanDelete: !!sessionUsername && (post.username === sessionUsername || !!isAdmin),
+        reactions: reactions || []
     };
 }
 
-// Reactions for a whole page of DM or group chat messages in ONE query (not
-// one per message). `table` is only ever one of the two internal constants
+// Reactions for a whole page of posts, DM messages or group chat messages in ONE query (not
+// one per message). `kind` is only ever one of the internal keys
 // below, never request input. Returns Map(messageId -> [{ emoji, count, mine,
 // users, customEmojiUrl }]) with emoji in first-reacted order (same ordering
 // as the in-app chips). `customEmojiUrl` is set when the reaction is a
 // ":name:" that still exists in emojis.json, so a client can show the image
 // instead of the raw ":name:" text.
-const REACTION_TABLES = { dm: 'Message_Reactions', gc: 'Group_Chat_Message_Reactions' };
+const REACTION_TABLES = {
+    post: { table: 'Reactions', idCol: 'post_id' },
+    dm: { table: 'Message_Reactions', idCol: 'message_id' },
+    gc: { table: 'Group_Chat_Message_Reactions', idCol: 'message_id' }
+};
 function fetchReactionsJSON(kind, messageIds, meUsername) {
     const byMessage = new Map();
-    const table = REACTION_TABLES[kind];
-    if (!table || !messageIds || !messageIds.length) return byMessage;
+    const spec = REACTION_TABLES[kind];
+    if (!spec || !messageIds || !messageIds.length) return byMessage;
+    const { table, idCol } = spec;
     let rows;
     try {
         const placeholders = messageIds.map(() => '?').join(',');
         rows = sqliteDb.prepare(
-            `SELECT message_id, emoji, username FROM ${table} WHERE message_id IN (${placeholders}) ORDER BY id ASC`
+            `SELECT ${idCol} AS item_id, emoji, username FROM ${table} WHERE ${idCol} IN (${placeholders}) ORDER BY id ASC`
         ).all(...messageIds);
     } catch (e) {
         console.error('fetchReactionsJSON error:', e.message);
@@ -11486,8 +11492,8 @@ function fetchReactionsJSON(kind, messageIds, meUsername) {
     }
     const customEmojis = loadCustomEmojis();
     rows.forEach(r => {
-        let list = byMessage.get(r.message_id);
-        if (!list) { list = []; byMessage.set(r.message_id, list); }
+        let list = byMessage.get(r.item_id);
+        if (!list) { list = []; byMessage.set(r.item_id, list); }
         let entry = list.find(x => x.emoji === r.emoji);
         if (!entry) {
             const m = /^:([A-Za-z0-9_-]{1,32}):$/.exec(r.emoji);
@@ -11633,8 +11639,9 @@ app.get('/api/v1/feed', requireApiAuth, (req, res) => {
     fetchPostsJSON(where, params, limit, (err, posts) => {
         if (err) return res.status(500).json({ error: 'db error' });
         const roots = posts.filter(p => !p.reply_to);
+        const reactionMap = fetchReactionsJSON('post', roots.map(p => p.id), req.session.userUsername);
         res.json({
-            posts: roots.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin)),
+            posts: roots.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin, reactionMap.get(p.id))),
             hasMore: posts.length === limit
         });
     });
@@ -11651,8 +11658,9 @@ app.get('/api/v1/following-feed', requireApiAuth, (req, res) => {
         fetchPostsJSON(where, params, limit, (err, posts) => {
             if (err) return res.status(500).json({ error: 'db error' });
             const roots = posts.filter(p => !p.reply_to);
+            const reactionMap = fetchReactionsJSON('post', roots.map(p => p.id), me);
             res.json({
-                posts: roots.map(p => serializePostJSON(p, me, req.isAdmin)),
+                posts: roots.map(p => serializePostJSON(p, me, req.isAdmin, reactionMap.get(p.id))),
                 hasMore: posts.length === limit
             });
         });
@@ -11670,7 +11678,8 @@ app.get('/api/v1/post/:id', requireApiAuth, (req, res) => {
         [postId], (err, post) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!post) return res.status(404).json({ error: 'Post not found' });
-        res.json({ post: serializePostJSON(post, req.session.userUsername, req.isAdmin) });
+        const reactionMap = fetchReactionsJSON('post', [post.id], req.session.userUsername);
+        res.json({ post: serializePostJSON(post, req.session.userUsername, req.isAdmin, reactionMap.get(post.id)) });
     });
 });
 
@@ -11683,8 +11692,9 @@ app.get('/api/v1/post/:id/replies', requireApiAuth, (req, res) => {
     const params = before ? [postId, before] : [postId];
     fetchPostsJSON(where, params, limit, (err, replies) => {
         if (err) return res.status(500).json({ error: 'db error' });
+        const reactionMap = fetchReactionsJSON('post', replies.map(p => p.id), req.session.userUsername);
         res.json({
-            replies: replies.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin)),
+            replies: replies.map(p => serializePostJSON(p, req.session.userUsername, req.isAdmin, reactionMap.get(p.id))),
             hasMore: replies.length === limit
         });
     });
@@ -11816,6 +11826,110 @@ app.get('/api/v1/groups/:id/messages', requireApiAuth, (req, res) => {
             res.json({
                 messages: ordered.map(m => serializeGroupMessageJSON(m, me, reactionMap.get(m.id))),
                 hasMore: msgs.length === limit
+            });
+        });
+    });
+});
+
+// ----- Reactions (write) -----
+// JSON twins of POST /post/:id/react, /messages/:username/react/:id and
+// /groups/:id/react/:msgId. Same rules (toggle, 100-char emoji, 24 distinct
+// emoji per item, muted users can't react to posts, same SSE broadcasts for
+// chats) but the response is the structured `reactions` array for that one
+// item - never an HTML chip row.
+
+// Returns { emoji } on success or { status, error } on a validation failure.
+function parseReactionEmojiJSON(body) {
+    const emoji = ((body && body.emoji) || '').toString().trim();
+    if (!emoji) return { status: 400, error: 'Pick an emoji first' };
+    if (/[\r\n\t]/.test(emoji)) return { status: 400, error: 'Reactions must be a single emoji, not text' };
+    if (emoji.length > MAX_REACTION_EMOJI_LENGTH) return { status: 400, error: `Reaction too long - ${MAX_REACTION_EMOJI_LENGTH} character limit` };
+    return { emoji };
+}
+
+// Toggles (me, emoji) on one item. Synchronous (better-sqlite3), so the
+// exists/count/insert sequence can't interleave with another request.
+// Returns { added, reactions } or { status, error }. `kind` is one of
+// REACTION_TABLES' keys, never request input.
+function toggleReactionJSON(kind, itemId, me, emoji, maxDistinct) {
+    const { table, idCol } = REACTION_TABLES[kind];
+    try {
+        const existing = sqliteDb.prepare(`SELECT id FROM ${table} WHERE ${idCol} = ? AND username = ? AND emoji = ?`).get(itemId, me, emoji);
+        let added;
+        if (existing) {
+            sqliteDb.prepare(`DELETE FROM ${table} WHERE id = ?`).run(existing.id);
+            added = false;
+        } else {
+            const cnt = sqliteDb.prepare(`SELECT COUNT(DISTINCT emoji) AS n FROM ${table} WHERE ${idCol} = ?`).get(itemId);
+            if (cnt && cnt.n >= maxDistinct) return { status: 400, error: 'This item already has the maximum number of different reactions' };
+            sqliteDb.prepare(`INSERT INTO ${table} (${idCol}, username, emoji) VALUES (?, ?, ?)`).run(itemId, me, emoji);
+            added = true;
+        }
+        return { added, reactions: fetchReactionsJSON(kind, [itemId], me).get(itemId) || [] };
+    } catch (e) {
+        console.error('toggleReactionJSON error:', e.message);
+        return { status: 500, error: 'db error' };
+    }
+}
+
+app.post('/api/v1/post/:id/react', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const postId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(postId)) return res.status(404).json({ error: 'Post not found' });
+    const parsed = parseReactionEmojiJSON(req.body);
+    if (parsed.error) return res.status(parsed.status).json({ error: parsed.error });
+    isUserMuted(me, (errMute, mute) => {
+        if (!errMute && mute) return res.status(403).json({ error: 'Muted users cannot react to posts' });
+        db.get(`SELECT id FROM Posts WHERE id = ?`, [postId], (err, post) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            if (!post) return res.status(404).json({ error: 'Post not found' });
+            const result = toggleReactionJSON('post', postId, me, parsed.emoji, MAX_DISTINCT_REACTIONS_PER_POST);
+            if (result.error) return res.status(result.status).json({ error: result.error });
+            res.json({ ok: true, added: result.added, reactions: result.reactions });
+        });
+    });
+});
+
+app.post('/api/v1/messages/:username/react/:id', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const other = req.params.username;
+    const msgId = parseInt(req.params.id, 10);
+    if (!Number.isInteger(msgId)) return res.status(404).json({ error: 'Message not found' });
+    const parsed = parseReactionEmojiJSON(req.body);
+    if (parsed.error) return res.status(parsed.status).json({ error: parsed.error });
+    db.get(`SELECT id, from_user, to_user FROM Messages WHERE id = ?`, [msgId], (err, msg) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!msg) return res.status(404).json({ error: 'Message not found' });
+        const participants = [msg.from_user, msg.to_user];
+        if (me === other || !participants.includes(me) || !participants.includes(other)) {
+            return res.status(403).json({ error: 'Not part of this conversation' });
+        }
+        const result = toggleReactionJSON('dm', msgId, me, parsed.emoji, MAX_DISTINCT_REACTIONS_PER_MESSAGE);
+        if (result.error) return res.status(result.status).json({ error: result.error });
+        broadcastDMReaction(msg.from_user, msg.to_user, msgId);
+        res.json({ ok: true, added: result.added, reactions: result.reactions });
+    });
+});
+
+app.post('/api/v1/groups/:id/react/:msgId', requireApiAuth, (req, res) => {
+    const me = req.session.userUsername;
+    const groupId = parseInt(req.params.id, 10);
+    const msgId = parseInt(req.params.msgId, 10);
+    if (!Number.isInteger(groupId)) return res.status(404).json({ error: 'Group not found' });
+    if (!Number.isInteger(msgId)) return res.status(404).json({ error: 'Message not found' });
+    const parsed = parseReactionEmojiJSON(req.body);
+    if (parsed.error) return res.status(parsed.status).json({ error: parsed.error });
+    db.get(`SELECT id FROM Group_Chat_Members WHERE group_id = ? AND username = ?`, [groupId, me], (errMem, memberRow) => {
+        if (errMem) return res.status(500).json({ error: 'db error' });
+        if (!memberRow) return res.status(403).json({ error: 'Not a member of this group' });
+        db.get(`SELECT id FROM Group_Chat_Messages WHERE id = ? AND group_id = ?`, [msgId, groupId], (err, msg) => {
+            if (err) return res.status(500).json({ error: 'db error' });
+            if (!msg) return res.status(404).json({ error: 'Message not found' });
+            const result = toggleReactionJSON('gc', msgId, me, parsed.emoji, MAX_DISTINCT_REACTIONS_PER_MESSAGE);
+            if (result.error) return res.status(result.status).json({ error: result.error });
+            db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ?`, [groupId], (errMembers, memberRows) => {
+                broadcastGCReaction(groupId, msgId, (memberRows || []).map(r => r.username));
+                res.json({ ok: true, added: result.added, reactions: result.reactions });
             });
         });
     });

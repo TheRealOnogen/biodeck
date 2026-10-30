@@ -123,13 +123,17 @@ All endpoints below require a logged-in session unless noted otherwise. Endpoint
 | GET | `/account/verify-email?token=...` | query: `token` | Verifies email via emailed link |
 | POST | `/forgot-password` | body: `username` | Sends reset email |
 | POST | `/reset-password` | body: `token, password, confirm_password` | Resets password |
-| POST | `/account/delete-self` | body: `password` | **JSON.** Soft-deletes own account after password confirmation |
+| POST | `/account/delete-self` | body: `password` | **JSON.** `{ ok, deleted, redirect }`. Permanently deletes the account after password confirmation. Everything is first saved to `data/<YYYY-MM-DD>_<username>.tar.gz`; if that fails the account is **not** deleted (`500`) |
 | POST | `/account/email/request-code` | body: `new_email` | **JSON.** Sends a confirmation code to a new email |
 | POST | `/account/email/confirm` | body: `code` | **JSON.** Confirms the email change |
 | POST | `/edit/nickname` | multipart form | Redirect. Updates display nickname |
 | POST | `/edit/bio` | body: `bio` | Redirect. Updates bio |
 | POST | `/edit/avatar` | multipart (`avatar` file) | Redirect. Updates avatar image |
 | POST | `/edit/theme` | body: `theme` | Redirect. Updates saved theme preference |
+| POST | `/account/data-export` | JSON body: `categories` (array of `posts`, `dms`, `account`, `support`), `token?` | **JSON.** `{ ok, id, sentTo }` (`sentTo` is the masked address). Queues an archive that is **emailed to the address on the account** (never one from the request). Needs a session, or - for banned/deleted users, who have none - the signed `token` embedded in the ban/deleted screens (valid 2h). `400` no valid category / no verified email, `401` no session or bad token, `429` a request is still being prepared or the daily limit (`DATA_EXPORT_MAX_PER_DAY`, default 3) is reached, `503` SMTP not configured |
+| GET | `/account/data-export/requests` | — | **JSON.** `{ requests: [{ id, categories, status: 'pending'\|'processing'\|'sent'\|'failed', delivery: 'attachment'\|'link'\|null, error, createdAt, completedAt }] }` - your last 5 requests |
+| GET | `/data-export/download/:id/:token` | — | Link-mode download (archive too big to attach, `DATA_EXPORT_MAX_EMAIL_MB`, default 15). No login needed - the emailed token is the credential. Valid `DATA_EXPORT_LINK_TTL_HOURS` (default 168); `404` once expired |
+| GET | `/account/deleted` | — | HTML. Landing page after self-deleting an account; offers the data request using a short-lived `dx_token` cookie |
 | GET | `/api/check-ban-status` | — | **JSON.** `{ banned, type: 'ip'|'account'|'deleted', reason, expiresAt? }`. Polled by the client to detect a ban/deletion mid-session |
 | GET | `/api/user-events/stream` | — | **SSE.** Per-user push channel, currently used to notify the client it's just been banned so it can bounce to the ban screen |
 

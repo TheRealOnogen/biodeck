@@ -2925,6 +2925,44 @@ db.serialize(() => {
                 UNIQUE(message_id, username, emoji)
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_gc_message_reactions_message ON Group_Chat_Message_Reactions(message_id)`);
+            // Index of the data/<date>_<username>.tar.gz archives written when an
+            // account is deleted (see "Data export & account archives"). Rows are
+            // keyed by user_id, not by a foreign key, so they outlive the account.
+            // email is copied here because a permanently deleted account's row
+            // (and with it the address to send a data request to) is gone.
+            db.run(`CREATE TABLE IF NOT EXISTS Data_Archives (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                email TEXT DEFAULT NULL,
+                email_verified INTEGER DEFAULT 0,
+                filename TEXT NOT NULL,
+                reason TEXT DEFAULT NULL,
+                trigger_type TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_data_archives_user ON Data_Archives(user_id)`);
+            // One row per "email me my data" request. subject_type is 'user' (a
+            // live account, built from the database) or 'archive' (a deleted
+            // account, built from its Data_Archives file).
+            db.run(`CREATE TABLE IF NOT EXISTS Data_Export_Requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_type TEXT NOT NULL,
+                subject_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                email TEXT NOT NULL,
+                categories TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                delivery TEXT DEFAULT NULL,
+                error TEXT DEFAULT NULL,
+                size_bytes INTEGER DEFAULT NULL,
+                file_path TEXT DEFAULT NULL,
+                token_hash TEXT DEFAULT NULL,
+                expires_at TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME DEFAULT NULL
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_data_export_subject ON Data_Export_Requests(subject_type, subject_id)`);
             // Group id 1 is reserved as the system "activations" log - new account
             // notices get posted there. INSERT OR IGNORE so this is a no-op after
             // the first boot (and safe if it already exists from an older db).
@@ -3119,6 +3157,7 @@ function checkBan(req, res, next) {
         // delete for any session that's still logged in elsewhere.
         if (!user) {
             const goneUsername = req.session.userUsername;
+            const dataBlockHTML = dxRequestBlockForUserSync(req.session.userId, 'gone');
             getWarningsForUser(goneUsername, (errW, warnings) => {
                 const warningsHTML = renderWarningsTableHTML(warnings);
                 req.session.destroy(() => {
@@ -3150,7 +3189,7 @@ function checkBan(req, res, next) {
         ${renderAvatarBlockHTML(null, goneUsername)}
         <h1>Your account has been deleted</h1><br>
         ${renderStandingBlockHTML('Deleted')}
-        ${warningsHTML}<br>
+        ${warningsHTML}${dataBlockHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
@@ -3165,6 +3204,7 @@ function checkBan(req, res, next) {
             const reason = escapeHTML(user.DeleteReason || 'No reason provided');
             const deletedUsername = req.session.userUsername;
             const deletedAvatarPath = user.avatar_path;
+            const dataBlockHTML = dxRequestBlockForUserSync(req.session.userId, 'deleted');
             getWarningsForUser(deletedUsername, (errW, warnings) => {
                 const warningsHTML = renderWarningsTableHTML(warnings);
                 req.session.destroy(() => {
@@ -3197,7 +3237,7 @@ function checkBan(req, res, next) {
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${reason}</h3><br><br>
         ${renderStandingBlockHTML('Deleted')}
-        ${warningsHTML}<br>
+        ${warningsHTML}${dataBlockHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
@@ -3216,6 +3256,7 @@ function checkBan(req, res, next) {
                 : '';
             const bannedUsername = req.session.userUsername;
             const bannedAvatarPath = user.avatar_path;
+            const dataBlockHTML = dxRequestBlockForUserSync(req.session.userId, 'banned');
             getWarningsForUser(bannedUsername, (errW, warnings) => {
                 const warningsHTML = renderWarningsTableHTML(warnings);
                 req.session.destroy(() => {
@@ -3249,7 +3290,7 @@ function checkBan(req, res, next) {
         <h3>Ban Reason: ${reason}</h3><br><br>
         ${expiryLine}
         ${renderStandingBlockHTML('Banned')}
-        ${warningsHTML}<br>
+        ${warningsHTML}${dataBlockHTML}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
 </body>
@@ -3812,6 +3853,878 @@ function checkEmailVerified(req, res, next) {
     });
 }
 
+// ============================================================================
+// ----- Data export & account archives -----
+//
+// Two related features live here:
+//
+//  1. Data requests. Users can ask for a copy of their data (any mix of
+//     Posts, DMs, Account info, Support tickets) from the dashboard. It's
+//     built into a .tar.gz in the background and emailed to the address on
+//     the account - never to an address supplied in the request. Banned and
+//     deleted users can't reach the dashboard, so the ban / deleted screens
+//     carry the same request form, authorised by a short-lived signed token
+//     (see dxSignToken) instead of a session.
+//
+//  2. Deletion archives. Whenever an account is deleted (self-service, admin
+//     soft delete, admin permanent delete) everything we hold on it is first
+//     written to data/<YYYY-MM-DD>_<username>.tar.gz (Data_Archives keeps the
+//     index). Deleting is refused if the archive can't be written. A deleted
+//     user's data request is served from that archive.
+//
+// Archive layout (same for both):
+//   manifest.json, README.txt
+//   account/account.json        + account/avatar/<file>
+//   posts/posts.json            + posts/attachments/<file>
+//   dms/direct_messages.json, dms/group_chat_messages.json + dms/attachments/<file>
+//   support/tickets.json
+//
+// Env (all optional):
+//   DATA_EXPORT_MAX_EMAIL_MB     attach the archive up to this size, otherwise
+//                                email a download link instead (default 15)
+//   DATA_EXPORT_LINK_TTL_HOURS   how long such a link works (default 168 = 7d)
+//   DATA_EXPORT_MAX_PER_DAY      requests per account per rolling 24h (default 3)
+// ============================================================================
+const zlib = require('zlib');
+
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_EXPORTS_DIR = path.join(DATA_DIR, 'exports');
+fs.mkdirSync(DATA_EXPORTS_DIR, { recursive: true, mode: 0o700 });
+
+const DATA_EXPORT_MAX_EMAIL_BYTES = Math.max(0.001, parseFloat(process.env.DATA_EXPORT_MAX_EMAIL_MB || '15')) * 1024 * 1024;
+const DATA_EXPORT_LINK_TTL_MS = Math.max(0.01, parseFloat(process.env.DATA_EXPORT_LINK_TTL_HOURS || '168')) * 60 * 60 * 1000;
+const DATA_EXPORT_MAX_PER_DAY = Math.max(1, parseInt(process.env.DATA_EXPORT_MAX_PER_DAY || '3', 10) || 3);
+const DATA_EXPORT_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
+const DATA_EXPORT_COOKIE = 'dx_token';
+
+const DATA_EXPORT_CATEGORIES = [
+    { key: 'posts',   label: 'Posts',                                   dir: 'posts/' },
+    { key: 'dms',     label: 'DMs (and your group chat messages)',      dir: 'dms/' },
+    { key: 'account', label: 'Account info',                            dir: 'account/' },
+    { key: 'support', label: 'Support tickets',                         dir: 'support/' }
+];
+
+// Returns the valid category keys in canonical order ([] if none were valid).
+function parseExportCategories(input) {
+    const arr = Array.isArray(input) ? input : (typeof input === 'string' ? input.split(',') : []);
+    const wanted = new Set(arr.map(s => String(s).trim().toLowerCase()));
+    return DATA_EXPORT_CATEGORIES.filter(c => wanted.has(c.key)).map(c => c.key);
+}
+
+// Promise wrappers around the db shim. Only fixed SQL strings are passed in
+// here - the shim caches every distinct SQL text as a prepared statement.
+function dxAll(sql, params) { return new Promise((resolve, reject) => db.all(sql, params || [], (e, r) => e ? reject(e) : resolve(r || []))); }
+function dxGet(sql, params) { return new Promise((resolve, reject) => db.get(sql, params || [], (e, r) => e ? reject(e) : resolve(r))); }
+function dxRun(sql, params) {
+    return new Promise((resolve, reject) => db.run(sql, params || [], function (e) {
+        if (e) reject(e); else resolve({ lastID: this.lastID, changes: this.changes });
+    }));
+}
+
+// An error whose message is safe to show to the person who made the request.
+class DxUserError extends Error {}
+
+function dxMaskEmail(email) {
+    const s = String(email || '');
+    const at = s.indexOf('@');
+    if (at < 1) return '***';
+    return s.slice(0, 1) + '***' + s.slice(at);
+}
+
+function dxIso(ts) {
+    if (typeof ts === 'string' && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(ts)) return ts.replace(' ', 'T') + 'Z';
+    return ts == null ? null : ts;
+}
+
+// ---------- minimal streaming tar.gz writer / reader (no dependencies) ----------
+
+function dxWaitDrain(stream) {
+    return new Promise((resolve, reject) => {
+        const onDrain = () => { stream.off('error', onErr); resolve(); };
+        const onErr = (e) => { stream.off('drain', onDrain); reject(e); };
+        stream.once('drain', onDrain);
+        stream.once('error', onErr);
+    });
+}
+
+function dxTarHeader(name, size, mtime, typeflag) {
+    const h = Buffer.alloc(512);
+    h.write(name, 0, 100, 'utf8');
+    h.write('0000644\0', 100, 'ascii');
+    h.write('0000000\0', 108, 'ascii');
+    h.write('0000000\0', 116, 'ascii');
+    h.write(size.toString(8).padStart(11, '0') + '\0', 124, 'ascii');
+    h.write(Math.floor(mtime).toString(8).padStart(11, '0') + '\0', 136, 'ascii');
+    h.fill(0x20, 148, 156);
+    h.write(typeflag, 156, 'ascii');
+    h.write('ustar\0', 257, 'ascii');
+    h.write('00', 263, 'ascii');
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += h[i];
+    h.write(sum.toString(8).padStart(6, '0') + '\0 ', 148, 'ascii');
+    return h;
+}
+
+// One PAX extended-header record: "<len> <key>=<value>\n", where <len> counts
+// its own digits too. Used for entry names longer than ustar's 100 bytes.
+function dxPaxRecord(key, value) {
+    const body = ` ${key}=${value}\n`;
+    const bodyLen = Buffer.byteLength(body);
+    let digits = String(bodyLen).length;
+    for (;;) {
+        const total = bodyLen + digits;
+        if (String(total).length === digits) return Buffer.from(String(total) + body);
+        digits = String(total).length;
+    }
+}
+
+class DxTarGzWriter {
+    constructor(destPath) {
+        this.destPath = destPath;
+        this.gz = zlib.createGzip({ level: 6 });
+        this.out = fs.createWriteStream(destPath, { mode: 0o600 });
+        this.cur = null;
+        this.gz.pipe(this.out);
+        this.done = new Promise((resolve, reject) => {
+            this.out.on('finish', resolve);
+            this.out.on('error', reject);
+            this.gz.on('error', reject);
+        });
+        this.done.catch(() => {}); // surfaced through _write()/finish(); don't crash if never awaited
+    }
+
+    async _write(buf) {
+        if (!buf.length) return;
+        if (!this.gz.write(buf)) await dxWaitDrain(this.gz);
+    }
+
+    // Starts an entry; call data() until `size` bytes were written, then end().
+    async begin(name, size, mtime) {
+        if (this.cur) throw new Error('previous tar entry still open');
+        const m = mtime || Math.floor(Date.now() / 1000);
+        if (Buffer.byteLength(name) > 100) {
+            const rec = dxPaxRecord('path', name);
+            await this._write(dxTarHeader('PaxHeader/' + path.posix.basename(name).slice(0, 80), rec.length, m, 'x'));
+            await this._write(rec);
+            await this._write(Buffer.alloc((512 - (rec.length % 512)) % 512));
+        }
+        await this._write(dxTarHeader(name.slice(0, 100), size, m, '0'));
+        this.cur = { remaining: size, size };
+    }
+
+    async data(buf) {
+        const c = this.cur;
+        if (!c) throw new Error('no open tar entry');
+        if (buf.length > c.remaining) buf = buf.subarray(0, c.remaining);
+        c.remaining -= buf.length;
+        await this._write(buf);
+    }
+
+    async end() {
+        const c = this.cur;
+        if (!c) return;
+        this.cur = null;
+        if (c.remaining > 0) await this._write(Buffer.alloc(c.remaining)); // source shrank - keep the archive valid
+        await this._write(Buffer.alloc((512 - (c.size % 512)) % 512));
+    }
+
+    async addBuffer(name, buf, mtime) {
+        await this.begin(name, buf.length, mtime);
+        await this.data(buf);
+        await this.end();
+    }
+
+    // Streams a file from disk. Throws BEFORE writing anything if it can't be
+    // opened, so the caller can safely treat the file as missing.
+    async addFile(name, absPath) {
+        const fh = await fs.promises.open(absPath, 'r');
+        try {
+            const st = await fh.stat();
+            if (!st.isFile()) throw new Error('not a regular file');
+            await this.begin(name, st.size, Math.floor(st.mtimeMs / 1000));
+            try {
+                const stream = fh.createReadStream({ autoClose: false, start: 0, end: Math.max(0, st.size - 1) });
+                if (st.size > 0) for await (const chunk of stream) await this.data(chunk);
+            } catch (e) {
+                await this.end(); // zero-pads what is missing so the archive stays readable
+                throw e;
+            }
+            await this.end();
+        } finally {
+            await fh.close().catch(() => {});
+        }
+    }
+
+    async finish() {
+        if (this.cur) await this.end();
+        await this._write(Buffer.alloc(1024));
+        this.gz.end();
+        await this.done;
+    }
+
+    async abort() {
+        try { this.gz.destroy(); } catch (e) {}
+        try { this.out.destroy(); } catch (e) {}
+        await fs.promises.unlink(this.destPath).catch(() => {});
+    }
+}
+
+function dxParseTarHeader(b) {
+    const str = (s, e) => { let end = s; while (end < e && b[end] !== 0) end++; return b.toString('utf8', s, end); };
+    let name = str(0, 100);
+    if (str(257, 262) === 'ustar') {
+        const prefix = str(345, 500);
+        if (prefix) name = prefix + '/' + name;
+    }
+    const size = parseInt(str(124, 136).trim() || '0', 8);
+    const mtime = parseInt(str(136, 148).trim() || '0', 8);
+    if (!Number.isFinite(size) || size < 0) throw new Error('corrupt tar header');
+    return { name, size, mtime: Number.isFinite(mtime) ? mtime : 0, type: String.fromCharCode(b[156] || 48) };
+}
+
+function dxParsePaxPath(buf) {
+    let pos = 0;
+    while (pos < buf.length) {
+        const sp = buf.indexOf(0x20, pos);
+        if (sp < 0) break;
+        const len = parseInt(buf.toString('ascii', pos, sp), 10);
+        if (!len || pos + len > buf.length) break;
+        const rec = buf.toString('utf8', sp + 1, pos + len - 1);
+        const eq = rec.indexOf('=');
+        if (eq > 0 && rec.slice(0, eq) === 'path') return rec.slice(eq + 1);
+        pos += len;
+    }
+    return null;
+}
+
+// Streams through a .tar.gz. onEntry({name,size,mtime,type}) may return
+// null/undefined to skip the entry's data, or a sink { write(buf), end() }
+// (both may be async) to receive it.
+async function dxUntarGz(file, onEntry) {
+    const rs = fs.createReadStream(file);
+    const gunzip = zlib.createGunzip();
+    rs.on('error', e => gunzip.destroy(e));
+    rs.pipe(gunzip);
+    let pending = Buffer.alloc(0);
+    let cur = null;
+    let longName = null;
+    let finished = false;
+    try {
+        for await (const chunk of gunzip) {
+            pending = pending.length ? Buffer.concat([pending, chunk]) : chunk;
+            while (!finished) {
+                if (!cur) {
+                    if (pending.length < 512) break;
+                    const block = pending.subarray(0, 512);
+                    pending = pending.subarray(512);
+                    if (block.every(x => x === 0)) { finished = true; break; }
+                    const h = dxParseTarHeader(block);
+                    cur = { h, remaining: h.size, pad: (512 - (h.size % 512)) % 512, sink: null, collect: null };
+                    if (h.type === 'x' || h.type === 'g' || h.type === 'L') {
+                        cur.collect = [];
+                    } else {
+                        const name = longName || h.name;
+                        longName = null;
+                        cur.sink = (await onEntry({ name, size: h.size, mtime: h.mtime, type: h.type })) || null;
+                    }
+                }
+                if (cur.remaining > 0) {
+                    if (!pending.length) break;
+                    const take = Math.min(cur.remaining, pending.length);
+                    const part = pending.subarray(0, take);
+                    pending = pending.subarray(take);
+                    cur.remaining -= take;
+                    if (cur.collect) cur.collect.push(part);
+                    else if (cur.sink) await cur.sink.write(part);
+                    if (cur.remaining > 0) break;
+                }
+                if (cur.pad > 0) {
+                    const take = Math.min(cur.pad, pending.length);
+                    pending = pending.subarray(take);
+                    cur.pad -= take;
+                    if (cur.pad > 0) break;
+                }
+                if (cur.collect) {
+                    const buf = Buffer.concat(cur.collect);
+                    if (cur.h.type === 'x') longName = dxParsePaxPath(buf) || longName;
+                    else if (cur.h.type === 'L') longName = buf.toString('utf8').replace(/\0.*$/s, '');
+                } else if (cur.sink) {
+                    await cur.sink.end();
+                }
+                cur = null;
+            }
+            if (finished) break;
+        }
+        if (!finished && cur) throw new Error('unexpected end of archive');
+    } finally {
+        rs.destroy();
+        gunzip.destroy();
+    }
+}
+
+// ---------- gathering a user's data ----------
+
+// Collects the attachment files that go into an archive. ref() hands back the
+// { name, file } object that is embedded in the JSON; commit() then copies the
+// files in and blanks `file` for anything that vanished in the meantime.
+class DxAttachments {
+    constructor() { this.entries = new Map(); this.counter = 0; }
+
+    ref(dir, f) {
+        const base = path.basename(String((f && f.path) || '').replace(/\\/g, '/'));
+        const out = { name: String((f && f.name) || base || 'file'), file: null };
+        if (!base || base.startsWith('.')) return out;
+        const abs = path.join(uploadsDir, base);
+        const key = dir + '|' + abs;
+        let entry = this.entries.get(key);
+        if (!entry) {
+            try { if (!fs.statSync(abs).isFile()) return out; } catch (e) { return out; }
+            const safe = base.replace(/[^A-Za-z0-9._-]/g, '_').replace(/^\.+/, '_').slice(-80);
+            entry = { abs, archiveName: `${dir}${++this.counter}_${safe}`, refs: [] };
+            this.entries.set(key, entry);
+        }
+        out.file = entry.archiveName;
+        entry.refs.push(out);
+        return out;
+    }
+
+    async commit(writer) {
+        for (const entry of this.entries.values()) {
+            try {
+                await writer.addFile(entry.archiveName, entry.abs);
+            } catch (e) {
+                console.error('Data export: could not add attachment', path.basename(entry.abs), '-', e.message);
+                entry.refs.forEach(r => { r.file = null; });
+            }
+        }
+    }
+}
+
+function dxGroupReactions(rows, idKey) {
+    const byId = new Map();
+    for (const r of rows) {
+        let perEmoji = byId.get(r[idKey]);
+        if (!perEmoji) { perEmoji = new Map(); byId.set(r[idKey], perEmoji); }
+        if (!perEmoji.has(r.emoji)) perEmoji.set(r.emoji, []);
+        perEmoji.get(r.emoji).push(r.username);
+    }
+    const lookup = (id) => {
+        const perEmoji = byId.get(id);
+        return perEmoji ? Array.from(perEmoji, ([emoji, users]) => ({ emoji, users })) : [];
+    };
+    return lookup;
+}
+
+// Returns { 'archive/path.json': object, ... } for the requested categories.
+async function dxCollect(userId, username, categories, att) {
+    const want = new Set(categories);
+    const docs = {};
+
+    if (want.has('account')) {
+        const u = await dxGet(`SELECT * FROM User_Data WHERE id = ?`, [userId]);
+        if (!u) throw new DxUserError('This account no longer exists.');
+        const friends = await dxAll(`SELECT user_a, user_b, created_at FROM Friends WHERE user_a = ? OR user_b = ? ORDER BY id`, [username, username]);
+        const friendRequests = await dxAll(`SELECT from_user, to_user, status, created_at FROM Friend_Requests WHERE from_user = ? OR to_user = ? ORDER BY id`, [username, username]);
+        const following = await dxAll(`SELECT following_username, created_at FROM Follows WHERE follower_username = ? ORDER BY id`, [username]);
+        const followers = await dxAll(`SELECT follower_username, created_at FROM Follows WHERE following_username = ? ORDER BY id`, [username]);
+        const groups = await dxAll(`SELECT g.id, g.name, g.created_by, g.is_public, m.joined_at
+            FROM Group_Chat_Members m JOIN Group_Chats g ON g.id = m.group_id WHERE m.username = ? ORDER BY g.id`, [username]);
+        const warnings = await dxAll(`SELECT reason, created_at, expires_at, mute_chat, account_action, removed_content FROM Warnings WHERE username = ? ORDER BY id`, [username]);
+        const logins = await dxAll(`SELECT ip, event, created_at FROM IP_Login_History WHERE user_id = ? ORDER BY id`, [userId]);
+
+        // Uploaded avatars are stored as public/uploads/<file>; the default
+        // placeholder (public/Default.png) isn't in uploadsDir so ref() skips it.
+        let avatar = null;
+        if (u.avatar_path) {
+            const ref = att.ref('account/avatar/', { path: u.avatar_path, name: path.basename(String(u.avatar_path)) });
+            if (ref.file) avatar = ref;
+        }
+        docs['account/account.json'] = {
+            username: u.username,
+            nickname: u.Nickname || null,
+            bio: u.bio || '',
+            email: u.email || null,
+            email_verified: !!u.email_verified,
+            theme: u.theme || 'default',
+            avatar,
+            badges: {
+                verified: !!u.IsVerified, supporter: !!u.IsSupporter, developer: !!u.IsDeveloper,
+                admin: !!u.IsAdmin, head_admin: !!u.IsHeadAdmin, owner: !!u.IsOwner
+            },
+            status: {
+                banned: !!u.IsBanned, ban_reason: u.BanReason || null, ban_expires_at: u.BanExpiresAt || null,
+                deleted: !!u.IsDeleted, delete_reason: u.DeleteReason || null
+            },
+            friends: friends.map(r => ({ username: r.user_a === username ? r.user_b : r.user_a, since: dxIso(r.created_at) })),
+            friend_requests: friendRequests.map(r => ({
+                direction: r.from_user === username ? 'sent' : 'received',
+                other_user: r.from_user === username ? r.to_user : r.from_user,
+                status: r.status, created_at: dxIso(r.created_at)
+            })),
+            following: following.map(r => ({ username: r.following_username, since: dxIso(r.created_at) })),
+            followers: followers.map(r => ({ username: r.follower_username, since: dxIso(r.created_at) })),
+            group_chats: groups.map(g => ({
+                id: g.id, name: g.name, created_by: g.created_by, public: !!g.is_public, joined_at: dxIso(g.joined_at)
+            })),
+            warnings: warnings.map(w => ({
+                reason: w.reason, issued_at: dxIso(w.created_at), expires_at: w.expires_at || null,
+                muted_chat: !!w.mute_chat, account_action: w.account_action || null, removed_content: w.removed_content || null
+            })),
+            login_history: logins.map(l => ({ ip: l.ip, event: l.event, at: dxIso(l.created_at) }))
+        };
+    }
+
+    if (want.has('posts')) {
+        const rows = await dxAll(`SELECT id, content, file_path, file_name, files_json, reply_to, pinned, edited, created_at
+            FROM Posts WHERE username = ? ORDER BY id`, [username]);
+        const reactions = dxGroupReactions(await dxAll(`SELECT post_id, emoji, username FROM Reactions
+            WHERE post_id IN (SELECT id FROM Posts WHERE username = ?) ORDER BY id`, [username]), 'post_id');
+        docs['posts/posts.json'] = {
+            username, count: rows.length,
+            posts: rows.map(r => ({
+                id: r.id, content: r.content, created_at: dxIso(r.created_at),
+                reply_to_post: r.reply_to || null, pinned: !!r.pinned, edited: !!r.edited,
+                attachments: getAttachments(r).map(f => att.ref('posts/attachments/', f)),
+                reactions: reactions(r.id)
+            }))
+        };
+    }
+
+    if (want.has('dms')) {
+        const dms = await dxAll(`SELECT id, from_user, to_user, content, file_path, file_name, files_json, reply_to, edited, read, created_at
+            FROM Messages WHERE from_user = ? OR to_user = ? ORDER BY id`, [username, username]);
+        const dmReactions = dxGroupReactions(await dxAll(`SELECT message_id, emoji, username FROM Message_Reactions
+            WHERE message_id IN (SELECT id FROM Messages WHERE from_user = ? OR to_user = ?) ORDER BY id`, [username, username]), 'message_id');
+        docs['dms/direct_messages.json'] = {
+            username, count: dms.length,
+            note: 'Every direct message you sent or received.',
+            messages: dms.map(r => ({
+                id: r.id, from: r.from_user, to: r.to_user, content: r.content, sent_at: dxIso(r.created_at),
+                read: !!r.read, edited: !!r.edited, reply_to_message: r.reply_to || null,
+                attachments: getAttachments(r).map(f => att.ref('dms/attachments/', f)),
+                reactions: dmReactions(r.id)
+            }))
+        };
+        const gcs = await dxAll(`SELECT m.id, m.group_id, g.name AS group_name, m.content, m.file_path, m.file_name, m.files_json, m.reply_to, m.edited, m.created_at
+            FROM Group_Chat_Messages m LEFT JOIN Group_Chats g ON g.id = m.group_id WHERE m.from_user = ? ORDER BY m.id`, [username]);
+        const gcReactions = dxGroupReactions(await dxAll(`SELECT message_id, emoji, username FROM Group_Chat_Message_Reactions
+            WHERE message_id IN (SELECT id FROM Group_Chat_Messages WHERE from_user = ?) ORDER BY id`, [username]), 'message_id');
+        docs['dms/group_chat_messages.json'] = {
+            username, count: gcs.length,
+            note: 'Group chat messages you sent (other members\' messages are not included).',
+            messages: gcs.map(r => ({
+                id: r.id, group_id: r.group_id, group_name: r.group_name || null, content: r.content, sent_at: dxIso(r.created_at),
+                edited: !!r.edited, reply_to_message: r.reply_to || null,
+                attachments: getAttachments(r).map(f => att.ref('dms/attachments/', f)),
+                reactions: gcReactions(r.id)
+            }))
+        };
+    }
+
+    if (want.has('support')) {
+        const tickets = await dxAll(`SELECT id, subject, message, status, created_at FROM Support_Tickets WHERE username = ? ORDER BY id`, [username]);
+        const replies = await dxAll(`SELECT ticket_id, message, is_customer, created_at FROM Support_Ticket_Replies
+            WHERE ticket_id IN (SELECT id FROM Support_Tickets WHERE username = ?) ORDER BY id`, [username]);
+        docs['support/tickets.json'] = {
+            username, count: tickets.length,
+            tickets: tickets.map(t => ({
+                id: t.id, subject: t.subject, message: t.message, status: t.status, created_at: dxIso(t.created_at),
+                replies: replies.filter(r => r.ticket_id === t.id).map(r => ({
+                    from: r.is_customer ? 'you' : 'support team', message: r.message, at: dxIso(r.created_at)
+                }))
+            }))
+        };
+    }
+    return docs;
+}
+
+function dxReadmeText(manifest) {
+    const names = DATA_EXPORT_CATEGORIES.filter(c => manifest.categories.includes(c.key)).map(c => c.label).join(', ');
+    return [
+        `Biodeck data export for @${manifest.username}`,
+        `Generated: ${manifest.generated_at}`,
+        `Included: ${names}`,
+        manifest.source === 'archive of deleted account' ? `Source: the copy saved when the account was deleted (${manifest.account_archived_at || 'unknown date'}).` : '',
+        '',
+        'Everything is plain JSON (UTF-8) except uploaded files, which are stored as-is.',
+        'Timestamps are UTC. Files referenced in the JSON (the "file" field) live next to it',
+        'under an "attachments" folder; "file": null means the upload no longer exists.',
+        '',
+        '  account/account.json          profile, email, badges, friends, follows, warnings, login history',
+        '  posts/posts.json              your posts and replies',
+        '  dms/direct_messages.json      DMs you sent or received',
+        '  dms/group_chat_messages.json  group chat messages you sent',
+        '  support/tickets.json          your support tickets and the replies on them',
+        ''
+    ].filter(l => l !== null).join('\n');
+}
+
+function dxManifest(username, categories, source, extra) {
+    return Object.assign({
+        format: 'biodeck-data-export', version: 1, username, categories,
+        generated_at: new Date().toISOString(), source
+    }, extra || {});
+}
+
+// Builds a data archive for a live account straight from the database.
+async function dxWriteUserArchive({ userId, username, categories, destPath, source, extra }) {
+    const att = new DxAttachments();
+    const docs = await dxCollect(userId, username, categories, att);
+    const w = new DxTarGzWriter(destPath);
+    try {
+        await att.commit(w);
+        for (const [name, obj] of Object.entries(docs)) {
+            await w.addBuffer(name, Buffer.from(JSON.stringify(obj, null, 2), 'utf8'));
+        }
+        const manifest = dxManifest(username, categories, source || 'live account', extra);
+        await w.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+        await w.addBuffer('README.txt', Buffer.from(dxReadmeText(manifest), 'utf8'));
+        await w.finish();
+    } catch (e) {
+        await w.abort();
+        throw e;
+    }
+}
+
+// Re-packs a deletion archive, keeping only the requested categories.
+async function dxFilterArchive(srcFile, categories, destPath, archiveRow) {
+    const prefixes = categories.map(k => DATA_EXPORT_CATEGORIES.find(c => c.key === k).dir);
+    const w = new DxTarGzWriter(destPath);
+    try {
+        let found = 0;
+        await dxUntarGz(srcFile, async (hdr) => {
+            if (hdr.type !== '0' && hdr.type !== '\0') return null;
+            const name = hdr.name.replace(/^\.\//, '');
+            if (!name || name.startsWith('/') || name.split('/').includes('..')) return null;
+            if (!prefixes.some(p => name.startsWith(p))) return null;
+            found++;
+            await w.begin(name, hdr.size, hdr.mtime);
+            return { write: (b) => w.data(b), end: () => w.end() };
+        });
+        const manifest = dxManifest(archiveRow.username, categories, 'archive of deleted account', {
+            account_archived_at: dxIso(archiveRow.created_at), account_deletion_reason: archiveRow.reason || null
+        });
+        await w.addBuffer('manifest.json', Buffer.from(JSON.stringify(manifest, null, 2), 'utf8'));
+        await w.addBuffer('README.txt', Buffer.from(dxReadmeText(manifest), 'utf8'));
+        await w.finish();
+    } catch (e) {
+        await w.abort();
+        throw e;
+    }
+}
+
+// ---------- deletion archives ----------
+
+// Writes data/<YYYY-MM-DD>_<username>.tar.gz for the account and records it in
+// Data_Archives. Resolves to the Data_Archives row. Throws if the archive could
+// not be written - callers must NOT go on to delete in that case.
+async function dxArchiveAccount(userId, reason, trigger) {
+    const user = await dxGet(`SELECT id, username, email, email_verified, IsDeleted FROM User_Data WHERE id = ?`, [userId]);
+    if (!user) throw new Error('user not found');
+
+    // A soft-deleted account was already archived (with its posts) at that
+    // point; a later permanent delete reuses that archive instead of writing a
+    // second, emptier one.
+    if (user.IsDeleted) {
+        const existing = await dxGet(`SELECT * FROM Data_Archives WHERE user_id = ? ORDER BY id DESC LIMIT 1`, [userId]);
+        if (existing && fs.existsSync(path.join(DATA_DIR, existing.filename))) return existing;
+    }
+
+    fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
+    const date = new Date().toISOString().slice(0, 10);
+    // Claim a free filename atomically ('wx'); same user + same day can happen
+    // if a username is re-registered after a permanent delete.
+    let filename = null;
+    for (let n = 1; n < 1000 && !filename; n++) {
+        const candidate = n === 1 ? `${date}_${user.username}.tar.gz` : `${date}_${user.username}-${n}.tar.gz`;
+        try { fs.closeSync(fs.openSync(path.join(DATA_DIR, candidate), 'wx', 0o600)); filename = candidate; }
+        catch (e) { if (e.code !== 'EEXIST') throw e; }
+    }
+    if (!filename) throw new Error('could not allocate an archive filename');
+
+    const finalPath = path.join(DATA_DIR, filename);
+    const partPath = finalPath + '.part';
+    try {
+        await dxWriteUserArchive({
+            userId: user.id, username: user.username, categories: DATA_EXPORT_CATEGORIES.map(c => c.key),
+            destPath: partPath, source: 'deletion archive', extra: { deletion_reason: reason || null, deletion_trigger: trigger || null }
+        });
+        await fs.promises.rename(partPath, finalPath);
+        const ins = await dxRun(`INSERT INTO Data_Archives (user_id, username, email, email_verified, filename, reason, trigger_type) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [user.id, user.username, user.email || null, user.email_verified ? 1 : 0, filename, reason || null, trigger || null]);
+        logAudit('account_archived', 'System', user.username, filename);
+        return await dxGet(`SELECT * FROM Data_Archives WHERE id = ?`, [ins.lastID]);
+    } catch (e) {
+        await fs.promises.unlink(partPath).catch(() => {});
+        await fs.promises.unlink(finalPath).catch(() => {});
+        throw e;
+    }
+}
+
+// ---------- signed tokens for people without a session ----------
+
+const DX_TOKEN_KEY = crypto.createHmac('sha256', SESSION_SECRET).update('biodeck-data-export-token-v1').digest();
+
+function dxSignToken(payload) {
+    const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.createHmac('sha256', DX_TOKEN_KEY).update(body).digest('base64url');
+    return `${body}.${sig}`;
+}
+
+function dxVerifyToken(token) {
+    if (typeof token !== 'string' || token.length > 600) return null;
+    const dot = token.indexOf('.');
+    if (dot < 1) return null;
+    const body = token.slice(0, dot);
+    const sig = Buffer.from(token.slice(dot + 1), 'base64url');
+    const expected = crypto.createHmac('sha256', DX_TOKEN_KEY).update(body).digest();
+    if (sig.length !== expected.length || !crypto.timingSafeEqual(sig, expected)) return null;
+    try {
+        const p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+        if (!p || (p.t !== 'user' && p.t !== 'archive') || !Number.isInteger(p.id) || !(p.exp > Date.now())) return null;
+        return p;
+    } catch (e) { return null; }
+}
+
+function dxSubjectToken(type, id) {
+    return dxSignToken({ t: type, id, exp: Date.now() + DATA_EXPORT_TOKEN_TTL_MS });
+}
+
+function dxReadCookie(req, name) {
+    for (const part of String(req.headers.cookie || '').split(';')) {
+        const i = part.indexOf('=');
+        if (i < 0 || part.slice(0, i).trim() !== name) continue;
+        try { return decodeURIComponent(part.slice(i + 1).trim()); } catch (e) { return null; }
+    }
+    return null;
+}
+
+// ---------- HTML: request form ----------
+
+function dxCategoryCheckboxesHTML() {
+    return DATA_EXPORT_CATEGORIES.map(c =>
+        `<label style="display:flex;align-items:center;gap:8px;margin:5px 0;font-size:0.9em;cursor:pointer;">` +
+        `<input type="checkbox" class="dx-cat" value="${c.key}" checked style="width:auto;margin:0;"> ${escapeHTML(c.label)}</label>`
+    ).join('');
+}
+
+// The "Your Data" block on the ban / deleted screens. `token` authorises the
+// request without a session.
+function renderDataRequestBlockHTML(token, email) {
+    return `<div class="dx-block" data-token="${escapeHTML(token)}" style="margin:18px 0;text-align:left;">
+        <div style="opacity:0.6;font-size:0.85em;margin-bottom:8px;text-align:center;">Your Data</div>
+        <p style="font-size:0.85em;opacity:0.75;margin:0 0 8px;text-align:center;">You can request a copy of your data. We'll email it to <strong>${escapeHTML(dxMaskEmail(email))}</strong>.</p>
+        <div style="display:inline-block;text-align:left;">${dxCategoryCheckboxesHTML()}</div>
+        <div style="text-align:center;margin-top:10px;"><button type="button" class="button dx-send" style="width:auto;padding-left:18px;padding-right:18px;">Email me my data</button></div>
+        <div class="dx-result" style="margin-top:8px;font-size:0.85em;text-align:center;min-height:1.2em;"></div>
+    </div>
+    <script>
+    (function () {
+        var block = document.querySelector('.dx-block');
+        if (!block) return;
+        var btn = block.querySelector('.dx-send');
+        var out = block.querySelector('.dx-result');
+        btn.addEventListener('click', function () {
+            var cats = [];
+            block.querySelectorAll('.dx-cat').forEach(function (c) { if (c.checked) cats.push(c.value); });
+            if (!cats.length) { out.style.color = 'var(--danger-light-color)'; out.textContent = 'Choose at least one thing to include.'; return; }
+            btn.disabled = true; out.style.color = ''; out.textContent = 'Sending request...';
+            fetch('/account/data-export', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: block.getAttribute('data-token'), categories: cats })
+            }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+              .then(function (res) {
+                if (!res.ok) { out.style.color = 'var(--danger-light-color)'; out.textContent = res.d.error || 'Could not send the request.'; btn.disabled = false; return; }
+                out.style.color = 'var(--accent-color)';
+                out.textContent = 'Request received. Your data will be emailed to ' + res.d.sentTo + ' shortly.';
+              }).catch(function () { out.style.color = 'var(--danger-light-color)'; out.textContent = 'Network error.'; btn.disabled = false; });
+        });
+    })();
+    <\/script>`;
+}
+
+// Synchronous on purpose (better-sqlite3 is): the ban / deleted screens build
+// their HTML right after destroying the session, so this is evaluated before.
+// state: 'banned' (data still in the DB) | 'deleted' (soft delete) | 'gone'
+// (permanently deleted - only the archive is left). Returns '' when there is
+// nothing to offer; never throws.
+function dxRequestBlockForUserSync(userId, state) {
+    try {
+        const archive = getStmt(`SELECT id, email, email_verified, filename FROM Data_Archives WHERE user_id = ? ORDER BY id DESC LIMIT 1`).get(userId);
+        const archiveOk = !!(archive && fs.existsSync(path.join(DATA_DIR, archive.filename)));
+        let subject;
+        if (state === 'gone' || (state === 'deleted' && archiveOk)) {
+            if (!archiveOk) return '';
+            subject = { type: 'archive', id: archive.id, email: archive.email, verified: archive.email_verified };
+        } else {
+            const u = getStmt(`SELECT id, email, email_verified FROM User_Data WHERE id = ?`).get(userId);
+            if (!u) return '';
+            subject = { type: 'user', id: u.id, email: u.email, verified: u.email_verified };
+        }
+        const note = (msg) => `<div style="margin:18px 0;"><div style="opacity:0.6;font-size:0.85em;margin-bottom:4px;">Your Data</div><p style="font-size:0.85em;opacity:0.7;margin:0;">${msg}</p></div>`;
+        if (!subject.email) return note('There is no email address on file for this account, so a data request can\'t be sent. Contact support if you need a copy.');
+        if (!subject.verified) return note('The email address on this account was never verified, so we can\'t send your data there. Contact support if you need a copy.');
+        return renderDataRequestBlockHTML(dxSubjectToken(subject.type, subject.id), subject.email);
+    } catch (e) {
+        console.error('Data request block error:', e.message);
+        return '';
+    }
+}
+
+// ---------- worker ----------
+
+let dxWorkerRunning = false;
+function dxKickQueue() {
+    if (dxWorkerRunning) return;
+    dxWorkerRunning = true;
+    (async () => {
+        try {
+            for (;;) {
+                const job = await dxGet(`SELECT * FROM Data_Export_Requests WHERE status = 'pending' ORDER BY id LIMIT 1`);
+                if (!job) break;
+                await dxRun(`UPDATE Data_Export_Requests SET status = 'processing' WHERE id = ?`, [job.id]);
+                await dxProcessJob(job);
+            }
+        } catch (e) {
+            console.error('Data export worker error:', e.message);
+        } finally {
+            dxWorkerRunning = false;
+        }
+    })();
+}
+
+function dxEmailParts(job, mode, linkUrl, expiresAt) {
+    const names = job.categories.split(',').map(k => (DATA_EXPORT_CATEGORIES.find(c => c.key === k) || { label: k }).label);
+    const fromArchive = job.subject_type === 'archive';
+    const subject = 'Your Biodeck data export';
+    const intro = fromArchive
+        ? `You asked for a copy of the data from your deleted Biodeck account @${job.username}.`
+        : `You asked for a copy of your Biodeck data (account @${job.username}).`;
+    const what = `Included: ${names.join(', ')}.`;
+    const how = mode === 'link'
+        ? `The archive is too large to attach, so you can download it here until ${new Date(expiresAt).toUTCString()}:\n${linkUrl}`
+        : 'The archive (a .tar.gz file) is attached. Open it with any archive tool - everything inside is plain JSON plus your uploaded files, and a README.txt explains the layout.';
+    const outro = 'If you didn\'t ask for this, you can ignore this email - nothing was shared with anyone else.';
+    const text = `${intro}\n\n${what}\n\n${how}\n\n${outro}\n`;
+    const html = `<p>${escapeHTML(intro)}</p><p>${escapeHTML(what)}</p>` + (mode === 'link'
+        ? `<p>The archive is too large to attach, so you can download it until ${escapeHTML(new Date(expiresAt).toUTCString())}:<br><a href="${escapeHTML(linkUrl)}">${escapeHTML(linkUrl)}</a></p>`
+        : `<p>${escapeHTML(how)}</p>`) + `<p style="opacity:0.7;font-size:0.9em;">${escapeHTML(outro)}</p>`;
+    return { subject, text, html };
+}
+
+async function dxProcessJob(job) {
+    const categories = job.categories.split(',').filter(Boolean);
+    const tmpName = `export-${job.id}-${crypto.randomBytes(6).toString('hex')}.tar.gz`;
+    const dest = path.join(DATA_EXPORTS_DIR, tmpName);
+    let keepFile = false;
+    try {
+        if (job.subject_type === 'user') {
+            const u = await dxGet(`SELECT id, username FROM User_Data WHERE id = ?`, [job.subject_id]);
+            if (!u) throw new DxUserError('This account no longer exists.');
+            await dxWriteUserArchive({ userId: u.id, username: u.username, categories, destPath: dest, source: 'live account' });
+        } else {
+            const a = await dxGet(`SELECT * FROM Data_Archives WHERE id = ?`, [job.subject_id]);
+            const src = a ? path.join(DATA_DIR, a.filename) : null;
+            if (!src || !fs.existsSync(src)) throw new DxUserError('The saved copy of this account is no longer available.');
+            await dxFilterArchive(src, categories, dest, a);
+        }
+        const size = fs.statSync(dest).size;
+        if (!mailTransporter) throw new DxUserError('Email isn\'t set up on this server right now.');
+        const from = process.env.SMTP_FROM || process.env.SMTP_USER;
+        const downloadName = `biodeck-data-${job.username}-${new Date().toISOString().slice(0, 10)}.tar.gz`;
+        let delivery;
+        if (size <= DATA_EXPORT_MAX_EMAIL_BYTES) {
+            const m = dxEmailParts(job, 'attachment');
+            await mailTransporter.sendMail({
+                from, to: job.email, subject: m.subject, text: m.text, html: m.html,
+                attachments: [{ filename: downloadName, path: dest, contentType: 'application/gzip' }]
+            });
+            delivery = 'attachment';
+        } else {
+            const raw = crypto.randomBytes(32).toString('hex');
+            const expiresAt = new Date(Date.now() + DATA_EXPORT_LINK_TTL_MS).toISOString();
+            await dxRun(`UPDATE Data_Export_Requests SET file_path = ?, token_hash = ?, expires_at = ? WHERE id = ?`,
+                [tmpName, crypto.createHash('sha256').update(raw).digest('hex'), expiresAt, job.id]);
+            keepFile = true;
+            const link = `${APP_BASE_URL}/data-export/download/${job.id}/${raw}`;
+            const m = dxEmailParts(job, 'link', link, expiresAt);
+            await mailTransporter.sendMail({ from, to: job.email, subject: m.subject, text: m.text, html: m.html });
+            delivery = 'link';
+        }
+        await dxRun(`UPDATE Data_Export_Requests SET status = 'sent', delivery = ?, size_bytes = ?, completed_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [delivery, size, job.id]);
+    } catch (e) {
+        console.error(`Data export #${job.id} failed:`, e && e.stack ? e.stack : e);
+        keepFile = false;
+        const msg = e instanceof DxUserError ? e.message : 'Something went wrong while preparing or sending your data. Please try again later.';
+        await dxRun(`UPDATE Data_Export_Requests SET status = 'failed', error = ?, file_path = NULL, token_hash = NULL, expires_at = NULL, completed_at = CURRENT_TIMESTAMP WHERE id = ?`,
+            [msg, job.id]).catch(() => {});
+    } finally {
+        if (!keepFile) await fs.promises.unlink(dest).catch(() => {});
+    }
+}
+
+// Link-mode downloads. Registered before the IP-ban / account-ban middleware
+// on purpose: the person following the emailed link may be banned or deleted -
+// the long random token in the URL is the authorisation. Not cached, not
+// indexed, and the token never leaks through the Referer header.
+app.get('/data-export/download/:id/:token', (req, res) => {
+    const gone = () => res.status(404).send(renderMessagePage('Link expired', 'This download link is no longer valid',
+        `<h3>Links expire after a while. You can request your data again.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>`));
+    try {
+        const id = parseInt(req.params.id, 10);
+        if (!Number.isInteger(id)) return gone();
+        const row = getStmt(`SELECT id, username, status, delivery, file_path, token_hash, expires_at FROM Data_Export_Requests WHERE id = ?`).get(id);
+        if (!row || row.status !== 'sent' || row.delivery !== 'link' || !row.file_path || !row.token_hash) return gone();
+        if (!(new Date(row.expires_at).getTime() > Date.now())) return gone();
+        const given = crypto.createHash('sha256').update(String(req.params.token)).digest();
+        const want = Buffer.from(row.token_hash, 'hex');
+        if (given.length !== want.length || !crypto.timingSafeEqual(given, want)) return gone();
+        const file = path.join(DATA_EXPORTS_DIR, path.basename(row.file_path));
+        if (!fs.existsSync(file)) return gone();
+        res.setHeader('Cache-Control', 'private, no-store');
+        res.setHeader('Referrer-Policy', 'no-referrer');
+        res.setHeader('X-Robots-Tag', 'noindex');
+        res.download(file, `biodeck-data-${row.username}.tar.gz`, (err) => { if (err && !res.headersSent) gone(); });
+    } catch (e) {
+        console.error('Data export download error:', e.message);
+        if (!res.headersSent) res.status(500).end();
+    }
+});
+
+// Deletes expired link-mode files and anything left behind by a crash.
+function dxCleanupExports() {
+    try {
+        const nowIso = new Date().toISOString();
+        const expired = getStmt(`SELECT id, file_path FROM Data_Export_Requests WHERE file_path IS NOT NULL AND expires_at IS NOT NULL AND expires_at < ?`).all(nowIso);
+        for (const r of expired) {
+            fs.promises.unlink(path.join(DATA_EXPORTS_DIR, path.basename(r.file_path))).catch(() => {});
+            db.run(`UPDATE Data_Export_Requests SET file_path = NULL, token_hash = NULL WHERE id = ?`, [r.id]);
+        }
+        const live = new Set(getStmt(`SELECT file_path FROM Data_Export_Requests WHERE file_path IS NOT NULL`).all().map(r => path.basename(r.file_path)));
+        for (const name of fs.readdirSync(DATA_EXPORTS_DIR)) {
+            if (live.has(name)) continue;
+            const full = path.join(DATA_EXPORTS_DIR, name);
+            try { if (Date.now() - fs.statSync(full).mtimeMs > 24 * 60 * 60 * 1000) fs.unlinkSync(full); } catch (e) {}
+        }
+    } catch (e) {
+        console.error('Data export cleanup error:', e.message);
+    }
+}
+
+// Boot: anything that was mid-flight when the process stopped is retried.
+// (Delayed a moment so the tables created in the startup block above exist.)
+setTimeout(() => {
+    try { db.run(`UPDATE Data_Export_Requests SET status = 'pending' WHERE status = 'processing'`); } catch (e) {}
+    dxKickQueue();
+    dxCleanupExports();
+}, 3000).unref();
+setInterval(dxCleanupExports, 60 * 60 * 1000).unref();
+
+// ============================ end data export ===============================
+
+
 app.use(checkIPBan);
 app.use(checkBan);
 app.use(checkEmailVerified);
@@ -4085,7 +4998,7 @@ app.post('/login', authLimiter, (req, res) => {
         <h1>Your account has been deleted</h1><br>
         <h3>Reason: ${escapeHTML(reason)}</h3><br><br>
         ${renderStandingBlockHTML('Deleted')}
-        ${deletedWarningsHTML}<br>
+        ${deletedWarningsHTML}${dxRequestBlockForUserSync(user.id, 'deleted')}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
     <script>
@@ -4141,7 +5054,7 @@ app.post('/login', authLimiter, (req, res) => {
         <h3>Ban Reason: ${escapeHTML(reason)}</h3><br><br>
         ${expiryLine}
         ${renderStandingBlockHTML('Banned')}
-        ${bannedWarningsHTML}<br>
+        ${bannedWarningsHTML}${dxRequestBlockForUserSync(user.id, 'banned')}<br>
         <button type="submit" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>
     </div>
     <script>
@@ -4629,6 +5542,14 @@ app.get('/edit', (req, res) => {
             </div>
             <button class="button" type="submit" style="width:auto;margin-top:8px;margin-bottom:8px;">Save Theme</button>
         </form>
+        <div class="dash-field" id="data-export-section">
+            <label>Your Data <span style="opacity:0.4;">(a copy of what Biodeck has stored about you, sent to you by email)</span></label>
+            <div style="margin-top:6px;">${dxCategoryCheckboxesHTML()}</div>
+            <p style="opacity:0.6;font-size:0.82em;margin:8px 0 0;">${email ? "It will be emailed to " + escapeHTML(email) + " as a .tar.gz archive." : "Add an email address above first - that's where your data is sent."}</p>
+            <button class="button" type="button" id="data-export-btn" onclick="requestDataExport()" style="width:auto;margin-top:8px;"${email ? '' : ' disabled'}>Request My Data</button>
+            <div id="data-export-result" style="margin-top:8px;font-size:0.85em;"></div>
+            <div id="data-export-history" style="margin-top:8px;font-size:0.8em;opacity:0.75;"></div>
+        </div>
         <div class="dash-links">
                 <button class="button" style="width:120px;" onclick="window.location.href='/standing';">Standing</button>
                 <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
@@ -4641,7 +5562,7 @@ app.get('/edit', (req, res) => {
         <hr style="border-color:rgba(255,80,80,0.3);margin:26px 0 14px;">
         <div class="dash-field" style="text-align:center;">
             <h3 style="color:var(--danger-strong-color);margin-bottom:4px;">Danger Zone</h3>
-            <p style="opacity:0.6;font-size:0.82em;">Deleting your account is <strong>permanent</strong>. It removes your posts, DMs, group chat messages and memberships, follows, friends, friend requests, and notifications from the database. There is no way to undo this or recover your data afterward.</p>
+            <p style="opacity:0.6;font-size:0.82em;">Deleting your account is <strong>permanent</strong>. It removes your posts, DMs, group chat messages and memberships, follows, friends, friend requests, and notifications from the live site. There is no way to undo this. A private copy of your data is saved when you delete, so you can still have it emailed to you afterward - or use "Your Data" above to get it first.</p>
             <button class="button" type="button" onclick="openDeleteAccountBox()" style="width:auto;">Delete My Account</button>
             <div id="delete-account-box" style="display:none;margin-top:14px;text-align:left;">
                 <label>Enter your password to confirm</label>
@@ -4759,6 +5680,62 @@ app.get('/edit', (req, res) => {
             document.getElementById('email-change-result').textContent = '';
         }
 
+        var dxHasEmail = ${email ? 'true' : 'false'};
+        var dxPollTimer = null;
+
+        function dxSelectedCategories() {
+            var c = [];
+            document.querySelectorAll('#data-export-section .dx-cat').forEach(function (x) { if (x.checked) c.push(x.value); });
+            return c;
+        }
+
+        async function requestDataExport() {
+            var resultEl = document.getElementById('data-export-result');
+            var btn = document.getElementById('data-export-btn');
+            var cats = dxSelectedCategories();
+            if (!cats.length) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Choose at least one thing to include.'; return; }
+            btn.disabled = true; resultEl.style.color = ''; resultEl.textContent = 'Sending request...';
+            try {
+                var r = await fetch('/account/data-export', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ categories: cats })
+                });
+                var d = await r.json();
+                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not send the request.'; btn.disabled = !dxHasEmail; return; }
+                resultEl.style.color = 'var(--accent-color)';
+                resultEl.textContent = 'Request received - your data will be emailed to ' + d.sentTo + ' shortly.';
+                loadDataExportHistory();
+            } catch (e) {
+                resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; btn.disabled = !dxHasEmail;
+            }
+        }
+
+        async function loadDataExportHistory() {
+            var el = document.getElementById('data-export-history');
+            var btn = document.getElementById('data-export-btn');
+            try {
+                var r = await fetch('/account/data-export/requests');
+                var d = await r.json();
+                if (!r.ok) return;
+                el.textContent = '';
+                var active = false;
+                d.requests.forEach(function (q) {
+                    var status = q.status === 'sent' ? (q.delivery === 'link' ? 'emailed (download link)' : 'emailed')
+                        : q.status === 'failed' ? ('failed - ' + (q.error || 'unknown error'))
+                        : 'being prepared...';
+                    var line = document.createElement('div');
+                    line.textContent = new Date(q.createdAt).toLocaleString() + ' - ' + q.categories.join(', ') + ' - ' + status;
+                    el.appendChild(line);
+                    if (q.status === 'pending' || q.status === 'processing') active = true;
+                });
+                clearTimeout(dxPollTimer);
+                if (active) { btn.disabled = true; dxPollTimer = setTimeout(loadDataExportHistory, 3000); }
+                else btn.disabled = !dxHasEmail;
+            } catch (e) {}
+        }
+        loadDataExportHistory();
+
         function openDeleteAccountBox() {
             document.getElementById('delete-account-box').style.display = 'block';
         }
@@ -4785,7 +5762,7 @@ app.get('/edit', (req, res) => {
                 const d = await r.json();
                 if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not delete account.'; return; }
                 resultEl.style.color = 'var(--accent-color)'; resultEl.textContent = 'Account deleted. Redirecting...';
-                setTimeout(() => window.location.href = '/', 1200);
+                setTimeout(() => window.location.href = d.redirect || '/', 1200);
             } catch (e) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Network error.'; }
         }
 
@@ -4899,6 +5876,88 @@ app.get('/standing/:id', (req, res) => {
     });
 });
 
+// ----- Data export: request routes (see the "Data export & account archives" block above) -----
+
+function dxResolveSubject(req) {
+    if (req.session && req.session.userId) return { type: 'user', id: req.session.userId };
+    const p = dxVerifyToken(req.body && req.body.token);
+    return p ? { type: p.t, id: p.id } : null;
+}
+
+app.post('/account/data-export', async (req, res) => {
+    try {
+        const subject = dxResolveSubject(req);
+        if (!subject) return res.status(401).json({ error: 'This request has expired. Please reload the page (or log in again) and try once more.' });
+        const categories = parseExportCategories(req.body && req.body.categories);
+        if (!categories.length) return res.status(400).json({ error: 'Choose at least one thing to include.' });
+        if (!mailTransporter) return res.status(503).json({ error: 'Email isn\'t set up on this server right now, so data requests can\'t be sent. Please contact support.' });
+
+        let username, email, verified;
+        if (subject.type === 'user') {
+            const u = await dxGet(`SELECT username, email, email_verified FROM User_Data WHERE id = ?`, [subject.id]);
+            if (!u) return res.status(404).json({ error: 'This account no longer exists.' });
+            ({ username, email, email_verified: verified } = u);
+        } else {
+            const a = await dxGet(`SELECT username, email, email_verified, filename FROM Data_Archives WHERE id = ?`, [subject.id]);
+            if (!a || !fs.existsSync(path.join(DATA_DIR, a.filename))) return res.status(404).json({ error: 'The saved copy of this account is no longer available.' });
+            ({ username, email, email_verified: verified } = a);
+        }
+        if (!email) return res.status(400).json({ error: 'There is no email address on file for this account.' });
+        if (!verified) return res.status(400).json({ error: 'The email address on this account isn\'t verified, so we can\'t send your data there.' });
+
+        const busy = await dxGet(`SELECT COUNT(*) AS c FROM Data_Export_Requests WHERE subject_type = ? AND subject_id = ? AND status IN ('pending', 'processing')`, [subject.type, subject.id]);
+        if (busy.c > 0) return res.status(429).json({ error: 'A previous request is still being prepared. Please wait for it to arrive first.' });
+        const recent = await dxGet(`SELECT COUNT(*) AS c FROM Data_Export_Requests WHERE subject_type = ? AND subject_id = ? AND created_at > datetime('now', '-1 day')`, [subject.type, subject.id]);
+        if (recent.c >= DATA_EXPORT_MAX_PER_DAY) return res.status(429).json({ error: `You can request your data up to ${DATA_EXPORT_MAX_PER_DAY} times per day. Please try again later.` });
+
+        const ins = await dxRun(`INSERT INTO Data_Export_Requests (subject_type, subject_id, username, email, categories) VALUES (?, ?, ?, ?, ?)`,
+            [subject.type, subject.id, username, email, categories.join(',')]);
+        logAudit('data_export_requested', username, username, categories.join(','));
+        dxKickQueue();
+        res.json({ ok: true, id: ins.lastID, sentTo: dxMaskEmail(email) });
+    } catch (e) {
+        console.error('Data export request error:', e.message);
+        res.status(500).json({ error: 'Something went wrong. Please try again later.' });
+    }
+});
+
+// Recent requests for the dashboard (logged-in users only).
+app.get('/account/data-export/requests', async (req, res) => {
+    if (!req.session || !req.session.userId) return res.status(401).json({ error: 'not logged in' });
+    try {
+        const rows = await dxAll(`SELECT id, categories, status, delivery, error, created_at, completed_at FROM Data_Export_Requests
+            WHERE subject_type = 'user' AND subject_id = ? ORDER BY id DESC LIMIT 5`, [req.session.userId]);
+        res.json({
+            requests: rows.map(r => ({
+                id: r.id,
+                categories: r.categories.split(',').map(k => (DATA_EXPORT_CATEGORIES.find(c => c.key === k) || { label: k }).label),
+                status: r.status, delivery: r.delivery, error: r.error,
+                createdAt: dxIso(r.created_at), completedAt: dxIso(r.completed_at)
+            }))
+        });
+    } catch (e) {
+        res.status(500).json({ error: 'db error' });
+    }
+});
+
+// Landing page after deleting your own account (the session is gone by then,
+// so the request token travels in a short-lived cookie set by /account/delete-self).
+app.get('/account/deleted', (req, res) => {
+    const p = dxVerifyToken(dxReadCookie(req, DATA_EXPORT_COOKIE));
+    const archive = p && p.t === 'archive' ? getStmt(`SELECT id, email, email_verified FROM Data_Archives WHERE id = ?`).get(p.id) : null;
+    if (!archive) return res.redirect('/');
+    const block = archive.email && archive.email_verified
+        ? renderDataRequestBlockHTML(dxSubjectToken('archive', archive.id), archive.email)
+        : '';
+    res.send(renderMessagePage('Account Deleted', 'Your account has been deleted',
+        `<h3>Your posts, DMs and the rest of your account data have been removed from Biodeck.</h3>
+        <p style="opacity:0.7;font-size:0.9em;">A copy was saved when you deleted your account. You can have it emailed to you below.</p>
+        ${block}<br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>`));
+});
+
+
+
 // Self-service, permanent account deletion. Requires the user's current
 // password as confirmation, then wipes the account and everything tied to
 // it via the same hardDeleteAccount() helper the admin hard-delete route
@@ -4918,14 +5977,27 @@ app.post('/account/delete-self', (req, res) => {
             return res.status(500).json({ error: 'auth error' });
         }
         if (!match) return res.status(401).json({ error: 'incorrect password' });
-        hardDeleteAccount(username, 'You deleted your own account', (err2) => {
+        hardDeleteAccount(username, 'You deleted your own account', (err2, archive) => {
             if (err2) {
                 console.error('Self-delete error:', err2.message);
+                if (err2.message === 'archive failed') {
+                    return res.status(500).json({ error: 'could not save a copy of your data, so your account was NOT deleted. Please try again later.' });
+                }
                 return res.status(500).json({ error: 'db error' });
             }
             logAudit('account_self_deleted', username, username, 'user deleted their own account');
+            const secure = !!req.secure;
             req.session.destroy(() => {
-                res.json({ ok: true, deleted: true });
+                // The session is gone, so hand the browser a short-lived signed
+                // token (cookie) that lets /account/deleted offer "email me my data".
+                let redirect = '/';
+                if (archive && archive.id) {
+                    res.cookie(DATA_EXPORT_COOKIE, dxSubjectToken('archive', archive.id), {
+                        httpOnly: true, sameSite: 'lax', secure, maxAge: DATA_EXPORT_TOKEN_TTL_MS, path: '/'
+                    });
+                    redirect = '/account/deleted';
+                }
+                res.json({ ok: true, deleted: true, redirect });
             });
         });
     });
@@ -9426,6 +10498,11 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
     if (target === req.session.userUsername) return res.status(400).json({ error: 'cannot delete your own account' });
     const reason = ((req.body && req.body.reason) || '').trim().substring(0, 500);
     if (!reason) return res.status(400).json({ error: 'a reason is required to delete an account' });
+    // Archive first: the posts (and the profile text) are wiped below.
+    db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (errU, targetRow) => {
+    if (errU) return res.status(500).json({ error: 'db error' });
+    if (!targetRow) return res.status(404).json({ error: 'user not found' });
+    dxArchiveAccount(targetRow.id, reason, 'admin_delete').then(() => {
     db.run(
         `UPDATE User_Data SET avatar_path = ?, Nickname = ?, bio = ?, IsDeleted = 1, DeleteReason = ? WHERE username = ?`,
         ['public/Default.png', 'Account Deleted', '', reason, target],
@@ -9451,13 +10528,36 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
             });
         }
     );
+    }).catch((archiveErr) => {
+        console.error('Could not archive account data, account was NOT deleted:', archiveErr && archiveErr.stack || archiveErr);
+        res.status(500).json({ error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
+    });
+    });
 });
 
 // Permanently removes a user and every row tied to their username/id across
 // the schema. Unlike the soft-delete above, there's no row left behind and
 // the username becomes available again. Used by both the admin hard-delete
 // route and self-service account deletion from the dashboard.
+//
+// Everything the account holds is first written to data/<date>_<username>.tar.gz
+// (dxArchiveAccount). If that fails the account is NOT deleted and the callback
+// gets Error('archive failed'). On success the callback's second argument is
+// the Data_Archives row, which is how a deleted user can still request a copy.
 function hardDeleteAccount(username, reason, callback) {
+    db.get(`SELECT id FROM User_Data WHERE username = ?`, [username], (err, row) => {
+        if (err) return callback(err);
+        if (!row) return callback(new Error('user not found'));
+        dxArchiveAccount(row.id, reason, 'permanent_delete').then((archive) => {
+            hardDeleteAccountRows(username, reason, (err2) => callback(err2, archive));
+        }).catch((archiveErr) => {
+            console.error('Could not archive account data, account was NOT deleted:', archiveErr && archiveErr.stack || archiveErr);
+            callback(new Error('archive failed'));
+        });
+    });
+}
+
+function hardDeleteAccountRows(username, reason, callback) {
     db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [username], (err, row) => {
         if (err) return callback(err);
         if (!row) return callback(new Error('user not found'));
@@ -9543,6 +10643,7 @@ app.post('/admin/delete-account-permanent/:username', requireAdmin, requireHeadA
     hardDeleteAccount(target, reason, (err) => {
         if (err) {
             if (err.message === 'user not found') return res.status(404).json({ error: 'user not found' });
+            if (err.message === 'archive failed') return res.status(500).json({ error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
             console.error('Hard delete error:', err.message);
             return res.status(500).json({ error: 'db error' });
         }

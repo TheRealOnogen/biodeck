@@ -9213,7 +9213,7 @@ app.get('/user/:username', (req, res) => {
                     const blockBtn = isOwnProfile ? '' : `<a id="block-btn" class="button" onclick="toggleBlock()" style="width:120px;text-decoration:none;">${isBlockedByMe ? 'Unblock' : 'Block'}</a>`;
                     const dmBtn = isOwnProfile ? '' : `<a href="/messages/${escapeHTML(profileUsername)}" class="button" style="width:120px;text-decoration:none;">Message</a>`;
                     const followBtn = isOwnProfile ? '' : `<a id="follow-btn" class="button" onclick="toggleFollow()" style="width:120px;text-decoration:none;">${isFollowing ? 'Unfollow' : 'Follow'}</a>`;
-                    const friendBtnHTML = isOwnProfile ? '' : `<a id="friend-btn" class="button" onclick="toggleFriend()" style="width:140px;text-decoration:none;">${
+                    const friendBtnHTML = isOwnProfile ? '' : `<a id="friend-btn" class="button" onclick="toggleFriend()" style="width:120px;text-decoration:none;">${
                         friendStatus === 'friends' ? 'Unfriend' :
                         friendStatus === 'sent' ? 'Cancel Request' :
                         friendStatus === 'received' ? 'Accept Request' :

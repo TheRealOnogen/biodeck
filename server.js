@@ -6,7 +6,11 @@
 
 // Onogen
 
-require('dotenv').config({ path: 'vars.env' });
+// Absolute path on purpose: a relative 'vars.env' is resolved against the
+// process's working directory, so starting the app from anywhere else (pm2,
+// systemd, `node /path/server.js`) silently loaded NO settings - which left the
+// captcha switched off without any visible error.
+require('dotenv').config({ path: require('path').join(__dirname, 'vars.env') });
 const express = require('express');
 const Database = require('better-sqlite3');
 const session = require('express-session');
@@ -3274,6 +3278,9 @@ function checkIPBan(req, res, next) {
     const ip = getClientIP(req);
     db.get(`SELECT reason FROM IP_Bans WHERE ip = ?`, [ip], (err, row) => {
         if (err || !row) return next();
+        if (req.path.startsWith('/api/')) {
+            return res.status(403).json({ error: 'Your IP has been banned.', code: 'ip_banned', reason: row.reason || 'No reason provided' });
+        }
         const reason = escapeHTML(row.reason || 'No reason provided');
         return res.status(403).send(`<!DOCTYPE html>
 <html lang="en">
@@ -4970,7 +4977,13 @@ app.get('/api/check-ban-status', (req, res) => {
 
 app.get('/register', registrationLockdownGuard, (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
-    res.sendFile(path.join(__dirname, 'register.html'));
+    fs.readFile(path.join(__dirname, 'register.html'), 'utf8', (err, html) => {
+        if (err) return res.status(500).end();
+        // Fresh signed token on every page load (see "Signup form tokens").
+        const field = `<input type="hidden" name="_ft" value="${issueFormToken(req)}">`;
+        res.set('Cache-Control', 'no-store');
+        res.type('html').send(html.replace('</form>', field + '\n</form>'));
+    });
 })
 
 app.get('/', (req, res) => {
@@ -5241,21 +5254,72 @@ function normalizeEmailForLimit(email) {
     return `${local}@${domain}`;
 }
 
-// Hidden honeypot field ("website") must be empty and the form must have
-// been open for at least REG_MIN_FILL_MS (register.html reports how long in
-// "_t"). Bots that POST straight to /register or auto-fill every input fail
-// one or both. Returns the same generic page either way so it doesn't tell a
-// bot which check it tripped.
+// ----- Signup form tokens (server-issued, replaces the client-reported "_t") -----
+// The old "form open time" check trusted a number the CLIENT sent (_t), so a
+// script just sent _t=99999 and skipped the 2.5s wait entirely. Now the server
+// stamps the time itself: GET /register (and GET /api/v1/auth/register-challenge)
+// hand out a token = timestamp + random nonce + HMAC bound to the requester's
+// IP. A signup only counts if its token (1) is correctly signed, (2) is at least
+// REG_MIN_FILL_MS old, (3) is not older than FORM_TOKEN_MAX_AGE_MS and (4) has
+// not been used for an account yet. A script can still fetch a token and wait,
+// but it can no longer skip the wait, mint tokens offline, reuse one token for
+// many accounts, or carry tokens between machines. This slows bots down; the
+// captcha and the per-IP / per-email limits are what actually stop them.
+const FORM_TOKEN_KEY = crypto.createHmac('sha256', SESSION_SECRET).update('biodeck-form-token-v1').digest();
+const FORM_TOKEN_MAX_AGE_MS = 60 * 60 * 1000;
+const usedFormNonces = new Map(); // nonce -> expiry timestamp
+setInterval(() => {
+    const now = Date.now();
+    for (const [n, exp] of usedFormNonces) if (exp < now) usedFormNonces.delete(n);
+}, 5 * 60 * 1000).unref();
+
+function formTokenMac(payload, ip) {
+    return crypto.createHmac('sha256', FORM_TOKEN_KEY).update(payload + '|' + ip).digest('hex');
+}
+function issueFormToken(req) {
+    const payload = Date.now() + '.' + crypto.randomBytes(12).toString('hex');
+    return payload + '.' + formTokenMac(payload, getClientIP(req));
+}
+// Checks everything EXCEPT "already used" (that is consumeFormNonce's job, done
+// atomically right before an account is created, so validation mistakes don't
+// burn the token). Returns { ok: true, nonce } or { ok: false, reason }.
+function parseFormToken(req, token) {
+    if (typeof token !== 'string' || token.length > 200) return { ok: false, reason: 'missing' };
+    const parts = token.split('.');
+    if (parts.length !== 3) return { ok: false, reason: 'malformed' };
+    const [ts, nonce, mac] = parts;
+    const expected = formTokenMac(ts + '.' + nonce, getClientIP(req));
+    const a = Buffer.from(mac), b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return { ok: false, reason: 'bad_signature' };
+    const age = Date.now() - parseInt(ts, 10);
+    if (!Number.isFinite(age) || age < REG_MIN_FILL_MS) return { ok: false, reason: 'too_early' };
+    if (age > FORM_TOKEN_MAX_AGE_MS) return { ok: false, reason: 'expired' };
+    if (usedFormNonces.has(nonce)) return { ok: false, reason: 'replayed' };
+    return { ok: true, nonce };
+}
+// Synchronous check-and-set, so concurrent requests can't both pass with one token.
+function consumeFormNonce(nonce) {
+    if (!nonce || usedFormNonces.has(nonce)) return false;
+    usedFormNonces.set(nonce, Date.now() + FORM_TOKEN_MAX_AGE_MS);
+    return true;
+}
+function releaseFormNonce(nonce) { if (nonce) usedFormNonces.delete(nonce); }
+
+function sendRegistrationBotRefusal(res) {
+    return res.status(400).send(renderMessagePage('Registration failed', 'Something went wrong',
+        `<h3>We couldn't process that registration. Please reload the page and try again.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+}
+
+// Hidden honeypot field ("website") must be empty AND the form must carry a
+// valid server-issued token (see above). Returns the same generic page either
+// way so it doesn't tell a bot which check it tripped.
 function registrationBotGuard(req, res, next) {
     const b = req.body || {};
     const honeypot = typeof b.website === 'string' ? b.website.trim() : '';
-    const filledIn = parseInt(b._t, 10);
-    const tooFast = !Number.isFinite(filledIn) || filledIn < REG_MIN_FILL_MS;
-    if (honeypot || tooFast) {
-        return res.status(400).send(renderMessagePage('Registration failed', 'Something went wrong',
-            `<h3>We couldn't process that registration. Please reload the page and try again.</h3><br><br>
-            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
-    }
+    const tok = parseFormToken(req, b._ft);
+    if (honeypot || !tok.ok) return sendRegistrationBotRefusal(res);
+    req._formNonce = tok.nonce;
     next();
 }
 
@@ -5296,6 +5360,11 @@ function checkSignupLimits(ip, email, emailNorm) {
 const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
 const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
 const CAPTCHA_ENABLED = !!(TURNSTILE_SITE_KEY && TURNSTILE_SECRET_KEY);
+// Set REQUIRE_CAPTCHA=1 in vars.env to FAIL CLOSED: if the keys are missing
+// (or vars.env wasn't loaded) login/register are refused instead of silently
+// running with no captcha at all.
+const REQUIRE_CAPTCHA = ['1', 'true'].includes(String(process.env.REQUIRE_CAPTCHA || '').toLowerCase());
+if (REQUIRE_CAPTCHA && !CAPTCHA_ENABLED) console.error('REQUIRE_CAPTCHA is set but TURNSTILE_SITE_KEY / TURNSTILE_SECRET_KEY are missing - login and registration will be refused until they are set.');
 if (!CAPTCHA_ENABLED) console.warn('Captcha is OFF - set TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY in vars.env to enable it on /login and /register.');
 
 // Served as a script so the pages stay static HTML: it drops the widget into
@@ -5325,8 +5394,8 @@ app.get('/captcha.js', (req, res) => {
 `);
 });
 
-async function verifyCaptchaToken(req) {
-    const token = req.body && req.body['cf-turnstile-response'];
+async function verifyCaptchaToken(req, tokenOverride) {
+    const token = tokenOverride !== undefined ? tokenOverride : (req.body && req.body['cf-turnstile-response']);
     if (typeof token !== 'string' || !token || token.length > 2048) return false;
     try {
         const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
@@ -5346,7 +5415,11 @@ async function verifyCaptchaToken(req) {
 // Runs after authLimiter and BEFORE any other work in the route, so a failed
 // captcha never touches the account tables or counts toward the spam ban.
 async function requireCaptcha(req, res, next) {
-    if (!CAPTCHA_ENABLED) return next();
+    if (!CAPTCHA_ENABLED) {
+        if (!REQUIRE_CAPTCHA) return next();
+        return res.status(503).send(renderMessagePage('Unavailable', 'Temporarily unavailable',
+            `<h3>This form is disabled until the site's captcha is configured. Please try again later.</h3>`));
+    }
     if (await verifyCaptchaToken(req)) return next();
     const back = req.path === '/register' ? '/register' : '/';
     return res.status(400).send(renderMessagePage('Captcha failed', 'Captcha check failed',
@@ -5354,11 +5427,132 @@ async function requireCaptcha(req, res, next) {
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='${back}';">Go back</button>`));
 }
 
+// ----- Shared account creation -----
+// EVERY way of creating an account (the HTML form and POST /api/v1/auth/register)
+// runs through this one function, so a custom client gets exactly the same
+// limits as the website - there is no weaker side door: per-email and per-IP
+// caps, disposable-email block, single-use signup token, registration lockdown
+// and the spam auto-ban. Callers do their own input validation and captcha
+// first. Resolves to { ok: true, userId, username, banned, banReason } or
+// { ok: false, code, ... } and throws only on unexpected errors.
+async function createAccount(req, { username, password, email, formNonce }) {
+    const ip = getClientIP(req);
+    const emailNorm = normalizeEmailForLimit(email);
+
+    // Cheap refusals (disposable email, per-email and per-IP caps) happen
+    // before the bcrypt hash so spammers can't burn CPU with them.
+    const refusal = checkSignupLimits(ip, email, emailNorm);
+    if (refusal) return { ok: false, code: 'signup_refused', refusal };
+
+    // One account per token. Synchronous, so parallel requests can't share one.
+    if (!consumeFormNonce(formNonce)) return { ok: false, code: 'bad_form_token' };
+
+    let hashedPassword;
+    try {
+        hashedPassword = await bcrypt.hash(password, 10);
+    } catch (e) {
+        releaseFormNonce(formNonce);
+        throw e;
+    }
+
+    // Re-check the lockdown now that the (async) hash is done: requests that
+    // were already in flight when it started must not slip through.
+    const lockdownPage = getRegistrationBlockPage();
+    if (lockdownPage) {
+        releaseFormNonce(formNonce);
+        return { ok: false, code: 'lockdown', page: lockdownPage };
+    }
+
+    // Account-spam guard. Checked after the (async) hash so the count and the
+    // INSERT below run back-to-back with nothing able to slip in between.
+    if (isRegistrationSpam(ip)) {
+        const banErr = await new Promise(resolve => banIPForSpam(ip, e => resolve(e || null)));
+        return { ok: false, code: 'spam_banned', banErr };
+    }
+
+    const gateEnabled = registrationGateEnabled;
+    const initialIsBanned = gateEnabled ? 1 : 0;
+    const initialBanReason = gateEnabled
+        ? "Account creation is currently disabled, please contact biodecksupport@gmail.com to activate your account, a message was also sent to admins"
+        : null;
+
+    const inserted = await new Promise(resolve => {
+        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path, reg_email_norm) VALUES (?, ?, ?, 0, ?, ?, ?, ?)`,
+            [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.png', emailNorm],
+            function (err) {
+                if (err) return resolve({ err });
+                const id = this.lastID;
+                // Log the IP of every account the moment it exists (this is what
+                // the spam ban counts), independent of the gate / email flow below.
+                db.run(`INSERT INTO Registration_IPs (user_id, username, ip, created_ts) VALUES (?, ?, ?, ?)`,
+                    [id, username, ip, Date.now()],
+                    (ipErr) => { if (ipErr) console.error('Registration IP log error:', ipErr.message); });
+                resolve({ id });
+            });
+    });
+    if (inserted.err) {
+        console.error("Database Insert Error:", inserted.err.message);
+        releaseFormNonce(formNonce);
+        return { ok: false, code: 'username_taken' };
+    }
+    const newUserId = inserted.id;
+    checkRegistrationLockdownTrigger();
+    logAudit('account_created', username, username, gateEnabled ? 'registration gate ON - created pending activation' : 'registration gate OFF - created active');
+
+    // Activation gating pings only fire while the registration gate is
+    // enabled. While it's off, registration is open and nobody gets pinged.
+    if (gateEnabled) {
+        // Post a notice in the reserved "Activations" group chat (id 1) so
+        // admins/mods watching it see new signups awaiting activation, and
+        // ping the user with id 1 (typically the owner/head admin).
+        db.get(`SELECT username FROM User_Data WHERE id = 1`, (errPing, pingUser) => {
+            const pingSuffix = pingUser ? ` @${pingUser.username}` : '';
+            const gcContent = `${username} is waiting for activation${pingSuffix}`;
+            db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content) VALUES (1, 'System', ?)`,
+                [gcContent], function (errGC) {
+                    if (errGC) { console.error('Activation notice insert error:', errGC.message); return; }
+                    const gcMsgId = this.lastID;
+                    db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
+                        if (errRow || !row) return;
+                        db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = 1`, (errMem, memberRows) => {
+                            const members = (memberRows || []).map(r => r.username);
+                            broadcastGCMessage(1, 'System', row, null, members);
+                        });
+                    });
+                    if (pingUser) {
+                        processMentions(gcContent, 'System', { type: 'mention_gc', post_id: 1, message_id: gcMsgId });
+                    }
+                });
+
+            // DM the same notice to user id 1 plus anyone listed in the local
+            // activation-pings.txt file, once each, skipping whoever doesn't
+            // actually have an account.
+            const dmContent = `${username} is waiting for activation`;
+            const candidateUsernames = new Set(getActivationPingUsernames());
+            if (pingUser) candidateUsernames.add(pingUser.username);
+            if (candidateUsernames.size) {
+                const usernameList = [...candidateUsernames];
+                const placeholders = usernameList.map(() => '?').join(',');
+                db.all(`SELECT username FROM User_Data WHERE username IN (${placeholders})`, usernameList, (errDM, rows) => {
+                    if (errDM || !rows) return;
+                    rows.forEach(r => sendSystemDM(r.username, dmContent));
+                });
+            }
+        });
+    }
+
+    if (initialIsBanned) return { ok: true, userId: newUserId, username, banned: true, banReason: initialBanReason };
+
+    recordLoginIP(newUserId, username, ip, 'register');
+    issueEmailVerification(newUserId, username, email, () => {});
+    return { ok: true, userId: newUserId, username, banned: false };
+}
+
 app.post('/register', authLimiter, registrationLockdownGuard, registrationBotGuard, requireCaptcha, async (req, res) => {
     const { username, password } = req.body;
     const email = (req.body.email || '').trim().toLowerCase();
 
-    if (!username || !password) {
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
         return res.sendFile(path.join(__dirname, 'register_error_missing_fields.html'));
     }
     if (username.length < 3 || username.length > 32) {
@@ -5377,104 +5571,30 @@ app.post('/register', authLimiter, registrationLockdownGuard, registrationBotGua
             `<h3>Please double check the email address and try again.</h3><br><br>
             <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
     }
-    // Cheap refusals (disposable email, per-email and per-IP caps) happen
-    // before the bcrypt hash so spammers can't burn CPU with them.
-    const emailNorm = normalizeEmailForLimit(email);
-    const signupRefusal = checkSignupLimits(getClientIP(req), email, emailNorm);
-    if (signupRefusal) {
-        return res.status(signupRefusal.status).send(renderMessagePage(signupRefusal.title, signupRefusal.heading,
-            `<h3>${escapeHTML(signupRefusal.message)}</h3><br><br>
-            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
-    }
     try {
-        const hashedPassword = await bcrypt.hash(password, 10);
-
-        // Account-spam guard. Checked after the (async) hash so the count and
-        // the INSERT below run back-to-back with nothing able to slip in
-        // between; see isRegistrationSpam().
-        // Re-check the lockdown now that the (async) hash is done: requests
-        // that were already in flight when it started must not slip through.
-        const lockdownPage = getRegistrationBlockPage();
-        if (lockdownPage) return res.status(503).send(lockdownPage);
-        const registerIP = getClientIP(req);
-        if (isRegistrationSpam(registerIP)) {
-            return banIPForSpam(registerIP, (banErr) => {
-                if (banErr) {
+        const result = await createAccount(req, { username, password, email, formNonce: req._formNonce });
+        if (!result.ok) {
+            if (result.code === 'signup_refused') {
+                const r = result.refusal;
+                return res.status(r.status).send(renderMessagePage(r.title, r.heading,
+                    `<h3>${escapeHTML(r.message)}</h3><br><br>
+                    <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+            }
+            if (result.code === 'bad_form_token') return sendRegistrationBotRefusal(res);
+            if (result.code === 'lockdown') return res.status(503).send(result.page);
+            if (result.code === 'spam_banned') {
+                if (result.banErr) {
                     return res.status(403).send(renderMessagePage('Registration blocked', 'Too many accounts',
                         `<h3>${escapeHTML(SPAM_REG_BAN_REASON)}</h3>`));
                 }
                 // Reuse the normal IP-ban page now that the ban is in place.
                 return checkIPBan(req, res, () => res.status(403).end());
-            });
+            }
+            return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
         }
-        const gateEnabled = registrationGateEnabled;
-        const initialIsBanned = gateEnabled ? 1 : 0;
-        const initialBanReason = gateEnabled
-            ? "Account creation is currently disabled, please contact biodecksupport@gmail.com to activate your account, a message was also sent to admins"
-            : null;
-
-        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path, reg_email_norm) VALUES (?, ?, ?, 0, ?, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.png', emailNorm], function(err) {
-            if (err) {
-                console.error("Database Insert Error:", err.message);
-                return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
-            }
-            const newUserId = this.lastID;
-            // Log the IP of every account the moment it exists (this is what
-            // the spam ban counts), independent of the gate / email flow below.
-            db.run(`INSERT INTO Registration_IPs (user_id, username, ip, created_ts) VALUES (?, ?, ?, ?)`,
-                [newUserId, username, registerIP, Date.now()],
-                (ipErr) => { if (ipErr) console.error('Registration IP log error:', ipErr.message); });
-            checkRegistrationLockdownTrigger();
-            logAudit('account_created', username, username, gateEnabled ? 'registration gate ON - created pending activation' : 'registration gate OFF - created active');
-
-            // Activation gating pings only fire while the registration gate is
-            // enabled. While it's off, registration is open and nobody gets
-            // pinged.
-            if (gateEnabled) {
-                // Post a notice in the reserved "Activations" group chat (id 1) so
-                // admins/mods watching it see new signups awaiting activation, and
-                // ping the user with id 1 (typically the owner/head admin).
-                db.get(`SELECT username FROM User_Data WHERE id = 1`, (errPing, pingUser) => {
-                    const pingSuffix = pingUser ? ` @${pingUser.username}` : '';
-                    const gcContent = `${username} is waiting for activation${pingSuffix}`;
-                    db.run(`INSERT INTO Group_Chat_Messages (group_id, from_user, content) VALUES (1, 'System', ?)`,
-                        [gcContent], function (errGC) {
-                            if (errGC) { console.error('Activation notice insert error:', errGC.message); return; }
-                            const gcMsgId = this.lastID;
-                            db.get(`SELECT Group_Chat_Messages.*, User_Data.avatar_path, User_Data.Nickname, User_Data.IsVerified FROM Group_Chat_Messages LEFT JOIN User_Data ON Group_Chat_Messages.from_user = User_Data.username WHERE Group_Chat_Messages.id = ?`, [gcMsgId], (errRow, row) => {
-                                if (errRow || !row) return;
-                                db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = 1`, (errMem, memberRows) => {
-                                    const members = (memberRows || []).map(r => r.username);
-                                    broadcastGCMessage(1, 'System', row, null, members);
-                                });
-                            });
-                            if (pingUser) {
-                                processMentions(gcContent, 'System', { type: 'mention_gc', post_id: 1, message_id: gcMsgId });
-                            }
-                        });
-
-                    // DM the same notice to user id 1 plus anyone listed in the
-                    // local activation-pings.txt file, once each, skipping
-                    // whoever doesn't actually have an account.
-                    const dmContent = `${username} is waiting for activation`;
-                    const candidateUsernames = new Set(getActivationPingUsernames());
-                    if (pingUser) candidateUsernames.add(pingUser.username);
-                    if (candidateUsernames.size) {
-                        const usernameList = [...candidateUsernames];
-                        const placeholders = usernameList.map(() => '?').join(',');
-                        db.all(`SELECT username FROM User_Data WHERE username IN (${placeholders})`, usernameList, (errDM, rows) => {
-                            if (errDM || !rows) return;
-                            rows.forEach(r => sendSystemDM(r.username, dmContent));
-                        });
-                    }
-                });
-            }
-
-            db.get(`SELECT IsBanned, BanReason FROM User_Data WHERE id = ?`, [newUserId], (err2, newUser) => {
-                if (err2 || !newUser) return res.redirect('/');
-                if (newUser.IsBanned) {
-                    const reason = newUser.BanReason || 'No reason provided';
-                    return res.send(`<!DOCTYPE html>
+        if (result.banned) {
+            const reason = result.banReason || 'No reason provided';
+            return res.send(`<!DOCTYPE html>
 <html lang="en">
 <head><link rel="icon" type="image/x-icon" href="/Biodeck.png">
 <meta charset="UTF-8">
@@ -5500,17 +5620,13 @@ app.post('/register', authLimiter, registrationLockdownGuard, registrationBotGua
 
 </body>
 </html>`);
-                }
-                recordLoginIP(newUserId, username, registerIP, 'register');
-                // New accounts start with email_verified = 0, so hold them in
-                // the same "pending" session state used elsewhere until they
-                // confirm the address, instead of granting a full session.
-                req.session.pendingVerifyUserId = newUserId;
-                req.session.pendingVerifyUsername = username;
-                issueEmailVerification(newUserId, username, email, () => {});
-                return res.redirect('/account/verify-email-required');
-            });
-        });
+        }
+        // New accounts start with email_verified = 0, so hold them in the
+        // same "pending" session state used elsewhere until they confirm the
+        // address, instead of granting a full session.
+        req.session.pendingVerifyUserId = result.userId;
+        req.session.pendingVerifyUsername = result.username;
+        return res.redirect('/account/verify-email-required');
     } catch (err) {
         console.error("Register error:", err);
         return res.status(500).sendFile(path.join(__dirname, 'register_error_internal.html'));
@@ -14096,6 +14212,260 @@ app.get('/editor', (req, res) => {
 app.get('/v86', (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// ============================================================================
+// ----- Auth API for custom clients: /api/v1/auth/* -----
+//
+// Same rules as the website, enforced by the same code:
+//   * login  shares authLimiter's counter with POST /login (an attacker gets ONE
+//     budget across both, not one each) plus a per-username failure throttle;
+//   * register runs through createAccount() - the exact function the HTML form
+//     uses - so per-IP / per-email caps, disposable-email block, lockdown and the
+//     spam auto-ban all apply, and it additionally needs a server-issued
+//     single-use challenge (the 2.5s rule, see "Signup form tokens") and a
+//     Turnstile captcha token;
+//   * if the captcha isn't configured the auth API FAILS CLOSED (503) instead of
+//     quietly running unprotected. Set API_ALLOW_NO_CAPTCHA=1 in vars.env only
+//     for local development.
+// JSON bodies only (no cross-site form posts) and no CORS headers are sent, so
+// browsers on other origins can't call these; native / desktop / server clients can.
+// ============================================================================
+const API_ALLOW_NO_CAPTCHA = ['1', 'true'].includes(String(process.env.API_ALLOW_NO_CAPTCHA || '').toLowerCase());
+const API_AUTH_AVAILABLE = CAPTCHA_ENABLED || API_ALLOW_NO_CAPTCHA;
+
+function requireJSONBody(req, res, next) {
+    if (!req.is('application/json')) {
+        return res.status(415).json({ error: 'Send a JSON body with Content-Type: application/json.', code: 'unsupported_media_type' });
+    }
+    if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+        return res.status(400).json({ error: 'Request body must be a JSON object.', code: 'invalid_request' });
+    }
+    next();
+}
+
+function apiLimiterMessage(error) { return { error, code: 'rate_limited' }; }
+const apiChallengeLimiter = rateLimitForAuth({
+    windowMs: 10 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+    message: apiLimiterMessage('Too many requests. Please wait a few minutes and try again.')
+});
+const apiRegisterLimiter = rateLimitForAuth({
+    windowMs: 60 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false,
+    message: apiLimiterMessage('Too many registration attempts from this network. Please try again later.')
+});
+
+// Fails closed when no captcha is configured (unless explicitly allowed for dev).
+async function apiRequireCaptcha(req, res, next) {
+    if (!CAPTCHA_ENABLED) {
+        if (API_ALLOW_NO_CAPTCHA) return next();
+        return res.status(503).json({ error: 'The auth API is disabled until the server\'s captcha is configured.', code: 'captcha_not_configured' });
+    }
+    if (await verifyCaptchaToken(req, req.body && req.body.captchaToken)) return next();
+    return res.status(400).json({ error: 'Captcha verification failed. Get a fresh token from the captcha page and try again.', code: 'captcha_failed' });
+}
+
+// Per-username failed-login throttle (the IP limiter alone doesn't stop one
+// account being guessed from many IPs). In memory; resets on restart.
+const LOGIN_FAIL_MAX = 10;
+const LOGIN_FAIL_WINDOW_MS = 15 * 60 * 1000;
+const loginFailures = new Map(); // lowercase username -> { count, first }
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, v] of loginFailures) if (now - v.first > LOGIN_FAIL_WINDOW_MS) loginFailures.delete(k);
+}, 5 * 60 * 1000).unref();
+function loginKey(username) { return String(username || '').toLowerCase().slice(0, 64); }
+function recordLoginFailure(username) {
+    const k = loginKey(username), now = Date.now();
+    const cur = loginFailures.get(k);
+    if (!cur || now - cur.first > LOGIN_FAIL_WINDOW_MS) loginFailures.set(k, { count: 1, first: now });
+    else cur.count++;
+}
+function apiLoginThrottle(req, res, next) {
+    const cur = loginFailures.get(loginKey(req.body && req.body.username));
+    if (cur && Date.now() - cur.first <= LOGIN_FAIL_WINDOW_MS && cur.count >= LOGIN_FAIL_MAX) {
+        return res.status(429).json({ error: 'Too many failed logins for this account. Please wait a few minutes.', code: 'too_many_failures' });
+    }
+    next();
+}
+
+// What a client needs to know before showing a login/register screen.
+app.get('/api/v1/auth/config', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({
+        authApiAvailable: API_AUTH_AVAILABLE,
+        captchaRequired: CAPTCHA_ENABLED,
+        turnstileSiteKey: CAPTCHA_ENABLED ? TURNSTILE_SITE_KEY : null,
+        captchaWidgetUrl: CAPTCHA_ENABLED ? `${APP_BASE_URL}/captcha-widget` : null,
+        registrationOpen: !getRegistrationBlockPage(),
+        registerMinWaitMs: REG_MIN_FILL_MS,
+        registerChallengeValidMs: FORM_TOKEN_MAX_AGE_MS
+    });
+});
+
+// Hands out a signed, IP-bound, single-use signup challenge. The server records
+// WHEN it was issued; /register refuses it until registerMinWaitMs has passed.
+app.get('/api/v1/auth/register-challenge', apiChallengeLimiter, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!API_AUTH_AVAILABLE) return res.status(503).json({ error: 'The auth API is disabled until the server\'s captcha is configured.', code: 'captcha_not_configured' });
+    if (getRegistrationBlockPage()) return res.status(503).json({ error: 'Registration is temporarily closed.', code: 'registration_closed' });
+    res.json({ challenge: issueFormToken(req), minWaitMs: REG_MIN_FILL_MS, validForMs: FORM_TOKEN_MAX_AGE_MS });
+});
+
+// A page for webview-based clients: shows the Cloudflare Turnstile widget on
+// THIS site's domain (site keys are domain-locked, so a client can't render it
+// itself) and exposes the solved token. Tokens are single-use: fetch a fresh
+// one for every login / register call.
+app.get('/captcha-widget', (req, res) => {
+    if (!CAPTCHA_ENABLED) return res.status(404).send('Captcha is not enabled.');
+    res.set('Cache-Control', 'no-store');
+    res.type('html').send(`<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Verification</title>
+<style>body{font-family:system-ui,sans-serif;text-align:center;padding:24px}textarea{width:90%;max-width:420px;height:70px;margin-top:12px}</style></head>
+<body>
+<h3>Confirm you're human</h3>
+<div id="w" style="display:flex;justify-content:center"></div>
+<div id="done" style="display:none"><p>Done. Your client can now use this token:</p>
+<textarea id="tok" readonly></textarea><br><button id="copy" type="button">Copy token</button></div>
+<script>
+window.__cb = function () {
+    turnstile.render('#w', { sitekey: ${JSON.stringify(TURNSTILE_SITE_KEY)}, callback: function (t) {
+        window.biodeckCaptchaToken = t;
+        document.getElementById('tok').value = t;
+        document.getElementById('done').style.display = 'block';
+        try { window.ReactNativeWebView && window.ReactNativeWebView.postMessage(JSON.stringify({ type: 'biodeck-captcha', token: t })); } catch (e) {}
+    }, 'expired-callback': function () { window.biodeckCaptchaToken = null; } });
+};
+document.getElementById('copy').onclick = function () { var t = document.getElementById('tok'); t.select(); document.execCommand('copy'); };
+</script>
+<script src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__cb" async defer></script>
+</body></html>`);
+});
+
+app.post('/api/v1/auth/register', requireJSONBody, authLimiter, apiRegisterLimiter, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!API_AUTH_AVAILABLE) return res.status(503).json({ error: 'The auth API is disabled until the server\'s captcha is configured.', code: 'captcha_not_configured' });
+    if (getRegistrationBlockPage()) return res.status(503).json({ error: 'Registration is temporarily closed.', code: 'registration_closed' });
+
+    // Cheapest checks first: the challenge is verified locally, before the
+    // captcha makes a network call to Cloudflare.
+    const tok = parseFormToken(req, req.body.challenge);
+    if (!tok.ok) {
+        const map = { too_early: 'challenge_too_early', expired: 'challenge_expired' };
+        return res.status(400).json({ error: 'Invalid or unusable registration challenge. Request a new one, wait registerMinWaitMs, then submit.', code: map[tok.reason] || 'bad_challenge' });
+    }
+    // Run the captcha middleware inline so the order above is kept.
+    let captchaPassed = false;
+    await apiRequireCaptcha(req, res, () => { captchaPassed = true; });
+    if (!captchaPassed) return; // apiRequireCaptcha already responded
+
+    const username = req.body.username, password = req.body.password;
+    const email = typeof req.body.email === 'string' ? req.body.email.trim().toLowerCase() : '';
+    if (typeof username !== 'string' || typeof password !== 'string' || !username || !password) {
+        return res.status(400).json({ error: 'username, password and email are required.', code: 'invalid_request' });
+    }
+    if (username.length < 3 || username.length > 32) return res.status(400).json({ error: 'Username must be 3-32 characters.', code: 'invalid_username' });
+    if (!/^[a-zA-Z0-9_.-]+$/.test(username)) return res.status(400).json({ error: 'Username may only contain letters, numbers, _ . and -', code: 'invalid_username' });
+    // bcrypt silently ignores everything after 72 bytes, so refuse longer passwords.
+    if (password.length < 8 || Buffer.byteLength(password, 'utf8') > 72) return res.status(400).json({ error: 'Password must be 8-72 bytes long.', code: 'invalid_password' });
+    if (!email || email.length > 254 || !EMAIL_REGEX.test(email)) return res.status(400).json({ error: 'A valid email address is required.', code: 'invalid_email' });
+
+    try {
+        const result = await createAccount(req, { username, password, email, formNonce: tok.nonce });
+        if (!result.ok) {
+            switch (result.code) {
+                case 'signup_refused': return res.status(result.refusal.status).json({ error: result.refusal.message, code: 'signup_refused' });
+                case 'bad_form_token': return res.status(400).json({ error: 'That registration challenge was already used. Request a new one.', code: 'bad_challenge' });
+                case 'lockdown': return res.status(503).json({ error: 'Registration is temporarily closed.', code: 'registration_closed' });
+                case 'spam_banned': return res.status(403).json({ error: SPAM_REG_BAN_REASON, code: 'ip_banned' });
+                default: return res.status(409).json({ error: 'That username is not available.', code: 'username_taken' });
+            }
+        }
+        if (result.banned) {
+            return res.status(202).json({ ok: true, status: 'pending_activation', username: result.username, message: result.banReason });
+        }
+        // Same pending state the website uses, so the emailed link and the
+        // verify-email pages work with this session.
+        req.session.pendingVerifyUserId = result.userId;
+        req.session.pendingVerifyUsername = result.username;
+        return res.status(201).json({ ok: true, status: 'verification_required', username: result.username, message: 'Account created. Click the link we emailed you, then log in.' });
+    } catch (e) {
+        console.error('API register error:', e);
+        return res.status(500).json({ error: 'Something went wrong.', code: 'internal' });
+    }
+});
+
+app.post('/api/v1/auth/login', requireJSONBody, authLimiter, apiLoginThrottle, apiRequireCaptcha, async (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const username = typeof req.body.username === 'string' ? req.body.username : '';
+    const password = typeof req.body.password === 'string' ? req.body.password : '';
+    if (!username || !password || username.length > 64 || password.length > 1024) {
+        return res.status(400).json({ error: 'username and password are required.', code: 'invalid_request' });
+    }
+    try {
+        const user = getStmt(`SELECT * FROM User_Data WHERE username = ?`).get(username);
+        // Always run one bcrypt compare so "no such user" takes as long as "wrong
+        // password" (no username enumeration by timing).
+        const match = await bcrypt.compare(password, user ? user.password : DUMMY_BCRYPT_HASH);
+        if (!user || !match) {
+            recordLoginFailure(username);
+            return res.status(401).json({ error: 'Invalid username or password.', code: 'invalid_credentials' });
+        }
+        loginFailures.delete(loginKey(username));
+
+        // Account state is only revealed after the password was right.
+        if (user.IsDeleted) {
+            return res.status(403).json({ error: 'This account has been deleted.', code: 'account_deleted', reason: user.DeleteReason || 'No reason provided' });
+        }
+        if (user.IsBanned && user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
+            clearExpiredBan(user.id);
+            user.IsBanned = 0;
+        }
+        if (user.IsBanned) {
+            return res.status(403).json({ error: 'This account is banned.', code: 'account_banned', reason: user.BanReason || 'No reason provided', expiresAt: user.BanExpiresAt || null });
+        }
+        if (fullLockdownEnabled && !isStaffUser(user)) {
+            return res.status(503).json({ error: 'Logins are temporarily paused.', code: 'lockdown' });
+        }
+        if (!user.email) {
+            req.session.pendingEmailUserId = user.id;
+            req.session.pendingEmailUsername = user.username;
+            return res.status(403).json({ error: 'This account needs an email address before it can be used. Finish at /account/add-email in a browser.', code: 'email_required' });
+        }
+        if (!user.email_verified) {
+            req.session.pendingVerifyUserId = user.id;
+            req.session.pendingVerifyUsername = user.username;
+            return res.status(403).json({ error: 'Verify your email address first (check your inbox), then log in again.', code: 'email_verification_required' });
+        }
+        // Fresh session id on login (session-fixation protection), same as the website.
+        req.session.regenerate((regenErr) => {
+            if (regenErr) {
+                console.error('Session regenerate error:', regenErr.message);
+                return res.status(500).json({ error: 'Something went wrong.', code: 'internal' });
+            }
+            req.session.userId = user.id;
+            req.session.userUsername = user.username;
+            recordLoginIP(user.id, user.username, getClientIP(req), 'login');
+            return res.json({ ok: true, user: { username: user.username, nickname: user.Nickname || null } });
+        });
+    } catch (e) {
+        console.error('API login error:', e);
+        return res.status(500).json({ error: 'Something went wrong.', code: 'internal' });
+    }
+});
+
+app.post('/api/v1/auth/logout', (req, res) => {
+    req.session.destroy(() => {
+        res.clearCookie('connect.sid');
+        res.json({ ok: true });
+    });
+});
+
+// Malformed JSON anywhere under /api gets a JSON error, not Express's HTML page.
+app.use('/api', (err, req, res, next) => {
+    if (err && (err.type === 'entity.parse.failed' || err.type === 'entity.too.large')) {
+        return res.status(err.status || 400).json({ error: 'Invalid or too large JSON body.', code: 'invalid_json' });
+    }
+    next(err);
 });
 
 // Catch-all: must stay last so every route/middleware above gets a chance to

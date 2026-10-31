@@ -6,7 +6,7 @@ This documents every route in `server.js` for anyone building a custom client.
 
 Everything under `/api/v1/` was added specifically for custom clients. Unlike the legacy routes documented further down, these always return proper structured JSON - no HTML fragments, no scraping required. They sit alongside the old routes rather than replacing them, so Biodeck's own frontend is unaffected; they read from the same tables via shared internal helpers, so the data is guaranteed consistent with what the web UI shows.
 
-Auth is still the session cookie described below - there's no separate token scheme for `/api/v1`. Log in via `POST /login` once, then send that cookie on every `/api/v1` request same as everything else. All `/api/v1` routes require a logged-in session and return `401 { "error": "Not logged in" }` otherwise. Hitting a path under `/api/v1/` (or any `/api/*` path) that doesn't exist returns `404 { "error": "Not found" }` rather than an HTML page - safe to treat any `/api/*` response as JSON, even a 404.
+Auth is still the session cookie described below - there's no separate token scheme for `/api/v1`. Log in once with `POST /api/v1/auth/login` (see [Authentication endpoints](#authentication-endpoints-apiv1auth)) - or `POST /login` - then send that cookie on every `/api/v1` request same as everything else. All `/api/v1` routes require a logged-in session and return `401 { "error": "Not logged in" }` otherwise. Hitting a path under `/api/v1/` (or any `/api/*` path) that doesn't exist returns `404 { "error": "Not found" }` rather than an HTML page - safe to treat any `/api/*` response as JSON, even a 404.
 
 Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` query param pattern (never both `before` and `after` at once), and every paginated response includes `hasMore` so you know whether to fetch another page. `limit` is clamped server-side (defaults and caps noted per-route below).
 
@@ -94,6 +94,26 @@ Pagination on `/api/v1` uses a `before`/`after` post-or-message-id + `limit` que
 **Reactions in `/api/v1`:** posts, DMs and group messages all carry a structured `reactions` array on read, and each has a JSON react endpoint (the three `POST .../react` rows above) that returns the updated array instead of an HTML chip row. Rules are identical to the legacy routes - see [Reactions](#reactions).
 
 **What's still missing from `/api/v1`:** posting/replying, editing, deleting, friend/follow actions, and group management (create/add/kick/leave/join/toggle-public) all still go through the legacy routes documented below - those already accept plain form fields or JSON bodies and mostly return real JSON already (see the tables further down), so a custom client can mix and match: read via `/api/v1`, write via the legacy write endpoints. If write endpoints under `/api/v1` end up being useful too, they can be added the same way - shout if a specific one would help.
+
+---
+
+## Authentication endpoints (`/api/v1/auth/*`)
+
+JSON in, JSON out. These enforce the same rules as the website (they share the website's rate-limit counter and run the same account-creation code), so they are deliberately a bit more involved than a plain username/password POST. Send `Content-Type: application/json`; form-encoded bodies get `415`. No CORS headers are sent, so browsers on other origins can't call them - native, desktop and server clients can. Keep the session cookie from the response (`Set-Cookie: connect.sid=...`) in a cookie jar and send it back.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/api/v1/auth/config` | - | `{ authApiAvailable, captchaRequired, turnstileSiteKey, captchaWidgetUrl, registrationOpen, registerMinWaitMs, registerChallengeValidMs }`. Call this first. If `authApiAvailable` is `false` the server has no captcha configured and the auth API is switched off |
+| GET | `/api/v1/auth/register-challenge` | - | `{ challenge, minWaitMs, validForMs }`. A signed, single-use token tied to your IP. The server records when it was issued |
+| POST | `/api/v1/auth/register` | `{ username, password, email, challenge, captchaToken }` | `201 { ok, status: "verification_required", username }` or `202 { ok, status: "pending_activation", message }` while new accounts need manual activation |
+| POST | `/api/v1/auth/login` | `{ username, password, captchaToken }` | `200 { ok: true, user: { username, nickname } }` + session cookie |
+| POST | `/api/v1/auth/logout` | - | `{ ok: true }` |
+
+**Captcha tokens.** When `captchaRequired` is `true`, every register and login call needs a fresh Cloudflare Turnstile token in `captchaToken`. Tokens are single-use. Turnstile site keys are locked to Biodeck's domain, so a client can't render the widget itself: open `captchaWidgetUrl` in a webview, let the user complete it, and read `window.biodeckCaptchaToken` (or the `biodeck-captcha` message posted to `ReactNativeWebView`).
+
+**Registering.** (1) `GET register-challenge`. (2) Wait at least `registerMinWaitMs` (2.5 s) - submitting earlier is refused. (3) Get a captcha token. (4) `POST register` within `validForMs` (1 h). A challenge works for one account only, and only from the IP that requested it. Password must be 8-72 bytes; username 3-32 of `a-z A-Z 0-9 _ . -`. New accounts must verify their email (click the emailed link) before `login` succeeds. The usual limits apply: max accounts per email and per IP per day, disposable-email block, registration lockdowns, and an automatic IP ban for creating accounts too fast.
+
+**Error codes** (`{ error, code }`): `invalid_request`, `invalid_json`, `unsupported_media_type` (415), `rate_limited` (429), `captcha_failed` (400), `captcha_not_configured` (503), `bad_challenge` / `challenge_too_early` / `challenge_expired` (400), `invalid_username` / `invalid_password` / `invalid_email` (400), `username_taken` (409), `signup_refused` (limits, disposable email), `registration_closed` (503), `ip_banned` (403, also returned by every `/api/*` route for banned IPs), `invalid_credentials` (401), `too_many_failures` (429, 10 wrong passwords for one account in 15 min), `email_verification_required` / `email_required` (403), `account_banned` (403, with `reason`, `expiresAt`), `account_deleted` (403), `lockdown` (503).
 
 ---
 

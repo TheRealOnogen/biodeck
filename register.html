@@ -23,12 +23,26 @@
         <input type="text" name="email" id="email" required><br><br>
         <label for="password">Password</label><br>
         <input type="password" id="password" name="password"><br><br>
+        <!-- Anti-bot: "website" is a honeypot real people never see (it's moved off-screen,
+             skipped by Tab and ignored by screen readers); "_t" reports how long the form
+             was open. The server refuses signups where the honeypot is filled or the form
+             was submitted in under ~2.5 seconds. -->
+        <div aria-hidden="true" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden;">
+            <label for="website">Leave this field empty</label>
+            <input type="text" id="website" name="website" tabindex="-1" autocomplete="off">
+        </div>
+        <input type="hidden" id="reg-t" name="_t" value="0">
         <div id="captcha-slot" style="display:flex;justify-content:center;margin-bottom:14px;"></div>
         <button type="submit" class="button">Register</button>
     </div>
     </form>
     <script src="/captcha.js" defer></script>
     <script>
+        // Report how long the form was open (checked server-side; see the anti-bot note above).
+        const formOpenedAt = Date.now();
+        document.querySelector('form').addEventListener('submit', () => {
+            document.getElementById('reg-t').value = String(Date.now() - formOpenedAt);
+        });
         document.querySelectorAll('.button').forEach(btn => {
             btn.addEventListener('mousedown', () => {
                 btn.classList.add('clicked');

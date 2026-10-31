@@ -114,8 +114,8 @@ All endpoints below require a logged-in session unless noted otherwise. Endpoint
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
-| POST | `/register` | body: `username, password, email`, plus `cf-turnstile-response` when captcha is enabled | Redirect to `/feed` or `/account/verify-email-required` on success; re-renders `register.html` with an error on failure. Missing/invalid captcha token: `400` HTML page. **Account-spam ban:** the 3rd registration attempt from one IP within 20 seconds is refused, and that IP is permanently added to `IP_Bans` (`403` ban page, reason `Stop spamming accounts, ...`). Every successful registration's IP is logged in `Registration_IPs` |
-| POST | `/login` | body: `username, password`, plus `cf-turnstile-response` when captcha is enabled | Redirect to `/feed` on success. Rate-limited (`authLimiter`). Missing/invalid captcha token: `400` HTML page (so a custom client can't log in with `username/password` alone once `TURNSTILE_SITE_KEY`/`TURNSTILE_SECRET_KEY` are set). On failure, returns a full HTML error page (banned/deleted/invalid credentials/pending email) with an appropriate status code |
+| POST | `/register` | body: `username, password, email`, plus `cf-turnstile-response` when captcha is enabled, plus the anti-bot fields `website` (hidden honeypot field, must be empty) and `_t` (milliseconds the signup form was open, must be >= 2500) | Redirect to `/feed` or `/account/verify-email-required` on success; re-renders `register.html` with an error on failure. Missing/invalid captcha token: `400` HTML page. **Account-spam ban:** the 3rd registration attempt from one IP within 20 seconds is refused, and that IP is permanently added to `IP_Bans` (`403` ban page, reason `Stop spamming accounts, ...`). Every successful registration's IP is logged in `Registration_IPs`. **Other refusals:** `400` generic "Registration failed" page if the honeypot `website` field is non-empty or `_t` is missing/under 2500 (a custom client must send `website=""` and a realistic `_t`); `400` for disposable-email domains; `429` if the same mailbox (Gmail dots and `+tags` ignored) already has 3 accounts, or the IP has already created 5 accounts in the last 24h (soft refusal, no ban); `503` + `Retry-After` while a **registration lockdown** is active (see below) |
+| POST | `/login` | body: `username, password`, plus `cf-turnstile-response` when captcha is enabled (`503` for non-staff while a [full lockdown](#full-lockdown) is on) | Redirect to `/feed` on success. Rate-limited (`authLimiter`). Missing/invalid captcha token: `400` HTML page (so a custom client can't log in with `username/password` alone once `TURNSTILE_SITE_KEY`/`TURNSTILE_SECRET_KEY` are set). On failure, returns a full HTML error page (banned/deleted/invalid credentials/pending email) with an appropriate status code |
 | GET | `/logout` | — | Destroys session, redirects to `/` |
 | POST | `/account/add-email` | body: `email` | For accounts created before email was required |
 | POST | `/account/verify-email-required/resend` | — | Resends verification email |
@@ -137,13 +137,29 @@ All endpoints below require a logged-in session unless noted otherwise. Endpoint
 | GET | `/api/check-ban-status` | — | **JSON.** `{ banned, type: 'ip'|'account'|'deleted', reason, expiresAt? }`. Polled by the client to detect a ban/deletion mid-session |
 | GET | `/api/user-events/stream` | — | **SSE.** Per-user push channel, currently used to notify the client it's just been banned so it can bounce to the ban screen |
 
+### Registration lockdown
+
+If **10 accounts are created within 60 seconds** (from any IPs combined), registration switches off completely for **3 hours**: `GET /register` and `POST /register` return `503` (with `Retry-After`) and a "registration is temporarily disabled" page, regardless of the registration-gate setting. Logging in is unaffected. The owner and anyone in `activation-pings.txt` get a system DM listing the accounts created in the burst, and the event is written to the audit log (`registration_lockdown_started`). The lockdown is stored in the `Settings` table, so it survives restarts. Head admins can start or end one early from the dashboard or via `/admin/registration-lockdown`.
+
+### Full lockdown
+
+A manual switch (Owners / Head Admins, in the admin dashboard or via `/admin/full-lockdown`) that turns off **both registration and login**. While it's on:
+
+- `GET`/`POST /register` return `503` and a "logins and signups are paused" page.
+- `POST /login` returns `503` with the same page for any non-staff account **whose password was correct** (a wrong password or unknown username still gets the normal `401`, so the lockdown can't be probed). Admin, Head Admin and Owner accounts can still log in, so the switch can always be turned back off.
+- The emailed verification link (`/account/verify-email`) still marks the email verified but no longer signs the user in.
+- The login page (`GET /`) shows a banner; the form stays so staff can log in.
+- **Existing sessions are not affected** - logged-in users keep using the site normally.
+
+There's no timer: it stays on until ended, and is stored in `Settings` (`full_lockdown`) so a restart doesn't lift it. It's separate from the automatic timed *registration* lockdown above, which only affects signups.
+
 ## Feed (public posts)
 
 Posts support optional file attachments (up to 5 per post, `multipart/form-data`, field name `attachments`). Max post length is **1000 characters**.
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
-| POST | `/feed/post` | multipart: `content, reply_to?, attachments[]` | Redirect to `/feed` or `/post/:reply_to`. `reply_to` (post id) makes it a reply |
+| POST | `/feed/post` | multipart: `content, reply_to?, attachments[]` | Redirect to `/feed` or `/post/:reply_to`. `reply_to` (post id) makes it a reply. **Spam protection** (admins exempt) - refusals return JSON `{ error }` (or a small HTML page when the request's `Accept` includes `text/html`): `429` posting timeout - the 3rd accepted post/reply within 10 seconds is refused and the account can't post or reply for **2 hours** (stored in `Post_Timeouts`, survives restarts; requests during the timeout are rejected before any upload is read); `429` for new accounts (under 24h old) posting more than once per 15 seconds; `422` for an identical post within 5 minutes, the same text (20+ chars) from a 4th different account within 10 minutes, more than 5 distinct `@mentions`, or - new accounts only - more than 2 links. Only posts that would otherwise have been accepted count towards the timeout |
 | POST | `/feed/delete/:id` | — | Plain 200/403/404 (no body). Only the author or an admin can delete |
 | POST | `/feed/edit/:id` | body: `content` | **JSON.** `{ ok: true, html }` — `html` is the freshly rendered post card |
 | GET | `/feed/poll?after=<id>` | query: `after` | **JSON (HTML fragment).** `{ html, lastId }` — new posts with id > `after`, for live-updating the feed |
@@ -192,6 +208,18 @@ Same shape as the main feed but scoped to accounts you follow (+ yourself).
 |---|---|---|
 | POST | `/follow/:username` | **JSON.** `{ ok: true, following: true }` |
 | POST | `/unfollow/:username` | **JSON.** `{ ok: true, following: false }` |
+
+## Blocking
+
+Blocking works in both directions for contact: neither account can DM, friend-request or follow the other, blocking removes any existing friendship, follow and pending friend requests between the two, and the blocker stops receiving notifications (replies, mentions, DMs, friend requests) from the blocked account. Blocked users can still see and reply to each other's public posts - this is about contact, not visibility. Max 500 blocks per account.
+
+| Method | Path | Response |
+|---|---|---|
+| POST | `/block/:username` | **JSON.** `{ ok: true, blocked: true }`. `400` blocking yourself or over the 500 limit, `404` unknown user |
+| POST | `/unblock/:username` | **JSON.** `{ ok: true, blocked: false }` |
+| GET | `/api/my-blocks` | **JSON, real data.** `{ blocks: [username, ...] }` |
+
+While a block exists, `POST /messages/:username/send`, `POST /friend-request/send/:username` and `POST /follow/:username` return `403 { error }` (the DM one also includes `blocked: true`).
 
 ## Direct messages
 
@@ -266,7 +294,7 @@ Any group creator can flip their group to public via `POST /groups/:id/toggle-pu
 
 These aren't relevant to a normal client but are listed for completeness — all return JSON:
 
-`/admin/tables-partial`, `/admin/dashboard`, `/admin/ban/:username`, `/admin/unban/:username`, `/admin/warn/:username`, `/admin/warnings/:username`, `/admin/warnings/:id/revoke`, `/admin/registration-gate` (GET/POST, POST is head-admin-only), `/admin/profile/:username` (+ `/text`, `/email`, `/avatar`, `/reset-avatar`), `/admin/delete-account/:username`, `/admin/delete-account-permanent/:username` (head-admin-only), `/admin/ipban`, `/admin/unipban`, `/admin/ipbans`, `/admin/badges/:username` (GET/POST), `/admin/pin/:id`, `/admin/unpin/:id`, `/admin/users`, `/admin/reports/:id`, `/admin/reports/:id/delete-content`.
+`/admin/tables-partial`, `/admin/dashboard`, `/admin/ban/:username`, `/admin/unban/:username`, `/admin/warn/:username`, `/admin/warnings/:username`, `/admin/warnings/:id/revoke`, `/admin/registration-gate` (GET/POST, POST is head-admin-only), `/admin/registration-lockdown` (GET: `{ active, until, leftMs }`; POST `{ active: true|false }` starts a 3h lockdown or ends it, head-admin-only), `/admin/full-lockdown` (GET: `{ enabled }`; POST `{ enabled: true|false }`, head-admin-only), `/admin/post-timeouts` (GET: currently timed-out accounts), `/admin/post-timeout/clear/:username` (POST: lift a posting timeout early), `/admin/profile/:username` (+ `/text`, `/email`, `/avatar`, `/reset-avatar`), `/admin/delete-account/:username`, `/admin/delete-account-permanent/:username` (head-admin-only), `/admin/ipban`, `/admin/unipban`, `/admin/ipbans`, `/admin/badges/:username` (GET/POST), `/admin/pin/:id`, `/admin/unpin/:id`, `/admin/users`, `/admin/reports/:id`, `/admin/reports/:id/delete-content`.
 
 A few admin routes (`/admin/support`, `/admin/support/:id`, `/admin/reports`, and the `/status`/`/reply` POSTs on both) render/redirect HTML instead of JSON.
 

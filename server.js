@@ -140,26 +140,93 @@ const uploadGC = makeMultiUpload(MAX_FILES_GC);
 
 const MSG_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
 
-const MAX_AVATAR_SIZE = 8 * 1024 * 1024;
+// ----- Avatar compression -----
+// Avatars are never stored as uploaded. The raw upload lands in a private
+// temp folder (NOT public/uploads), is checked by its real contents rather
+// than its filename, then re-encoded as a 512x512 WebP (typically 10-60 KB)
+// with all metadata (EXIF/GPS) stripped. Animated GIFs become a still frame.
+// SVG and BMP are not accepted for avatars: SVG can carry script/external
+// references and sharp can't read BMP.
+// Needs:  npm install sharp
+const sharp = require('sharp');
+const MAX_AVATAR_SIZE = 8 * 1024 * 1024;           // raw upload ceiling
+const AVATAR_OUTPUT_SIZE = 512;                    // px, square
+const AVATAR_WEBP_QUALITY = 80;
+const AVATAR_MAX_INPUT_PIXELS = 40 * 1000 * 1000;  // refuses "decompression bombs": tiny file, gigantic decoded image
+const AVATAR_MAX_CONCURRENT_JOBS = 3;              // caps CPU/RAM spent resizing at any moment
+const AVATAR_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp'];
+const AVATAR_FORMATS = ['jpeg', 'png', 'gif', 'webp'];
+const avatarTmpDir = path.join(__dirname, 'tmp-uploads');
+if (!fs.existsSync(avatarTmpDir)) fs.mkdirSync(avatarTmpDir, { recursive: true });
+// Raw files left behind by a crash mid-request are swept on boot.
+fs.readdir(avatarTmpDir, (err, names) => { (names || []).forEach(n => fs.unlink(path.join(avatarTmpDir, n), () => {})); });
+
+let avatarJobsRunning = 0;
 
 // keyFn: own session id for a normal avatar change, target username for an admin one.
-function makeAvatarUpload(keyFn) {
+function makeAvatarUpload() {
     const storage = multer.diskStorage({
-        destination: (req, file, cb) => cb(null, uploadsDir),
-        filename: (req, file, cb) => cb(null, `avatar-${keyFn(req)}-${Date.now()}${path.extname(file.originalname).toLowerCase()}`)
+        destination: (req, file, cb) => cb(null, avatarTmpDir),
+        filename: (req, file, cb) => cb(null, crypto.randomBytes(16).toString('hex') + path.extname(file.originalname).toLowerCase())
     });
     return multer({
         storage,
-        limits: { fileSize: MAX_AVATAR_SIZE },
+        limits: { fileSize: MAX_AVATAR_SIZE, files: 1 },
         fileFilter: (req, file, cb) => {
             const ext = path.extname(file.originalname).toLowerCase();
-            if (MSG_IMAGE_EXTS.includes(ext)) cb(null, true);
-            else cb(new Error('Only image files are allowed for profile pictures'));
+            if (AVATAR_EXTS.includes(ext)) cb(null, true);
+            else cb(new Error('Profile pictures must be a JPG, PNG, GIF or WebP image'));
         }
     });
 }
-const avatarUpload = makeAvatarUpload(req => req.session.userId);
-const adminAvatarUpload = makeAvatarUpload(req => req.params.username);
+const avatarUpload = makeAvatarUpload();
+const adminAvatarUpload = makeAvatarUpload();
+
+// Validates + re-encodes the raw upload at `srcPath` into public/uploads and
+// resolves to the new full path (same form multer used to give us). Always
+// removes the raw temp file, success or not. Rejects on anything that isn't
+// a real, reasonably-sized JPEG/PNG/GIF/WebP.
+async function compressAvatar(srcPath, key) {
+    if (avatarJobsRunning >= AVATAR_MAX_CONCURRENT_JOBS) {
+        fs.unlink(srcPath, () => {});
+        throw new Error('busy');
+    }
+    avatarJobsRunning++;
+    const safeKey = String(key).replace(/[^a-zA-Z0-9_.-]/g, '_').slice(0, 40);
+    const outPath = path.join(uploadsDir, `avatar-${safeKey}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.webp`);
+    try {
+        const opts = { limitInputPixels: AVATAR_MAX_INPUT_PIXELS, failOn: 'error' };
+        const meta = await sharp(srcPath, opts).metadata();
+        if (!AVATAR_FORMATS.includes(meta.format)) throw new Error('not a supported image');
+        await sharp(srcPath, opts)
+            .rotate() // apply EXIF orientation before metadata is dropped
+            .resize(AVATAR_OUTPUT_SIZE, AVATAR_OUTPUT_SIZE, { fit: 'cover' })
+            .webp({ quality: AVATAR_WEBP_QUALITY })
+            .toFile(outPath);
+        return outPath;
+    } catch (e) {
+        fs.unlink(outPath, () => {});
+        throw e;
+    } finally {
+        avatarJobsRunning--;
+        fs.unlink(srcPath, () => {});
+    }
+}
+
+// Deletes a replaced avatar file. Only ever touches files named avatar-*
+// directly inside uploads (never public/Default.png or anything else), and
+// only if no account still points at it.
+function deleteOldAvatarFile(oldPath) {
+    if (!oldPath) return;
+    const name = path.basename(String(oldPath).replace(/\\/g, '/'));
+    if (!/^avatar-/.test(name)) return;
+    try {
+        const stillUsed = getStmt(`SELECT 1 FROM User_Data WHERE avatar_path LIKE ? LIMIT 1`).get('%' + name);
+        if (stillUsed) return;
+    } catch (e) { return; }
+    fs.unlink(path.join(uploadsDir, name), () => {});
+}
+
 const MSG_VIDEO_MIME_TYPES = {
     '.mp4': 'video/mp4',
     '.m4v': 'video/mp4',
@@ -1818,8 +1885,26 @@ function renderAttachmentsHTML(files, maxHeight, maxWidth) {
     return html;
 }
 
+// ----- Blocking -----
+// User_Blocks(blocker, blocked). A block works in both directions for
+// contact: neither side can DM, friend-request or follow the other, and the
+// blocker stops receiving notifications (replies, mentions, DMs, friend
+// requests) from the blocked account. Synchronous lookups (better-sqlite3),
+// failing open on a DB error.
+function blockExists(blocker, blocked) {
+    try {
+        return !!getStmt(`SELECT 1 FROM User_Blocks WHERE blocker = ? AND blocked = ?`).get(blocker, blocked);
+    } catch (e) {
+        return false;
+    }
+}
+function eitherBlocked(a, b) {
+    return blockExists(a, b) || blockExists(b, a);
+}
+
 function createNotification({ username, type, actor_username, post_id = null, message_id = null, content_preview = null }) {
     if (!username || !actor_username || username === actor_username) return;
+    if (blockExists(username, actor_username)) return; // recipient blocked the actor
     db.run(
         `INSERT INTO Notifications (username, type, actor_username, post_id, message_id, content_preview) VALUES (?, ?, ?, ?, ?, ?)`,
         [username, type, actor_username, post_id, message_id, content_preview],
@@ -2667,6 +2752,32 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_registration_ips_ip ON Registration_IPs(ip, created_ts)`);
+            // Global "accounts created in the last minute" count (lockdown
+            // trigger) and per-user account-age lookups (new-account post limits).
+            db.run(`CREATE INDEX IF NOT EXISTS idx_registration_ips_ts ON Registration_IPs(created_ts)`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_registration_ips_user ON Registration_IPs(user_id)`);
+            // Normalised email the account REGISTERED with (see
+            // normalizeEmailForLimit). Only used to cap accounts per mailbox;
+            // NULL for accounts created before this column existed.
+            db.run(`ALTER TABLE User_Data ADD COLUMN reg_email_norm TEXT DEFAULT NULL`, () => {});
+            db.run(`CREATE INDEX IF NOT EXISTS idx_user_data_reg_email_norm ON User_Data(reg_email_norm)`);
+            // Posting timeouts from the post-flood guard (survive restarts).
+            db.run(`CREATE TABLE IF NOT EXISTS Post_Timeouts (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT NOT NULL,
+                expires_ts INTEGER NOT NULL,
+                reason TEXT DEFAULT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            // Who has blocked whom (see "Blocking" near the Follow routes).
+            db.run(`CREATE TABLE IF NOT EXISTS User_Blocks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                blocker TEXT NOT NULL,
+                blocked TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(blocker, blocked)
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_user_blocks_blocked ON User_Blocks(blocked)`);
             db.run(`CREATE TABLE IF NOT EXISTS Friend_Requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_user TEXT NOT NULL,
@@ -2742,7 +2853,7 @@ db.serialize(() => {
             db.run(`CREATE TABLE IF NOT EXISTS Settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            )`, () => { loadRegistrationGateSetting(); });
+            )`, () => { loadRegistrationGateSetting(); loadRegistrationLockdown(); loadFullLockdown(); });
             // Audit trail for admin-facing/account-lifecycle events (account
             // created/banned/unbanned/deleted, registration gate toggled, etc).
             // actor is who performed the action ('System' for self-service
@@ -3108,7 +3219,19 @@ app.get('/theme.css', (req, res) => {
     });
 });
 
+// OPTIONAL hardening: set CLIENT_IP_HEADER in vars.env (e.g.
+// CLIENT_IP_HEADER=cf-connecting-ip behind Cloudflare) to read the client IP
+// from a header your proxy sets itself. Without it, the FIRST X-Forwarded-For
+// entry is used, which a client can forge (most proxies append to whatever
+// the client sent) - that lets a spammer dodge IP bans and the per-IP limits
+// by sending a different fake header on every request. Leave unset to keep
+// the previous behaviour. Only set it if the app is reachable ONLY through
+// that proxy, otherwise the header itself becomes forgeable.
+const CLIENT_IP_HEADER = (process.env.CLIENT_IP_HEADER || '').trim().toLowerCase();
 function getClientIP(req) {
+    if (CLIENT_IP_HEADER && req.headers[CLIENT_IP_HEADER]) {
+        return String(req.headers[CLIENT_IP_HEADER]).split(',')[0].trim();
+    }
     const forwarded = req.headers['x-forwarded-for'];
     if (forwarded) return forwarded.split(',')[0].trim();
     return req.socket.remoteAddress || req.ip || 'unknown';
@@ -4802,14 +4925,20 @@ app.get('/api/check-ban-status', (req, res) => {
     });
 });
 
-app.get('/register', (req, res) => {
+app.get('/register', registrationLockdownGuard, (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
     res.sendFile(path.join(__dirname, 'register.html'));
 })
 
 app.get('/', (req, res) => {
     if (req.session.userId) return res.redirect('/feed');
-    res.sendFile(path.join(__dirname, 'login.html'));
+    if (!fullLockdownEnabled) return res.sendFile(path.join(__dirname, 'login.html'));
+    // Full lockdown: keep the form (staff still need it) but say what's going on.
+    fs.readFile(path.join(__dirname, 'login.html'), 'utf8', (err, html) => {
+        if (err) return res.sendFile(path.join(__dirname, 'login.html'));
+        const banner = '<div style="position:fixed;top:0;left:0;right:0;z-index:9999;background:rgb(200,60,60);color:#fff;text-align:center;padding:10px 14px;font-size:0.9em;">Logins and registrations are temporarily paused. If you are already signed in you are not affected.</div>';
+        res.send(html.replace('<body>', '<body>\n' + banner));
+    });
 });
 
 // Login/register had no rate limiting at all, so a script could try
@@ -4866,6 +4995,251 @@ function banIPForSpam(ip, cb) {
             cb(null);
         }
     );
+}
+
+// ============================ SPAM PROTECTION ===============================
+// Three layers, all tunable via the constants below:
+//   1. Registration lockdown - LOCKDOWN_REG_MAX accounts created inside
+//      LOCKDOWN_REG_WINDOW_MS (from ANY IPs) switches registration off
+//      entirely for LOCKDOWN_DURATION_MS. Survives restarts (Settings table)
+//      and can be started/ended by a head admin from the dashboard.
+//   2. Signup hardening - honeypot + minimum-fill-time on the form,
+//      disposable-email blocking, and per-IP / per-email account caps.
+//   3. Post spam protection - see the "Post spam protection" block above the
+//      /feed/post route.
+// (The older "3 accounts in 20s from one IP = permanent IP ban" rule above is
+// untouched and still runs.)
+
+function formatDuration(ms) {
+    const totalMin = Math.max(1, Math.ceil(ms / 60000));
+    const h = Math.floor(totalMin / 60);
+    const m = totalMin % 60;
+    const hPart = `${h} hour${h === 1 ? '' : 's'}`;
+    const mPart = `${m} minute${m === 1 ? '' : 's'}`;
+    if (!h) return mPart;
+    if (!m) return hPart;
+    return `${hPart} ${mPart}`;
+}
+
+// ----- 1. Registration lockdown -----
+const LOCKDOWN_REG_MAX = 10;
+const LOCKDOWN_REG_WINDOW_MS = 60 * 1000;
+const LOCKDOWN_DURATION_MS = 3 * 60 * 60 * 1000;
+
+// Epoch ms the lockdown ends at (0 / in the past = not locked down). Cached
+// in memory, persisted in Settings so a restart can't be used to dodge it.
+let registrationLockdownUntil = 0;
+
+function loadRegistrationLockdown() {
+    db.get(`SELECT value FROM Settings WHERE key = 'registration_lockdown_until'`, (err, row) => {
+        if (!err && row) registrationLockdownUntil = parseInt(row.value, 10) || 0;
+    });
+}
+
+function getRegistrationLockdownLeftMs() {
+    return Math.max(0, registrationLockdownUntil - Date.now());
+}
+
+function setRegistrationLockdown(untilTs) {
+    registrationLockdownUntil = untilTs; // in-memory first so it applies to the very next request
+    db.run(`INSERT INTO Settings (key, value) VALUES ('registration_lockdown_until', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [String(untilTs)],
+        (err) => { if (err) console.error('Registration lockdown save error:', err.message); });
+}
+
+function renderLockdownPage(leftMs) {
+    return renderMessagePage('Registration paused', 'Registration is temporarily disabled',
+        `<h3>We noticed an unusual spike in signups, so new registrations are paused for now. Please try again in about ${escapeHTML(formatDuration(leftMs))}.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`);
+}
+
+// Cheap early exit used on GET /register and POST /register (before the
+// captcha round-trip and before any hashing work).
+function registrationLockdownGuard(req, res, next) {
+    if (req.session && req.session.userId) return next();
+    const page = getRegistrationBlockPage();
+    if (!page) return next();
+    const left = getRegistrationLockdownLeftMs();
+    if (!fullLockdownEnabled && left) res.set('Retry-After', String(Math.ceil(left / 1000)));
+    return res.status(503).send(page);
+}
+
+// ----- Full lockdown (manual, admin-controlled) -----
+// Switched on/off from the admin dashboard (Owners / Head Admins). While ON:
+//   - nobody can register (same as the timed registration lockdown), and
+//   - nobody can LOG IN, including via the emailed verification link,
+//     EXCEPT staff accounts (Admin / Head Admin / Owner) - otherwise an
+//     expired admin session would make it impossible to turn this back off.
+// Sessions that already exist are untouched: logged-in users keep using the
+// site normally. There is no timer; it stays on until someone ends it, and is
+// stored in Settings so a restart doesn't lift it.
+let fullLockdownEnabled = false;
+
+function loadFullLockdown() {
+    db.get(`SELECT value FROM Settings WHERE key = 'full_lockdown'`, (err, row) => {
+        if (!err && row) fullLockdownEnabled = row.value === '1';
+    });
+}
+
+function setFullLockdown(enabled) {
+    fullLockdownEnabled = !!enabled; // in-memory first so it applies to the very next request
+    db.run(`INSERT INTO Settings (key, value) VALUES ('full_lockdown', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [enabled ? '1' : '0'],
+        (err) => { if (err) console.error('Full lockdown save error:', err.message); });
+}
+
+function isStaffUser(user) {
+    return !!(user && (user.IsAdmin || user.IsOwner || user.IsHeadAdmin));
+}
+
+function renderFullLockdownPage() {
+    return renderMessagePage('Temporarily unavailable', 'Logins and signups are paused',
+        `<h3>Biodeck has temporarily paused new logins and registrations. If you're already signed in you can keep using the site as normal. Please try again later.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to home</button>`);
+}
+
+// The page to show instead of the registration form/handler, or null when
+// registration is open. Full lockdown wins over the timed one.
+function getRegistrationBlockPage() {
+    if (fullLockdownEnabled) return renderFullLockdownPage();
+    const left = getRegistrationLockdownLeftMs();
+    return left > 0 ? renderLockdownPage(left) : null;
+}
+
+// DMs the admins who already get activation pings (user id 1 + anyone in
+// activation-pings.txt) so a lockdown never goes unnoticed.
+function notifyAdminsOfLockdown(message) {
+    const targets = new Set(getActivationPingUsernames());
+    db.get(`SELECT username FROM User_Data WHERE id = 1`, (err, owner) => {
+        if (owner) targets.add(owner.username);
+        const list = [...targets];
+        if (!list.length) return;
+        const placeholders = list.map(() => '?').join(',');
+        db.all(`SELECT username FROM User_Data WHERE username IN (${placeholders})`, list, (err2, rows) => {
+            if (err2 || !rows) return;
+            rows.forEach(r => sendSystemDM(r.username, message));
+        });
+    });
+}
+
+// Called right after a successful registration has been logged to
+// Registration_IPs. Counts every account created in the window (any IP) and
+// starts the lockdown once the threshold is reached.
+function checkRegistrationLockdownTrigger() {
+    if (getRegistrationLockdownLeftMs() > 0) return;
+    try {
+        const since = Date.now() - LOCKDOWN_REG_WINDOW_MS;
+        const rows = getStmt(`SELECT username, ip FROM Registration_IPs WHERE created_ts > ?`).all(since);
+        if (rows.length < LOCKDOWN_REG_MAX) return;
+        const until = Date.now() + LOCKDOWN_DURATION_MS;
+        setRegistrationLockdown(until);
+        const names = rows.map(r => r.username).join(', ');
+        const ipCount = new Set(rows.map(r => r.ip)).size;
+        const summary = `${rows.length} accounts created within ${LOCKDOWN_REG_WINDOW_MS / 1000}s from ${ipCount} IP${ipCount === 1 ? '' : 's'}`;
+        logAudit('registration_lockdown_started', 'System', null,
+            `${summary}; registration disabled for ${LOCKDOWN_DURATION_MS / 3600000}h. Accounts: ${names}`.slice(0, 1000));
+        notifyAdminsOfLockdown(`Registration lockdown started: ${summary}. Signups are disabled for ${LOCKDOWN_DURATION_MS / 3600000} hours (until ${new Date(until).toUTCString()}). Accounts created in the burst: ${names}. You can end the lockdown early from the admin dashboard.`);
+    } catch (e) {
+        console.error('Registration lockdown trigger error:', e.message);
+    }
+}
+
+// ----- 2. Signup hardening -----
+const REG_MIN_FILL_MS = 2500;            // a human can't fill the form faster than this
+const MAX_ACCOUNTS_PER_IP_PER_DAY = 5;   // soft cap (refused, not banned)
+const MAX_ACCOUNTS_PER_EMAIL = 3;        // counted on a normalised address (see below)
+
+const DISPOSABLE_EMAIL_DOMAINS = new Set([
+    'mailinator.com', 'guerrillamail.com', 'guerrillamail.net', 'guerrillamail.org', 'guerrillamailblock.com',
+    'sharklasers.com', 'grr.la', '10minutemail.com', '10minutemail.net', 'tempmail.com', 'temp-mail.org',
+    'temp-mail.io', 'tempmail.net', 'throwawaymail.com', 'yopmail.com', 'yopmail.net', 'getnada.com',
+    'nada.email', 'trashmail.com', 'trashmail.net', 'maildrop.cc', 'dispostable.com', 'fakeinbox.com',
+    'mailnesia.com', 'mintemail.com', 'mohmal.com', 'emailondeck.com', 'spamgourmet.com', 'moakt.com',
+    'tmpmail.org', 'tmpmail.net', 'burnermail.io', 'inboxkitten.com', 'mailcatch.com', 'mytemp.email',
+    'tempinbox.com', 'discard.email', 'harakirimail.com', 'emailfake.com', 'fakemail.net', 'getairmail.com',
+    'mail.tm', 'tempr.email'
+]);
+
+// Optional extra domains, one per line (# comments allowed). Read once at
+// startup - restart after editing it.
+const BLOCKED_EMAIL_DOMAINS_FILE = path.join(__dirname, 'blocked-email-domains.txt');
+(function loadExtraBlockedEmailDomains() {
+    try {
+        fs.readFileSync(BLOCKED_EMAIL_DOMAINS_FILE, 'utf8').split(/\r?\n/).forEach(line => {
+            const d = line.replace(/#.*$/, '').trim().toLowerCase();
+            if (d) DISPOSABLE_EMAIL_DOMAINS.add(d);
+        });
+    } catch (e) { /* no file = just the built-in list */ }
+})();
+
+function isDisposableEmail(email) {
+    const domain = email.slice(email.lastIndexOf('@') + 1).toLowerCase();
+    const parts = domain.split('.');
+    for (let i = 0; i < parts.length - 1; i++) {
+        if (DISPOSABLE_EMAIL_DOMAINS.has(parts.slice(i).join('.'))) return true;
+    }
+    return false;
+}
+
+// Collapses the usual "same inbox, different spelling" tricks so one mailbox
+// can't be turned into unlimited addresses: +tags are dropped everywhere and
+// Gmail's dots are ignored. Only used to COUNT accounts per mailbox - the
+// address the user typed is still what gets stored and emailed.
+function normalizeEmailForLimit(email) {
+    const at = email.lastIndexOf('@');
+    if (at < 1) return email;
+    let local = email.slice(0, at).toLowerCase();
+    let domain = email.slice(at + 1).toLowerCase();
+    local = local.split('+')[0];
+    if (domain === 'gmail.com' || domain === 'googlemail.com') {
+        local = local.replace(/\./g, '');
+        domain = 'gmail.com';
+    }
+    return `${local}@${domain}`;
+}
+
+// Hidden honeypot field ("website") must be empty and the form must have
+// been open for at least REG_MIN_FILL_MS (register.html reports how long in
+// "_t"). Bots that POST straight to /register or auto-fill every input fail
+// one or both. Returns the same generic page either way so it doesn't tell a
+// bot which check it tripped.
+function registrationBotGuard(req, res, next) {
+    const b = req.body || {};
+    const honeypot = typeof b.website === 'string' ? b.website.trim() : '';
+    const filledIn = parseInt(b._t, 10);
+    const tooFast = !Number.isFinite(filledIn) || filledIn < REG_MIN_FILL_MS;
+    if (honeypot || tooFast) {
+        return res.status(400).send(renderMessagePage('Registration failed', 'Something went wrong',
+            `<h3>We couldn't process that registration. Please reload the page and try again.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+    }
+    next();
+}
+
+// Cheap checks that run BEFORE the bcrypt hash so refused signups cost almost
+// nothing. Returns null when fine, otherwise { status, title, heading, message }.
+// Fails open: a broken DB read must never lock everybody out of registering.
+function checkSignupLimits(ip, email, emailNorm) {
+    try {
+        if (isDisposableEmail(email)) {
+            return { status: 400, title: 'Email not allowed', heading: 'That email provider isn\'t allowed',
+                message: 'Please use a permanent email address (temporary/disposable inboxes can\'t be used).' };
+        }
+        const byEmail = getStmt(`SELECT COUNT(*) AS c FROM User_Data WHERE reg_email_norm = ?`).get(emailNorm);
+        if (byEmail && byEmail.c >= MAX_ACCOUNTS_PER_EMAIL) {
+            return { status: 429, title: 'Email limit reached', heading: 'That email can\'t be used again',
+                message: 'This email address has been used for too many accounts. Please use a different one.' };
+        }
+        const byIP = getStmt(`SELECT COUNT(*) AS c FROM Registration_IPs WHERE ip = ? AND created_ts > ?`)
+            .get(ip, Date.now() - 24 * 60 * 60 * 1000);
+        if (byIP && byIP.c >= MAX_ACCOUNTS_PER_IP_PER_DAY) {
+            return { status: 429, title: 'Too many accounts', heading: 'Too many accounts from your network',
+                message: 'Too many accounts have been created from your network today. Please try again tomorrow.' };
+        }
+    } catch (e) {
+        console.error('Signup limit check error:', e.message);
+    }
+    return null;
 }
 
 // ----- CAPTCHA (Cloudflare Turnstile) on /login and /register -----
@@ -4937,7 +5311,7 @@ async function requireCaptcha(req, res, next) {
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='${back}';">Go back</button>`));
 }
 
-app.post('/register', authLimiter, requireCaptcha, async (req, res) => {
+app.post('/register', authLimiter, registrationLockdownGuard, registrationBotGuard, requireCaptcha, async (req, res) => {
     const { username, password } = req.body;
     const email = (req.body.email || '').trim().toLowerCase();
 
@@ -4960,12 +5334,25 @@ app.post('/register', authLimiter, requireCaptcha, async (req, res) => {
             `<h3>Please double check the email address and try again.</h3><br><br>
             <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
     }
+    // Cheap refusals (disposable email, per-email and per-IP caps) happen
+    // before the bcrypt hash so spammers can't burn CPU with them.
+    const emailNorm = normalizeEmailForLimit(email);
+    const signupRefusal = checkSignupLimits(getClientIP(req), email, emailNorm);
+    if (signupRefusal) {
+        return res.status(signupRefusal.status).send(renderMessagePage(signupRefusal.title, signupRefusal.heading,
+            `<h3>${escapeHTML(signupRefusal.message)}</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/register';">Go back</button>`));
+    }
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
 
         // Account-spam guard. Checked after the (async) hash so the count and
         // the INSERT below run back-to-back with nothing able to slip in
         // between; see isRegistrationSpam().
+        // Re-check the lockdown now that the (async) hash is done: requests
+        // that were already in flight when it started must not slip through.
+        const lockdownPage = getRegistrationBlockPage();
+        if (lockdownPage) return res.status(503).send(lockdownPage);
         const registerIP = getClientIP(req);
         if (isRegistrationSpam(registerIP)) {
             return banIPForSpam(registerIP, (banErr) => {
@@ -4983,7 +5370,7 @@ app.post('/register', authLimiter, requireCaptcha, async (req, res) => {
             ? "Account creation is currently disabled, please contact biodecksupport@gmail.com to activate your account, a message was also sent to admins"
             : null;
 
-        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path) VALUES (?, ?, ?, 0, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.png'], function(err) {
+        db.run(`INSERT INTO User_Data (username, password, email, email_verified, IsBanned, BanReason, avatar_path, reg_email_norm) VALUES (?, ?, ?, 0, ?, ?, ?, ?)`, [username, hashedPassword, email, initialIsBanned, initialBanReason, 'public/Default.png', emailNorm], function(err) {
             if (err) {
                 console.error("Database Insert Error:", err.message);
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
@@ -4994,6 +5381,7 @@ app.post('/register', authLimiter, requireCaptcha, async (req, res) => {
             db.run(`INSERT INTO Registration_IPs (user_id, username, ip, created_ts) VALUES (?, ?, ?, ?)`,
                 [newUserId, username, registerIP, Date.now()],
                 (ipErr) => { if (ipErr) console.error('Registration IP log error:', ipErr.message); });
+            checkRegistrationLockdownTrigger();
             logAudit('account_created', username, username, gateEnabled ? 'registration gate ON - created pending activation' : 'registration gate OFF - created active');
 
             // Activation gating pings only fire while the registration gate is
@@ -5214,6 +5602,12 @@ app.post('/login', authLimiter, requireCaptcha, (req, res) => {
 </body>
 </html>`);
                 }
+                // Full lockdown: only staff may log in. Checked after the
+                // password so the page is only ever shown to someone who
+                // really holds the credentials (nothing to enumerate).
+                if (fullLockdownEnabled && !isStaffUser(user)) {
+                    return res.status(503).send(renderFullLockdownPage());
+                }
                 if (!user.email) {
                     // Older accounts predate the email requirement. Hold them in a
                     // "pending" session state (no userId yet) until they add one,
@@ -5409,6 +5803,13 @@ app.get('/account/verify-email', (req, res) => {
                 // authenticated (or re-authenticated) status. This also
                 // naturally clears any pendingVerify* hold from the old
                 // session, since regenerate() starts from an empty one.
+                // During a full lockdown the email still gets verified, but
+                // this link must not sign a non-staff user in.
+                if (fullLockdownEnabled && !isStaffUser(user)) {
+                    return res.send(renderMessagePage('Email Verified', 'Your email has been verified',
+                        `<h3>Logins are temporarily paused, so you'll need to log in again later.</h3><br><br>
+                        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to login</button>`));
+                }
                 req.session.regenerate((regenErr) => {
                     if (regenErr) {
                         console.error('Session regenerate error:', regenErr.message);
@@ -6163,11 +6564,40 @@ app.post('/edit/bio', (req, res) => {
     db.run(`UPDATE User_Data SET bio = ? WHERE id = ?`, [bio || '', req.session.userId], () => res.redirect('/edit'));
 });
 
-app.post('/edit/avatar', (req, res) => {
+// 5 avatar changes per 10 minutes per account - each one costs a decode +
+// resize, and unthrottled it was an easy way to burn CPU/disk.
+const avatarChangeLimiter = rateLimitForAuth({
+    windowMs: 10 * 60 * 1000,
+    max: 5,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req.session && req.session.userId) ? 'u' + req.session.userId : 'ip' + getClientIP(req),
+    handler: (req, res) => res.redirect('/edit?avatarerror=1')
+});
+
+app.post('/edit/avatar', avatarChangeLimiter, (req, res) => {
     if (!req.session.userId) return res.redirect('/');
-    avatarUpload.single('avatar')(req, res, (err) => {
-        if (err || !req.file) return res.redirect('/edit?avatarerror=1');
-        db.run(`UPDATE User_Data SET avatar_path = ? WHERE id = ?`, [req.file.path, req.session.userId], () => res.redirect('/edit'));
+    avatarUpload.single('avatar')(req, res, async (err) => {
+        if (err || !req.file) {
+            if (req.file) fs.unlink(req.file.path, () => {});
+            return res.redirect('/edit?avatarerror=1');
+        }
+        const userId = req.session.userId;
+        let newPath;
+        try {
+            newPath = await compressAvatar(req.file.path, userId);
+        } catch (e) {
+            if (e.message !== 'busy') console.warn('Avatar rejected for user', userId + ':', e.message);
+            return res.redirect('/edit?avatarerror=1');
+        }
+        db.get(`SELECT avatar_path FROM User_Data WHERE id = ?`, [userId], (e1, row) => {
+            const oldPath = row ? row.avatar_path : null;
+            db.run(`UPDATE User_Data SET avatar_path = ? WHERE id = ?`, [newPath, userId], (e2) => {
+                if (e2) { fs.unlink(newPath, () => {}); return res.redirect('/edit?avatarerror=1'); }
+                deleteOldAvatarFile(oldPath);
+                res.redirect('/edit');
+            });
+        });
     });
 });
 
@@ -6418,7 +6848,11 @@ ${ATTACH_STYLE_BLOCK}
                 // submit would resend them even though the preview strip (or
                 // nothing) is what the person actually sees on screen.
                 postAttachMgr.clear();
-                if (r.url && r.url.includes('posterror=muted')) {
+                if (r.status === 429 || r.status === 422) {
+                    let rejection = null;
+                    try { rejection = await r.json(); } catch (e) {}
+                    showPostError((rejection && rejection.error) || "You're posting too fast. Please slow down.");
+                } else if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
                     showPostError("That file type isn't allowed as an attachment.");
@@ -6806,6 +7240,184 @@ ${NOTIF_BADGE_SCRIPT}${USER_EVENTS_SCRIPT}${SOUND_SCRIPT}${EMOJI_SCRIPT}${REPORT
     });
 });
 
+// ----- Post spam protection -----
+// (a) Flood timeout: POST_FLOOD_MAX accepted posts/replies inside
+//     POST_FLOOD_WINDOW_MS puts the account in a POST_FLOOD_TIMEOUT_MS posting
+//     timeout. Only posts that would actually have gone through are counted
+//     (typos, too-long posts and spam-filter refusals don't count against you),
+//     and the post that crosses the line is refused, so at most
+//     POST_FLOOD_MAX - 1 get through. The timeout is stored in Post_Timeouts,
+//     so restarts don't clear it. Admins are exempt.
+// (b) Content checks (checkPostSpam): duplicate posts, the same text from many
+//     different accounts, mention-spam, and a slow mode + link cap for
+//     accounts less than a day old.
+const POST_FLOOD_MAX = 3;
+const POST_FLOOD_WINDOW_MS = 10 * 1000;
+const POST_FLOOD_TIMEOUT_MS = 2 * 60 * 60 * 1000;
+
+const NEW_ACCOUNT_AGE_MS = 24 * 60 * 60 * 1000;
+const NEW_ACCOUNT_POST_GAP_MS = 15 * 1000;
+const NEW_ACCOUNT_MAX_LINKS = 2;
+const MAX_MENTIONS_PER_POST = 5;
+const DUPLICATE_POST_WINDOW_MS = 5 * 60 * 1000;
+const CROSS_USER_DUPLICATE_WINDOW_MS = 10 * 60 * 1000;
+const CROSS_USER_DUPLICATE_MAX_USERS = 4; // the 4th different account posting identical text is refused
+
+const postAttemptLog = new Map();   // userId -> [attempt timestamps]
+const recentPostsByUser = new Map(); // userId -> [{ h: contentHash|null, ts }]
+const recentPostContent = new Map(); // contentHash -> { users: Set<userId>, ts }
+
+setInterval(() => {
+    const now = Date.now();
+    postAttemptLog.forEach((arr, k) => { if (!arr.length || now - arr[arr.length - 1] > POST_FLOOD_WINDOW_MS) postAttemptLog.delete(k); });
+    recentPostsByUser.forEach((arr, k) => { if (!arr.length || now - arr[arr.length - 1].ts > DUPLICATE_POST_WINDOW_MS) recentPostsByUser.delete(k); });
+    recentPostContent.forEach((e, k) => { if (now - e.ts > CROSS_USER_DUPLICATE_WINDOW_MS) recentPostContent.delete(k); });
+    try { getStmt(`DELETE FROM Post_Timeouts WHERE expires_ts < ?`).run(now); } catch (e) { /* table not ready yet */ }
+}, 5 * 60 * 1000).unref();
+
+// Milliseconds left on this user's posting timeout (0 = none). Expired rows
+// are deleted on sight.
+function getPostTimeoutLeftMs(userId) {
+    try {
+        const row = getStmt(`SELECT expires_ts FROM Post_Timeouts WHERE user_id = ?`).get(userId);
+        if (!row) return 0;
+        const left = row.expires_ts - Date.now();
+        if (left <= 0) { getStmt(`DELETE FROM Post_Timeouts WHERE user_id = ?`).run(userId); return 0; }
+        return left;
+    } catch (e) {
+        console.error('Post timeout lookup error:', e.message);
+        return 0; // a broken lookup must never block everyone from posting
+    }
+}
+
+function startPostTimeout(userId, username) {
+    const until = Date.now() + POST_FLOOD_TIMEOUT_MS;
+    try {
+        getStmt(`INSERT INTO Post_Timeouts (user_id, username, expires_ts, reason) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, expires_ts = excluded.expires_ts, reason = excluded.reason, created_at = CURRENT_TIMESTAMP`)
+            .run(userId, username, until, 'post flood');
+    } catch (e) {
+        console.error('Post timeout save error:', e.message);
+    }
+    logAudit('post_timeout', 'System', username,
+        `${POST_FLOOD_MAX} posts within ${POST_FLOOD_WINDOW_MS / 1000}s - posting disabled for ${POST_FLOOD_TIMEOUT_MS / 3600000}h`);
+}
+
+// Same body for both clients: the web UI posts with fetch (Accept: */*) and
+// shows the JSON "error" in its red toast; a plain browser form post gets a
+// small HTML page instead of raw JSON.
+function sendPostRejection(req, res, status, message) {
+    if (String(req.headers.accept || '').includes('text/html')) {
+        return res.status(status).send(renderMessagePage('Slow down', message,
+            `<button type="button" class="button" style="width: 150px" onclick="history.back();">Go back</button>`));
+    }
+    return res.status(status).json({ error: message });
+}
+
+// Runs BEFORE the multipart upload middleware on purpose: while an account is
+// in a timeout, its requests are refused without ever writing attachments to
+// disk.
+function postFloodGuard(req, res, next) {
+    if (!req.session || !req.session.userId || req.isAdmin) return next();
+    const left = getPostTimeoutLeftMs(req.session.userId);
+    if (left > 0) {
+        return sendPostRejection(req, res, 429, `You're in a posting timeout for another ${formatDuration(left)}.`);
+    }
+    next();
+}
+
+// Counts one post that has already passed validation and checkPostSpam. If it
+// is the POST_FLOOD_MAX-th inside the window the timeout starts and
+// { status, message } is returned to refuse it; otherwise null.
+function checkPostFlood(req) {
+    if (req.isAdmin) return null;
+    const userId = req.session.userId;
+    const now = Date.now();
+    const attempts = (postAttemptLog.get(userId) || []).filter(t => now - t < POST_FLOOD_WINDOW_MS);
+    attempts.push(now);
+    if (attempts.length >= POST_FLOOD_MAX) {
+        postAttemptLog.delete(userId);
+        startPostTimeout(userId, req.session.userUsername);
+        return { status: 429, message: `You posted too many times too quickly, so posting is disabled on your account for ${formatDuration(POST_FLOOD_TIMEOUT_MS)}.` };
+    }
+    postAttemptLog.set(userId, attempts);
+    return null;
+}
+
+function normalizePostText(content) {
+    return (content || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Content-level checks, run once the post has been parsed and validated.
+// Read-only: returns null to allow it, or { status, message } to refuse.
+// recordAcceptedPost() is what remembers a post that actually went through.
+function checkPostSpam(req, content) {
+    if (req.isAdmin) return null;
+    const userId = req.session.userId;
+    const now = Date.now();
+    const text = (content || '').trim();
+
+    const mentions = new Set((text.match(/@[a-zA-Z0-9_]{1,32}/g) || []).map(m => m.toLowerCase()));
+    if (mentions.size > MAX_MENTIONS_PER_POST) {
+        return { status: 422, message: `Too many mentions - you can mention at most ${MAX_MENTIONS_PER_POST} people per post.` };
+    }
+
+    // Account age comes from Registration_IPs (written for every signup);
+    // accounts that predate that table simply count as established.
+    let newAccount = false;
+    try {
+        const row = getStmt(`SELECT created_ts FROM Registration_IPs WHERE user_id = ? ORDER BY created_ts DESC LIMIT 1`).get(userId);
+        newAccount = !!row && (now - row.created_ts) < NEW_ACCOUNT_AGE_MS;
+    } catch (e) { /* fail open */ }
+
+    const recent = (recentPostsByUser.get(userId) || []).filter(p => now - p.ts < DUPLICATE_POST_WINDOW_MS);
+
+    if (newAccount) {
+        const last = recent.length ? recent[recent.length - 1].ts : 0;
+        if (last && now - last < NEW_ACCOUNT_POST_GAP_MS) {
+            const wait = Math.ceil((NEW_ACCOUNT_POST_GAP_MS - (now - last)) / 1000);
+            return { status: 429, message: `New accounts can post once every ${NEW_ACCOUNT_POST_GAP_MS / 1000} seconds - try again in ${wait}s.` };
+        }
+        const links = (text.match(/https?:\/\/|www\./gi) || []).length;
+        if (links > NEW_ACCOUNT_MAX_LINKS) {
+            return { status: 422, message: `New accounts can include at most ${NEW_ACCOUNT_MAX_LINKS} links per post.` };
+        }
+    }
+
+    const norm = normalizePostText(text);
+    if (norm.length >= 10) {
+        const hash = crypto.createHash('sha1').update(norm).digest('hex');
+        if (recent.some(p => p.h === hash)) {
+            return { status: 422, message: 'You already posted that a moment ago.' };
+        }
+        if (norm.length >= 20) {
+            const entry = recentPostContent.get(hash);
+            if (entry && now - entry.ts < CROSS_USER_DUPLICATE_WINDOW_MS && !entry.users.has(userId)
+                && entry.users.size >= CROSS_USER_DUPLICATE_MAX_USERS - 1) {
+                return { status: 422, message: 'That exact message is being posted by a lot of accounts right now, so it was blocked as spam.' };
+            }
+        }
+    }
+    return null;
+}
+
+// Remembers a post that went through, for the duplicate / slow-mode checks.
+function recordAcceptedPost(req, content) {
+    if (req.isAdmin) return;
+    const userId = req.session.userId;
+    const now = Date.now();
+    const norm = normalizePostText(content);
+    const hash = norm.length >= 10 ? crypto.createHash('sha1').update(norm).digest('hex') : null;
+    const recent = (recentPostsByUser.get(userId) || []).filter(p => now - p.ts < DUPLICATE_POST_WINDOW_MS);
+    recent.push({ h: hash, ts: now });
+    recentPostsByUser.set(userId, recent.slice(-10));
+    if (hash && norm.length >= 20) {
+        const entry = recentPostContent.get(hash);
+        if (!entry || now - entry.ts >= CROSS_USER_DUPLICATE_WINDOW_MS) recentPostContent.set(hash, { users: new Set([userId]), ts: now });
+        else entry.users.add(userId);
+    }
+}
+
 	const rateLimit = require('express-rate-limit');
 const postRateLimiter = rateLimit({
     windowMs: 5 * 1000,
@@ -6817,10 +7429,10 @@ const postRateLimiter = rateLimit({
         const replyTo = req.body && req.body.reply_to ? parseInt(req.body.reply_to) : null;
         const backTo = replyTo ? `/post/${replyTo}` : '/feed';
         //res.redirect(429, `${backTo}?posterror=ratelimit`);
-        res.status(429).send("please stop spamming");
+        sendPostRejection(req, res, 429, "You're posting too fast. Please slow down.");
     }
 });
-app.post('/feed/post', postRateLimiter, (req, res, next) => {
+app.post('/feed/post', postRateLimiter, postFloodGuard, (req, res, next) => {
     uploadFeed.array('attachments', MAX_FILES_FEED)(req, res, (err) => {
         if (err) {
             const backTo = req.body && req.body.reply_to ? `/post/${parseInt(req.body.reply_to)}` : '/feed';
@@ -6849,6 +7461,15 @@ app.post('/feed/post', postRateLimiter, (req, res, next) => {
 
     if ((!content || !content.trim()) && !files.length) return res.redirect(backTo);
     if (content && content.length > MAX_POST_LENGTH) return res.redirect(`${backTo}?posterror=1`);
+
+    // Content checks first, then the flood counter - so only posts that would
+    // really go through count towards the 3-in-10-seconds timeout.
+    const spamVerdict = checkPostSpam(req, content) || checkPostFlood(req);
+    if (spamVerdict) {
+        cleanupAttachmentFiles(filesMeta);
+        return sendPostRejection(req, res, spamVerdict.status, spamVerdict.message);
+    }
+    recordAcceptedPost(req, content);
 
     db.run(
         `INSERT INTO Posts (user_id, username, content, file_path, file_name, files_json, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?)`,
@@ -7297,7 +7918,11 @@ ${ATTACH_STYLE_BLOCK}
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
                 postAttachMgr.clear();
-                if (r.url && r.url.includes('posterror=muted')) {
+                if (r.status === 429 || r.status === 422) {
+                    let rejection = null;
+                    try { rejection = await r.json(); } catch (e) {}
+                    showPostError((rejection && rejection.error) || "You're posting too fast. Please slow down.");
+                } else if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to post until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
                     showPostError("That file type isn't allowed as an attachment.");
@@ -7784,7 +8409,11 @@ ${ATTACH_STYLE_BLOCK}
             try {
                 const r = await fetch(postForm.action, { method: 'POST', body: fd });
                 postAttachMgr.clear();
-                if (r.url && r.url.includes('posterror=muted')) {
+                if (r.status === 429 || r.status === 422) {
+                    let rejection = null;
+                    try { rejection = await r.json(); } catch (e) {}
+                    showPostError((rejection && rejection.error) || "You're posting too fast. Please slow down.");
+                } else if (r.url && r.url.includes('posterror=muted')) {
                     showPostError("You're not able to reply until your warning expires.");
                 } else if (r.url && r.url.includes('posterror=filetype')) {
                     showPostError("That file type isn't allowed as an attachment.");
@@ -8132,6 +8761,7 @@ app.post('/friend-request/send/:username', (req, res) => {
     const from = req.session.userUsername;
     const to = req.params.username;
     if (from === to) return res.status(400).json({ error: 'cannot friend yourself' });
+    if (eitherBlocked(from, to)) return res.status(403).json({ error: "You can't send a friend request to this user." });
     db.get(`SELECT id FROM Friends WHERE (user_a = ? AND user_b = ?) OR (user_a = ? AND user_b = ?)`, [from, to, to, from], (err, row) => {
         if (row) return res.status(400).json({ error: 'already friends' });
         db.run(`INSERT OR IGNORE INTO Friend_Requests (from_user, to_user, status) VALUES (?, ?, 'pending')`, [from, to], function (err2) {
@@ -8424,6 +9054,7 @@ app.post('/follow/:username', (req, res) => {
     const follower = req.session.userUsername;
     const following = req.params.username;
     if (follower === following) return res.status(400).json({ error: 'cannot follow yourself' });
+    if (eitherBlocked(follower, following)) return res.status(403).json({ error: "You can't follow this user." });
     db.run(`INSERT OR IGNORE INTO Follows (follower_username, following_username) VALUES (?, ?)`, [follower, following], (err) => {
         if (err) return res.status(500).json({ error: 'db error' });
         res.json({ ok: true, following: true });
@@ -8437,6 +9068,49 @@ app.post('/unfollow/:username', (req, res) => {
     db.run(`DELETE FROM Follows WHERE follower_username = ? AND following_username = ?`, [follower, following], (err) => {
         if (err) return res.status(500).json({ error: 'db error' });
         res.json({ ok: true, following: false });
+    });
+});
+
+// ----- Blocking routes -----
+const MAX_BLOCKS_PER_USER = 500;
+
+app.post('/block/:username', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    const me = req.session.userUsername;
+    const target = req.params.username;
+    if (me === target) return res.status(400).json({ error: "You can't block yourself." });
+    db.get(`SELECT username FROM User_Data WHERE username = ?`, [target], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: 'User not found.' });
+        const other = user.username;
+        if (!blockExists(me, other)) {
+            const row = getStmt(`SELECT COUNT(*) AS c FROM User_Blocks WHERE blocker = ?`).get(me);
+            if (row && row.c >= MAX_BLOCKS_PER_USER) return res.status(400).json({ error: `You can block at most ${MAX_BLOCKS_PER_USER} people.` });
+        }
+        db.run(`INSERT OR IGNORE INTO User_Blocks (blocker, blocked) VALUES (?, ?)`, [me, other], (err2) => {
+            if (err2) return res.status(500).json({ error: 'db error' });
+            // Blocking also severs existing ties in both directions.
+            const a = [me, other].sort()[0], b = [me, other].sort()[1];
+            db.run(`DELETE FROM Follows WHERE (follower_username = ? AND following_username = ?) OR (follower_username = ? AND following_username = ?)`, [me, other, other, me]);
+            db.run(`DELETE FROM Friends WHERE user_a = ? AND user_b = ?`, [a, b]);
+            db.run(`DELETE FROM Friend_Requests WHERE status = 'pending' AND ((from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?))`, [me, other, other, me]);
+            res.json({ ok: true, blocked: true });
+        });
+    });
+});
+
+app.post('/unblock/:username', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'unauthorized' });
+    db.run(`DELETE FROM User_Blocks WHERE blocker = ? AND blocked = ?`, [req.session.userUsername, req.params.username], (err) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({ ok: true, blocked: false });
+    });
+});
+
+app.get('/api/my-blocks', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    db.all(`SELECT blocked FROM User_Blocks WHERE blocker = ? ORDER BY created_at DESC`, [req.session.userUsername], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({ blocks: (rows || []).map(r => r.blocked) });
     });
 });
 
@@ -8535,6 +9209,8 @@ app.get('/user/:username', (req, res) => {
                         </div>`;
                     }).join('');
 
+                    const isBlockedByMe = !isOwnProfile && blockExists(sessionUsername, profileUsername);
+                    const blockBtn = isOwnProfile ? '' : `<a id="block-btn" class="button" onclick="toggleBlock()" style="width:120px;text-decoration:none;">${isBlockedByMe ? 'Unblock' : 'Block'}</a>`;
                     const dmBtn = isOwnProfile ? '' : `<a href="/messages/${escapeHTML(profileUsername)}" class="button" style="width:120px;text-decoration:none;">Message</a>`;
                     const followBtn = isOwnProfile ? '' : `<a id="follow-btn" class="button" onclick="toggleFollow()" style="width:120px;text-decoration:none;">${isFollowing ? 'Unfollow' : 'Follow'}</a>`;
                     const friendBtnHTML = isOwnProfile ? '' : `<a id="friend-btn" class="button" onclick="toggleFriend()" style="width:140px;text-decoration:none;">${
@@ -8586,6 +9262,7 @@ app.get('/user/:username', (req, res) => {
             ${dmBtn}
             ${followBtn}
             ${friendBtnHTML}
+            ${blockBtn}
         </div>
         <hr style="border-color:rgba(255,255,255,0.2);">
     </div>
@@ -8612,6 +9289,32 @@ app.get('/user/:username', (req, res) => {
                 .then(data => {
                     following = data.following;
                     btn.textContent = following ? 'Unfollow' : 'Follow';
+                    btn.disabled = false;
+                })
+                .catch(() => { btn.disabled = false; });
+        }
+
+        let blocked = ${isBlockedByMe ? 'true' : 'false'};
+        function toggleBlock() {
+            const btn = document.getElementById('block-btn');
+            if (!blocked && !confirm('Block ${escapeHTML(profileUsername)}? They will no longer be able to message, follow or friend you, and any existing friendship/follow is removed.')) return;
+            const endpoint = blocked ? '/unblock/${escapeHTML(profileUsername)}' : '/block/${escapeHTML(profileUsername)}';
+            btn.disabled = true;
+            fetch(endpoint, { method: 'POST' })
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ok) {
+                        blocked = !!data.blocked;
+                        btn.textContent = blocked ? 'Unblock' : 'Block';
+                        if (blocked) {
+                            following = false;
+                            const fb = document.getElementById('follow-btn');
+                            if (fb) fb.textContent = 'Follow';
+                            friendStatus = 'none';
+                            const frb = document.getElementById('friend-btn');
+                            if (frb) frb.textContent = 'Add Friend';
+                        }
+                    }
                     btn.disabled = false;
                 })
                 .catch(() => { btn.disabled = false; });
@@ -9121,6 +9824,10 @@ app.post('/messages/:username/send', (req, res, next) => {
     if ((!content || !content.trim()) && !files.length) return res.status(400).json({ error: 'Message is empty.' });
     if (content && content.length > MAX_MSG_LENGTH) return res.status(400).json({ error: 'Message too long or too many files selected - 4,000 character limit, max 10 files.' });
 
+    if (eitherBlocked(me, other)) {
+        cleanupAttachmentFiles(filesMeta);
+        return res.status(403).json({ error: "You can't message this user.", blocked: true });
+    }
     recordPrivateUploads(files, { scope: 'dm', userA: me, userB: other });
     db.run(`INSERT INTO Messages (from_user, to_user, content, file_path, file_name, files_json, reply_to) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [me, other, (content || '').trim(), filePath, fileName, filesJSON, replyTo], function (err) {
@@ -9649,6 +10356,30 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="reg-gate-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>
 
+    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+        <h2>Registration Lockdown</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Starts automatically when ${LOCKDOWN_REG_MAX} accounts are created within ${LOCKDOWN_REG_WINDOW_MS / 1000} seconds. While active, <strong>nobody</strong> can register (even with the gate OFF) for ${LOCKDOWN_DURATION_MS / 3600000} hours or until it is ended here.</p>
+        <p style="margin-top:10px;">Status: <span id="reg-lockdown-status">${getRegistrationLockdownLeftMs() > 0 ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ends in about ' + escapeHTML(formatDuration(getRegistrationLockdownLeftMs())) : '<span style="color:var(--success-color);font-weight:700;">Not active</span>'}</span></p>
+        ${req.isHeadAdmin ? `
+        <div class="action-row">
+            <button class="button" onclick="toggleRegistrationLockdown(true)" style="width:140px;">Start lockdown</button>
+            <button class="button" onclick="toggleRegistrationLockdown(false)" style="width:140px;">End lockdown</button>
+        </div>
+        <div id="reg-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
+    </div>
+
+    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+        <h2>Full Lockdown</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, nobody can register <strong>or log in</strong> (including via the emailed verification link). People who are already logged in are not affected, and Admin / Head Admin / Owner accounts can still log in so this can be turned off. It stays on until it is ended here.</p>
+        <p style="margin-top:10px;">Status: <span id="full-lockdown-status">${fullLockdownEnabled ? '<span style="color:var(--danger-color);font-weight:700;">ON</span>' : '<span style="color:var(--success-color);font-weight:700;">OFF</span>'}</span></p>
+        ${req.isHeadAdmin ? `
+        <div class="action-row">
+            <button class="button" onclick="toggleFullLockdown(true)" style="width:140px;">Turn ON</button>
+            <button class="button" onclick="toggleFullLockdown(false)" style="width:140px;">Turn OFF</button>
+        </div>
+        <div id="full-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
+    </div>
+
     <div class="panel">
         <h2>Ban / Unban User</h2>
         <label>Username</label>
@@ -9875,6 +10606,45 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             document.getElementById('reg-gate-status').innerHTML = d.enabled
                 ? '<span style="color:var(--success-color);font-weight:700;">ON</span>'
                 : '<span style="color:var(--danger-color);font-weight:700;">OFF</span>';
+            result.className = 'ok'; result.textContent = 'Saved.';
+            setTimeout(() => { result.textContent = ''; }, 1500);
+        } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
+    }
+
+    async function toggleFullLockdown(enable) {
+        if (enable && !confirm('Turn ON full lockdown? Nobody except staff will be able to log in or register until you turn it off. People already logged in are not affected.')) return;
+        const result = document.getElementById('full-lockdown-result');
+        result.className = ''; result.textContent = 'Updating...';
+        try {
+            const r = await fetch('/admin/full-lockdown', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enable })
+            });
+            const d = await r.json();
+            if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
+            document.getElementById('full-lockdown-status').innerHTML = d.enabled
+                ? '<span style="color:var(--danger-color);font-weight:700;">ON</span>'
+                : '<span style="color:var(--success-color);font-weight:700;">OFF</span>';
+            result.className = 'ok'; result.textContent = 'Saved.';
+            setTimeout(() => { result.textContent = ''; }, 1500);
+        } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
+    }
+
+    async function toggleRegistrationLockdown(active) {
+        const result = document.getElementById('reg-lockdown-result');
+        result.className = ''; result.textContent = 'Updating...';
+        try {
+            const r = await fetch('/admin/registration-lockdown', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ active: active })
+            });
+            const d = await r.json();
+            if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
+            document.getElementById('reg-lockdown-status').innerHTML = d.active
+                ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ends in about ' + Math.ceil(d.leftMs / 60000) + ' minutes'
+                : '<span style="color:var(--success-color);font-weight:700;">Not active</span>';
             result.className = 'ok'; result.textContent = 'Saved.';
             setTimeout(() => { result.textContent = ''; }, 1500);
         } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
@@ -10553,6 +11323,58 @@ app.post('/admin/registration-gate', requireAdmin, requireHeadAdmin, (req, res) 
     });
 });
 
+// Registration lockdown: starts by itself when LOCKDOWN_REG_MAX accounts are
+// created inside LOCKDOWN_REG_WINDOW_MS (see checkRegistrationLockdownTrigger).
+// Any admin can read it; only Owners/Head Admins can start or end one.
+app.get('/admin/registration-lockdown', requireAdmin, (req, res) => {
+    const leftMs = getRegistrationLockdownLeftMs();
+    res.json({ active: leftMs > 0, until: leftMs > 0 ? new Date(registrationLockdownUntil).toISOString() : null, leftMs });
+});
+
+app.post('/admin/registration-lockdown', requireAdmin, requireHeadAdmin, (req, res) => {
+    const active = !!(req.body && req.body.active);
+    setRegistrationLockdown(active ? Date.now() + LOCKDOWN_DURATION_MS : 0);
+    logAudit(active ? 'registration_lockdown_started' : 'registration_lockdown_ended', req.session.userUsername, null,
+        active ? `manual, ${LOCKDOWN_DURATION_MS / 3600000}h` : 'ended manually');
+    const leftMs = getRegistrationLockdownLeftMs();
+    res.json({ ok: true, active: leftMs > 0, leftMs });
+});
+
+// Full lockdown (register + login off, existing sessions unaffected, staff can
+// still log in). Any admin can read it; only Owners/Head Admins can change it.
+app.get('/admin/full-lockdown', requireAdmin, (req, res) => {
+    res.json({ enabled: fullLockdownEnabled });
+});
+
+app.post('/admin/full-lockdown', requireAdmin, requireHeadAdmin, (req, res) => {
+    const enabled = !!(req.body && req.body.enabled);
+    setFullLockdown(enabled);
+    logAudit(enabled ? 'full_lockdown_enabled' : 'full_lockdown_disabled', req.session.userUsername, null, null);
+    res.json({ ok: true, enabled: fullLockdownEnabled });
+});
+
+// Posting timeouts handed out by the post-flood guard.
+app.get('/admin/post-timeouts', requireAdmin, (req, res) => {
+    db.all(`SELECT username, expires_ts, reason FROM Post_Timeouts WHERE expires_ts > ? ORDER BY expires_ts DESC`, [Date.now()], (err, rows) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        res.json({ timeouts: (rows || []).map(r => ({ username: r.username, expiresAt: new Date(r.expires_ts).toISOString(), reason: r.reason })) });
+    });
+});
+
+// Lifts a timeout early (false positive).
+app.post('/admin/post-timeout/clear/:username', requireAdmin, (req, res) => {
+    const target = req.params.username;
+    db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err, user) => {
+        if (err || !user) return res.status(404).json({ error: 'User not found.' });
+        postAttemptLog.delete(user.id);
+        db.run(`DELETE FROM Post_Timeouts WHERE user_id = ?`, [user.id], function (err2) {
+            if (err2) return res.status(500).json({ error: 'db error' });
+            if (this.changes > 0) logAudit('post_timeout_cleared', req.session.userUsername, target, null);
+            res.json({ ok: true, cleared: this.changes > 0 });
+        });
+    });
+});
+
 // Lets an admin/owner inspect and fix up anyone's public profile (avatar,
 // nickname, bio) - e.g. removing an inappropriate pfp or bio without doing
 // a full account deletion.
@@ -10613,11 +11435,24 @@ app.post('/admin/profile/:username/avatar', requireAdmin, (req, res) => {
     db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (err, user) => {
         if (err) return res.status(500).json({ error: 'db error' });
         if (!user) return res.status(404).json({ error: 'user not found' });
-        adminAvatarUpload.single('avatar')(req, res, (uploadErr) => {
-            if (uploadErr || !req.file) return res.status(400).json({ error: uploadErr ? uploadErr.message : 'No file uploaded.' });
-            db.run(`UPDATE User_Data SET avatar_path = ? WHERE username = ?`, [req.file.path, target], (err2) => {
-                if (err2) return res.status(500).json({ error: 'db error' });
-                res.json({ ok: true, username: target, avatar_url: avatarPathToURL(req.file.path) });
+        adminAvatarUpload.single('avatar')(req, res, async (uploadErr) => {
+            if (uploadErr || !req.file) {
+                if (req.file) fs.unlink(req.file.path, () => {});
+                return res.status(400).json({ error: uploadErr ? uploadErr.message : 'No file uploaded.' });
+            }
+            let newPath;
+            try {
+                newPath = await compressAvatar(req.file.path, target);
+            } catch (e) {
+                return res.status(400).json({ error: e.message === 'busy' ? 'Server is busy, try again in a moment.' : 'That file is not a valid JPG, PNG, GIF or WebP image.' });
+            }
+            db.get(`SELECT avatar_path FROM User_Data WHERE username = ?`, [target], (e1, row) => {
+                const oldPath = row ? row.avatar_path : null;
+                db.run(`UPDATE User_Data SET avatar_path = ? WHERE username = ?`, [newPath, target], (err2) => {
+                    if (err2) { fs.unlink(newPath, () => {}); return res.status(500).json({ error: 'db error' }); }
+                    deleteOldAvatarFile(oldPath);
+                    res.json({ ok: true, username: target, avatar_url: avatarPathToURL(newPath) });
+                });
             });
         });
     });

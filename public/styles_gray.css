@@ -97,7 +97,7 @@ body {
   border: 5px solid white;
   margin: 0;
   text-align: center;
-  animation: slideInFromUp 1s ease-out forwards;
+
   border-radius: 20px;
 }
 textarea.box {
@@ -118,7 +118,7 @@ textarea.box {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  animation: slideInFromUp 1s ease-out forwards;
+
   transition: 0.2s;
 }
 .button:hover {
@@ -1501,7 +1501,7 @@ body.page-chat .chat-action-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  animation: slideInFromUp 1s ease-out forwards;
+
   transition: 0.2s;
 }
 body.page-chat .chat-action-btn:hover {

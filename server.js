@@ -3149,7 +3149,11 @@ if (!fs.existsSync(sessionsDir)) fs.mkdirSync(sessionsDir, { recursive: true });
 // client IP instead of the proxy's. '1' trusts exactly one hop (the
 // immediate proxy in front of this app) - bump it if there's more than one
 // proxy between the internet and this process.
-app.set('trust proxy', 1);
+// Number of proxies between the internet and this process (default 1). If you
+// run e.g. Cloudflare -> nginx -> node that is 2; getting this wrong makes
+// req.ip the proxy's address (everyone shares one IP) or lets a client forge it.
+const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '1', 10) || 0);
+app.set('trust proxy', TRUST_PROXY_HOPS);
 
 // Named so serveUpload() can load the session on demand for private files.
 // express-session is a no-op when req.session is already set, so registering
@@ -3219,22 +3223,29 @@ app.get('/theme.css', (req, res) => {
     });
 });
 
-// OPTIONAL hardening: set CLIENT_IP_HEADER in vars.env (e.g.
-// CLIENT_IP_HEADER=cf-connecting-ip behind Cloudflare) to read the client IP
-// from a header your proxy sets itself. Without it, the FIRST X-Forwarded-For
-// entry is used, which a client can forge (most proxies append to whatever
-// the client sent) - that lets a spammer dodge IP bans and the per-IP limits
-// by sending a different fake header on every request. Leave unset to keep
-// the previous behaviour. Only set it if the app is reachable ONLY through
-// that proxy, otherwise the header itself becomes forgeable.
+// SECURITY: the client IP must never come from a header the client can write.
+// The old code took the FIRST X-Forwarded-For entry, which is whatever the
+// client sent - a browser extension that adds a random X-Forwarded-For to every
+// request defeated the per-IP signup limit, the account-spam auto-ban and IP
+// bans completely. Now:
+//   1. If CLIENT_IP_HEADER is set in vars.env (e.g. cf-connecting-ip behind
+//      Cloudflare) that header is used - the proxy overwrites it on every
+//      request, so it can't be forged as long as the app is ONLY reachable via
+//      that proxy.
+//   2. Otherwise req.ip is used. With 'trust proxy' = TRUST_PROXY_HOPS Express
+//      takes the address your own proxy appended, ignoring anything a client
+//      prepended to X-Forwarded-For.
 const CLIENT_IP_HEADER = (process.env.CLIENT_IP_HEADER || '').trim().toLowerCase();
+function normalizeIP(ip) {
+    ip = String(ip || '').trim();
+    if (ip.toLowerCase().startsWith('::ffff:') && ip.includes('.')) ip = ip.slice(7); // IPv4-mapped IPv6
+    return ip || 'unknown';
+}
 function getClientIP(req) {
     if (CLIENT_IP_HEADER && req.headers[CLIENT_IP_HEADER]) {
-        return String(req.headers[CLIENT_IP_HEADER]).split(',')[0].trim();
+        return normalizeIP(String(req.headers[CLIENT_IP_HEADER]).split(',')[0]);
     }
-    const forwarded = req.headers['x-forwarded-for'];
-    if (forwarded) return forwarded.split(',')[0].trim();
-    return req.socket.remoteAddress || req.ip || 'unknown';
+    return normalizeIP(req.ip || (req.socket && req.socket.remoteAddress));
 }
 
 // Records a login/register event in IP_Login_History and keeps
@@ -3978,7 +3989,18 @@ function checkEmailVerified(req, res, next) {
     }
     db.get(`SELECT email, email_verified FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
         if (err || !user) return next();
-        if (user.email && !user.email_verified) {
+        if (!user.email) {
+            // Legacy account with no email: same hold as at login, instead of
+            // letting an old session slip past verification entirely.
+            const userId = req.session.userId;
+            const username = req.session.userUsername;
+            req.session.pendingEmailUserId = userId;
+            req.session.pendingEmailUsername = username;
+            delete req.session.userId;
+            delete req.session.userUsername;
+            return res.redirect('/account/add-email');
+        }
+        if (!user.email_verified) {
             const userId = req.session.userId;
             const username = req.session.userUsername;
             req.session.pendingVerifyUserId = userId;
@@ -3986,6 +4008,27 @@ function checkEmailVerified(req, res, next) {
             delete req.session.userId;
             delete req.session.userUsername;
             return res.redirect('/account/verify-email-required');
+        }
+        next();
+    });
+}
+
+// Gate for every route that accepts multipart uploads. It MUST run before
+// multer: multer writes files to disk while parsing, and the routes' own
+// `if (!req.session.userId)` checks ran AFTER it. Sessions held in the
+// "pending verification" state have no userId, so checkEmailVerified lets them
+// through, and they (like fully logged-out visitors) could write files to disk
+// on /messages/:u/send, /groups/:id/send and /feed/post before being refused.
+// This requires a real session AND a verified email, re-checked against the DB.
+function requireVerifiedForUpload(req, res, next) {
+    const wantsHTML = String(req.headers.accept || '').includes('text/html');
+    const refuse = (status, message, redirectTo) =>
+        wantsHTML ? res.redirect(redirectTo) : res.status(status).json({ error: message });
+    if (!req.session || !req.session.userId) return refuse(401, 'Not logged in.', '/');
+    db.get(`SELECT email, email_verified FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
+        if (err) return res.status(500).json({ error: 'Something went wrong.' });
+        if (!user || !user.email || !user.email_verified) {
+            return refuse(403, 'Verify your email address before uploading files.', '/account/verify-email-required');
         }
         next();
     });
@@ -6575,7 +6618,7 @@ const avatarChangeLimiter = rateLimitForAuth({
     handler: (req, res) => res.redirect('/edit?avatarerror=1')
 });
 
-app.post('/edit/avatar', avatarChangeLimiter, (req, res) => {
+app.post('/edit/avatar', requireVerifiedForUpload, avatarChangeLimiter, (req, res) => {
     if (!req.session.userId) return res.redirect('/');
     avatarUpload.single('avatar')(req, res, async (err) => {
         if (err || !req.file) {
@@ -7432,7 +7475,7 @@ const postRateLimiter = rateLimit({
         sendPostRejection(req, res, 429, "You're posting too fast. Please slow down.");
     }
 });
-app.post('/feed/post', postRateLimiter, postFloodGuard, (req, res, next) => {
+app.post('/feed/post', postRateLimiter, requireVerifiedForUpload, postFloodGuard, (req, res, next) => {
     uploadFeed.array('attachments', MAX_FILES_FEED)(req, res, (err) => {
         if (err) {
             const backTo = req.body && req.body.reply_to ? `/post/${parseInt(req.body.reply_to)}` : '/feed';
@@ -9797,7 +9840,7 @@ app.post('/messages/:username/presence', (req, res) => {
     res.status(204).end();
 });
 
-app.post('/messages/:username/send', (req, res, next) => {
+app.post('/messages/:username/send', requireVerifiedForUpload, (req, res, next) => {
     uploadDM.array('attachments', MAX_FILES_DM)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_DM} per message.` });
@@ -13309,7 +13352,7 @@ app.get('/groups/:id/stream', (req, res) => {
     });
 });
 
-app.post('/groups/:id/send', (req, res, next) => {
+app.post('/groups/:id/send', requireVerifiedForUpload, (req, res, next) => {
     uploadGC.array('attachments', MAX_FILES_GC)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_GC} per message.` });

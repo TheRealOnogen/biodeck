@@ -23,9 +23,11 @@
         <input type="text" name="email" id="email" required><br><br>
         <label for="password">Password</label><br>
         <input type="password" id="password" name="password"><br><br>
+        <div id="captcha-slot" style="display:flex;justify-content:center;margin-bottom:14px;"></div>
         <button type="submit" class="button">Register</button>
     </div>
     </form>
+    <script src="/captcha.js" defer></script>
     <script>
         document.querySelectorAll('.button').forEach(btn => {
             btn.addEventListener('mousedown', () => {

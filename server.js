@@ -2652,6 +2652,21 @@ db.serialize(() => {
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )`);
             db.run(`CREATE INDEX IF NOT EXISTS idx_ip_login_history_user ON IP_Login_History(user_id, created_at)`);
+            // One row per account created, with the IP it was created from.
+            // Unlike IP_Login_History (which is skipped for accounts that
+            // start out banned/gated), this is written for EVERY successful
+            // registration, and is what the account-spam auto-ban counts.
+            // created_ts is epoch milliseconds so the time-window check is a
+            // plain integer comparison.
+            db.run(`CREATE TABLE IF NOT EXISTS Registration_IPs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                ip TEXT NOT NULL,
+                created_ts INTEGER NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )`);
+            db.run(`CREATE INDEX IF NOT EXISTS idx_registration_ips_ip ON Registration_IPs(ip, created_ts)`);
             db.run(`CREATE TABLE IF NOT EXISTS Friend_Requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 from_user TEXT NOT NULL,
@@ -4811,7 +4826,118 @@ const authLimiter = rateLimitForAuth({
     message: { error: 'Too many attempts. Please wait a few minutes and try again.' }
 });
 
-app.post('/register', authLimiter, async (req, res) => {
+// ----- Account-spam auto-ban -----
+// If one IP tries to create SPAM_REG_MAX accounts inside SPAM_REG_WINDOW_MS,
+// that IP is permanently added to IP_Bans (same table the admin /admin/ipban
+// route uses, so it shows up in the admin IP ban list and can be lifted with
+// /admin/unipban). The attempt that crosses the threshold is refused, so at
+// most SPAM_REG_MAX - 1 accounts ever get created in a burst.
+const SPAM_REG_MAX = 3;
+const SPAM_REG_WINDOW_MS = 20 * 1000;
+const SPAM_REG_BAN_REASON = 'Stop spamming accounts, if you think this was an error contact an administrator';
+
+// True if one more registration from `ip` right now would be the
+// SPAM_REG_MAX-th inside the window. Synchronous on purpose (better-sqlite3),
+// so the count and the INSERT that follows it in /register can't interleave
+// with another request's.
+function isRegistrationSpam(ip) {
+    try {
+        const since = Date.now() - SPAM_REG_WINDOW_MS;
+        const row = getStmt(`SELECT COUNT(*) AS c FROM Registration_IPs WHERE ip = ? AND created_ts > ?`).get(ip, since);
+        return ((row && row.c) || 0) + 1 >= SPAM_REG_MAX;
+    } catch (e) {
+        console.error('Registration spam check error:', e.message);
+        return false; // a broken check must never lock people out of registering
+    }
+}
+
+function banIPForSpam(ip, cb) {
+    db.run(
+        `INSERT INTO IP_Bans (ip, reason, banned_by) VALUES (?, ?, 'System')
+         ON CONFLICT(ip) DO UPDATE SET reason = excluded.reason, banned_by = excluded.banned_by, created_at = CURRENT_TIMESTAMP`,
+        [ip, SPAM_REG_BAN_REASON],
+        function (err) {
+            if (err) { console.error('Auto IP ban error:', err.message); return cb(err); }
+            logAudit('ip_banned', 'System', ip, `${SPAM_REG_BAN_REASON} (auto: ${SPAM_REG_MAX} accounts within ${SPAM_REG_WINDOW_MS / 1000}s)`);
+            // Same live notice the admin ban sends: only sessions on this IP.
+            userEventConnections.forEach(conn => {
+                if (conn.ip === ip) sseSend(conn.res, 'banned', { event: 'banned', type: 'ip', reason: SPAM_REG_BAN_REASON });
+            });
+            cb(null);
+        }
+    );
+}
+
+// ----- CAPTCHA (Cloudflare Turnstile) on /login and /register -----
+// Free keys: Cloudflare dashboard -> Turnstile -> add a widget for your
+// domain, then put these in vars.env:
+//   TURNSTILE_SITE_KEY=0x4AAAA...      (public, goes to the browser)
+//   TURNSTILE_SECRET_KEY=0x4AAAA...    (private, only used server-side)
+// With either one missing the captcha is simply off (a warning is logged),
+// so the site keeps working while you set it up. Once both are set, a
+// missing/invalid/unverifiable token blocks the login or registration.
+const TURNSTILE_SITE_KEY = process.env.TURNSTILE_SITE_KEY || '';
+const TURNSTILE_SECRET_KEY = process.env.TURNSTILE_SECRET_KEY || '';
+const CAPTCHA_ENABLED = !!(TURNSTILE_SITE_KEY && TURNSTILE_SECRET_KEY);
+if (!CAPTCHA_ENABLED) console.warn('Captcha is OFF - set TURNSTILE_SITE_KEY and TURNSTILE_SECRET_KEY in vars.env to enable it on /login and /register.');
+
+// Served as a script so the pages stay static HTML: it drops the widget into
+// <div id="captcha-slot"> inside the form, and Turnstile adds the hidden
+// "cf-turnstile-response" field to that form by itself.
+app.get('/captcha.js', (req, res) => {
+    res.type('application/javascript; charset=utf-8');
+    res.set('Cache-Control', 'no-cache');
+    res.send(`(function () {
+    var siteKey = ${JSON.stringify(CAPTCHA_ENABLED ? TURNSTILE_SITE_KEY : '')};
+    if (!siteKey) return;
+    var slot = document.getElementById('captcha-slot');
+    if (!slot) return;
+    var form = slot.closest('form');
+    if (form) form.addEventListener('submit', function (e) {
+        var field = form.querySelector('[name="cf-turnstile-response"]');
+        if (!field || !field.value) { e.preventDefault(); alert('Please complete the captcha first.'); }
+    });
+    window.__biodeckCaptchaLoaded = function () {
+        window.turnstile.render(slot, { sitekey: siteKey, theme: 'auto' });
+    };
+    var s = document.createElement('script');
+    s.src = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit&onload=__biodeckCaptchaLoaded';
+    s.async = true; s.defer = true;
+    document.head.appendChild(s);
+})();
+`);
+});
+
+async function verifyCaptchaToken(req) {
+    const token = req.body && req.body['cf-turnstile-response'];
+    if (typeof token !== 'string' || !token || token.length > 2048) return false;
+    try {
+        const r = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+            method: 'POST',
+            body: new URLSearchParams({ secret: TURNSTILE_SECRET_KEY, response: token, remoteip: getClientIP(req) }),
+            signal: AbortSignal.timeout(5000)
+        });
+        const data = await r.json();
+        return !!(data && data.success);
+    } catch (e) {
+        // Fails closed: if Cloudflare can't be reached nobody gets through.
+        console.error('Captcha verification error:', e.message);
+        return false;
+    }
+}
+
+// Runs after authLimiter and BEFORE any other work in the route, so a failed
+// captcha never touches the account tables or counts toward the spam ban.
+async function requireCaptcha(req, res, next) {
+    if (!CAPTCHA_ENABLED) return next();
+    if (await verifyCaptchaToken(req)) return next();
+    const back = req.path === '/register' ? '/register' : '/';
+    return res.status(400).send(renderMessagePage('Captcha failed', 'Captcha check failed',
+        `<h3>We couldn't verify that you're not a bot. Please go back and try again.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='${back}';">Go back</button>`));
+}
+
+app.post('/register', authLimiter, requireCaptcha, async (req, res) => {
     const { username, password } = req.body;
     const email = (req.body.email || '').trim().toLowerCase();
 
@@ -4836,6 +4962,21 @@ app.post('/register', authLimiter, async (req, res) => {
     }
     try {
         const hashedPassword = await bcrypt.hash(password, 10);
+
+        // Account-spam guard. Checked after the (async) hash so the count and
+        // the INSERT below run back-to-back with nothing able to slip in
+        // between; see isRegistrationSpam().
+        const registerIP = getClientIP(req);
+        if (isRegistrationSpam(registerIP)) {
+            return banIPForSpam(registerIP, (banErr) => {
+                if (banErr) {
+                    return res.status(403).send(renderMessagePage('Registration blocked', 'Too many accounts',
+                        `<h3>${escapeHTML(SPAM_REG_BAN_REASON)}</h3>`));
+                }
+                // Reuse the normal IP-ban page now that the ban is in place.
+                return checkIPBan(req, res, () => res.status(403).end());
+            });
+        }
         const gateEnabled = registrationGateEnabled;
         const initialIsBanned = gateEnabled ? 1 : 0;
         const initialBanReason = gateEnabled
@@ -4848,6 +4989,11 @@ app.post('/register', authLimiter, async (req, res) => {
                 return res.sendFile(path.join(__dirname, 'register_error_username_taken.html'));
             }
             const newUserId = this.lastID;
+            // Log the IP of every account the moment it exists (this is what
+            // the spam ban counts), independent of the gate / email flow below.
+            db.run(`INSERT INTO Registration_IPs (user_id, username, ip, created_ts) VALUES (?, ?, ?, ?)`,
+                [newUserId, username, registerIP, Date.now()],
+                (ipErr) => { if (ipErr) console.error('Registration IP log error:', ipErr.message); });
             logAudit('account_created', username, username, gateEnabled ? 'registration gate ON - created pending activation' : 'registration gate OFF - created active');
 
             // Activation gating pings only fire while the registration gate is
@@ -4924,7 +5070,6 @@ app.post('/register', authLimiter, async (req, res) => {
 </body>
 </html>`);
                 }
-                const registerIP = getClientIP(req);
                 recordLoginIP(newUserId, username, registerIP, 'register');
                 // New accounts start with email_verified = 0, so hold them in
                 // the same "pending" session state used elsewhere until they
@@ -4949,7 +5094,7 @@ app.post('/register', authLimiter, async (req, res) => {
 // without ever seeing an error message that says so.
 const DUMMY_BCRYPT_HASH = '$2b$10$CwTycUXWue0Thq9StjUM0uJ8p/K.hM7X1Gj1AqNU9CIsCzZbwjIYq';
 
-app.post('/login', authLimiter, (req, res) => {
+app.post('/login', authLimiter, requireCaptcha, (req, res) => {
     const { username, password } = req.body;
 
     db.get(`SELECT * FROM User_Data WHERE username = ?`, [username], async (err, user) => {

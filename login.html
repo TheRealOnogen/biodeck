@@ -21,12 +21,14 @@
         <input type="text" id="username" name="username"><br><br>
         <label for="password">Password</label><br>
         <input type="password" id="password" name="password"><br><br>
+        <div id="captcha-slot" style="display:flex;justify-content:center;margin-bottom:14px;"></div>
         <button type="submit" class="button">Login</button><br><br>
         <button type="button" class="button" onclick="window.location.href='/forgot-password'" style="width: 180px">Forgot Password</button>
         <button type="button" class="button" onclick="window.location.href='register'" style="width: 180px">Don't have an account</button><br><br>
         <button type="button" class="button" onclick="window.location.href='support'" style="width: 180px">Support</button>
     </div>
     </form>
+    <script src="/captcha.js" defer></script>
     <script>
         document.querySelectorAll('.button').forEach(btn => {
             btn.addEventListener('mousedown', () => {

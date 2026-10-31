@@ -114,8 +114,8 @@ All endpoints below require a logged-in session unless noted otherwise. Endpoint
 
 | Method | Path | Body / Query | Response |
 |---|---|---|---|
-| POST | `/register` | body: `username, password, email` | Redirect to `/feed` or `/account/verify-email-required` on success; re-renders `register.html` with an error on failure |
-| POST | `/login` | body: `username, password` | Redirect to `/feed` on success. Rate-limited (`authLimiter`). On failure, returns a full HTML error page (banned/deleted/invalid credentials/pending email) with an appropriate status code |
+| POST | `/register` | body: `username, password, email`, plus `cf-turnstile-response` when captcha is enabled | Redirect to `/feed` or `/account/verify-email-required` on success; re-renders `register.html` with an error on failure. Missing/invalid captcha token: `400` HTML page. **Account-spam ban:** the 3rd registration attempt from one IP within 20 seconds is refused, and that IP is permanently added to `IP_Bans` (`403` ban page, reason `Stop spamming accounts, ...`). Every successful registration's IP is logged in `Registration_IPs` |
+| POST | `/login` | body: `username, password`, plus `cf-turnstile-response` when captcha is enabled | Redirect to `/feed` on success. Rate-limited (`authLimiter`). Missing/invalid captcha token: `400` HTML page (so a custom client can't log in with `username/password` alone once `TURNSTILE_SITE_KEY`/`TURNSTILE_SECRET_KEY` are set). On failure, returns a full HTML error page (banned/deleted/invalid credentials/pending email) with an appropriate status code |
 | GET | `/logout` | — | Destroys session, redirects to `/` |
 | POST | `/account/add-email` | body: `email` | For accounts created before email was required |
 | POST | `/account/verify-email-required/resend` | — | Resends verification email |

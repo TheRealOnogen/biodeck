@@ -2032,6 +2032,77 @@ function cleanupAttachmentFiles(files) {
     });
 }
 
+// ----- Cascade deletion of replies -----
+// Replies are rows in Posts whose reply_to points at their parent. Deleting a
+// post used to remove only that one row, leaving every reply (and the reply's
+// attachments, reactions and notifications) behind as orphans that still
+// rendered as if the thread existed. deletePostDescendants() removes the whole
+// reply tree under the given post ids (any depth). It is seeded from
+// `reply_to IN (ids)`, so it works whether or not the root rows are still there.
+// The roots themselves are NOT touched - callers delete those as they always did.
+// Moderation snapshots (Reports / Warnings) are left alone on purpose, and
+// cleanupAttachmentFiles() already refuses to unlink a file they still reference.
+const CASCADE_DELETE_REPLIES_ON_ACCOUNT_DELETE = true;
+
+function runInIdChunks(sqlWithIdsToken, ids, done) {
+    const parts = [];
+    for (let i = 0; i < ids.length; i += 400) parts.push(ids.slice(i, i + 400));
+    let changes = 0;
+    const step = () => {
+        const part = parts.shift();
+        if (!part) return done(null, changes);
+        db.run(sqlWithIdsToken.replace('%IDS%', part.map(() => '?').join(',')), part, function (err) {
+            if (err) return done(err, changes);
+            changes += this.changes || 0;
+            step();
+        });
+    };
+    step();
+}
+
+function deletePostDescendants(rootIds, callback) {
+    const ids = (Array.isArray(rootIds) ? rootIds : [rootIds]).map(n => parseInt(n, 10)).filter(Number.isInteger);
+    let total = 0;
+    const finish = (err) => { if (callback) callback(err || null, total); };
+    if (!ids.length) return finish(null);
+    const chunks = [];
+    for (let i = 0; i < ids.length; i += 400) chunks.push(ids.slice(i, i + 400));
+
+    const nextChunk = () => {
+        const chunk = chunks.shift();
+        if (!chunk) return finish(null);
+        const ph = chunk.map(() => '?').join(',');
+        db.all(
+            `WITH RECURSIVE tree(id) AS (
+                SELECT id FROM Posts WHERE reply_to IN (${ph})
+                UNION
+                SELECT p.id FROM Posts p JOIN tree t ON p.reply_to = t.id
+             )
+             SELECT id, file_path, file_name, files_json FROM Posts WHERE id IN (SELECT id FROM tree)`,
+            chunk,
+            (err, rows) => {
+                if (err) { console.error('Reply tree lookup error:', err.message); return finish(err); }
+                if (!rows || !rows.length) return nextChunk();
+                const replyIds = rows.map(r => r.id);
+                const attachments = rows.reduce((acc, r) => acc.concat(getAttachments(r)), []);
+                runInIdChunks(`DELETE FROM Reactions WHERE post_id IN (%IDS%)`, replyIds, (e1) => {
+                    if (e1) console.error('Reply reactions delete error:', e1.message);
+                    runInIdChunks(`DELETE FROM Notifications WHERE post_id IN (%IDS%)`, replyIds, (e2) => {
+                        if (e2) console.error('Reply notifications delete error:', e2.message);
+                        runInIdChunks(`DELETE FROM Posts WHERE id IN (%IDS%)`, replyIds, (e3, n) => {
+                            if (e3) { console.error('Reply delete error:', e3.message); return finish(e3); }
+                            total += n;
+                            cleanupAttachmentFiles(attachments);
+                            nextChunk();
+                        });
+                    });
+                });
+            }
+        );
+    };
+    nextChunk();
+}
+
 // Renders one or more attachments. A single image renders full-size like before.
 // Multiple images render as a grid capped at 3 columns wide (so 1-3 images is one
 // row, 4+ wraps to additional rows of up to 3). Non-image files (video/audio/other)
@@ -3661,7 +3732,11 @@ function checkBan(req, res, next) {
 // emailed, so this still works out of the box in dev.
 const APP_BASE_URL = (process.env.APP_BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 const RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
-const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// Strict on purpose: the old pattern accepted commas, quotes and angle brackets,
+// and nodemailer treats a comma in `to` as a separator between recipients, so
+// "x,someone@host.com" could be delivered to a different mailbox than the one
+// it appears to be. Only plain ASCII dot-atom addresses pass now.
+const EMAIL_REGEX = /^(?=.{3,254}$)[A-Za-z0-9!#$%&'*+\/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+\/=?^_`{|}~-]+)*@(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$/;
 
 let mailTransporter = null;
 if (nodemailer && process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
@@ -3708,11 +3783,46 @@ function stripEmailQuote(text) {
     return lines.slice(0, cutoff).join('\n').trim();
 }
 
+// True for bounces (NDRs), out-of-office replies and other machine-generated mail.
+// These must never become support tickets: every undeliverable verification or
+// reset email bounces back to this mailbox, and one fake signup = one ticket.
+function isAutomatedMail(mail, fromAddr, fromName) {
+    const hv = (k) => {
+        try {
+            const v = mail.headers && mail.headers.get ? mail.headers.get(k) : undefined;
+            if (v === undefined || v === null) return '';
+            if (typeof v === 'string') return v.toLowerCase();
+            if (Array.isArray(v)) return v.map(x => String(x && x.value || x)).join(' ').toLowerCase();
+            return String(v.value || v.text || '').toLowerCase();
+        } catch (e) { return ''; }
+    };
+    const local = String(fromAddr || '').split('@')[0].toLowerCase();
+    if (/^(mailer-daemon|postmaster|mail-daemon|daemon|bounces?|no-?reply|do-?not-?reply)$/.test(local)) return true;
+    if (/mail delivery (sub)?system|mailer-daemon|postmaster/i.test(fromName || '')) return true;
+    const autoSubmitted = hv('auto-submitted');
+    if (autoSubmitted && autoSubmitted !== 'no') return true;
+    if (hv('x-failed-recipients')) return true;
+    if (hv('content-type').startsWith('multipart/report')) return true;
+    if (/^(bulk|junk|auto_reply|list)$/.test(hv('precedence'))) return true;
+    if (hv('x-autoreply') || hv('x-autorespond')) return true;
+    const subj = String(mail.subject || '').trim();
+    if (/^(delivery status notification|undeliverable|undelivered mail|mail delivery (failed|failure|subsystem)|returned mail|failure notice|auto(matic)?[- ]?reply|out of office)/i.test(subj)) return true;
+    return false;
+}
+
 function processInboundSupportEmail(mail) {
     const fromEntry = mail.from && mail.from.value && mail.from.value[0];
     const fromAddr = fromEntry ? fromEntry.address : null;
     if (!fromAddr) return;
     const fromName = (fromEntry.name || fromAddr).trim();
+
+    if (isAutomatedMail(mail, fromAddr, fromName)) {
+        // Log it (so failed verification mails are still visible in the server
+        // log) but don't create a ticket or reply.
+        console.log(`[support inbox] ignored automated mail from ${fromAddr}: ${String(mail.subject || '').slice(0, 80)}` +
+            (mail.headers && mail.headers.get && mail.headers.get('x-failed-recipients') ? ` (failed: ${mail.headers.get('x-failed-recipients')})` : ''));
+        return;
+    }
 
     // Never let our own outgoing address turn into a ticket/reply - stops a
     // feedback loop if this mailbox is used for both sending and receiving.
@@ -4189,7 +4299,13 @@ function checkEmailVerified(req, res, next) {
         return next();
     }
     db.get(`SELECT email, email_verified FROM User_Data WHERE id = ?`, [req.session.userId], (err, user) => {
-        if (err || !user) return next();
+        // Fail CLOSED on a DB error: letting the request through here would
+        // let an unverified session act for as long as the DB is erroring.
+        if (err) {
+            console.error('checkEmailVerified DB error:', err.message);
+            return res.status(503).send('Temporarily unavailable. Please try again in a moment.');
+        }
+        if (!user) return next();
         if (!user.email) {
             // Legacy account with no email: same hold as at login, instead of
             // letting an old session slip past verification entirely.
@@ -5491,6 +5607,148 @@ function isDisposableEmail(email) {
     return false;
 }
 
+// ----- Stronger email validation (works against services that rotate domains) -----
+// Domain blocklists can't stop services that generate a fresh domain every time,
+// so on top of the list we (1) trust big mailbox providers outright, and
+// (2) for every OTHER domain require real MX records whose mail server isn't
+// one we've blocked. Disposable services point all their rotating domains at a
+// small set of mail servers, so blocking the servers works where blocking
+// domains doesn't. Fill blocked-mx-hosts.txt (one host per line, # comments
+// allowed; restart to reload) - see the dig instructions in the patch notes.
+const dnsPromises = require('dns').promises;
+
+const TRUSTED_EMAIL_DOMAINS = new Set([
+    'gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'msn.com',
+    'yahoo.com', 'ymail.com', 'icloud.com', 'me.com', 'proton.me', 'protonmail.com', 'pm.me',
+    'gmx.com', 'gmx.net', 'mail.ru', 'yandex.com', 'yandex.ru', 'ukr.net', 'i.ua', 'meta.ua',
+    'aol.com', 'zoho.com', 'fastmail.com'
+]);
+
+const BLOCKED_MX_HOSTS = new Set();
+const BLOCKED_MX_HOSTS_FILE = path.join(__dirname, 'blocked-mx-hosts.txt');
+(function loadBlockedMxHosts() {
+    try {
+        fs.readFileSync(BLOCKED_MX_HOSTS_FILE, 'utf8').split(/\r?\n/).forEach(line => {
+            const h = line.replace(/#.*$/, '').trim().toLowerCase().replace(/\.$/, '');
+            if (h) BLOCKED_MX_HOSTS.add(h);
+        });
+    } catch (e) { /* no file = no MX blocking, only the other checks */ }
+})();
+
+// Disposable services rotate domains AND mail-server hostnames, but the
+// hostnames all resolve to the same few IPs. blocked-mx-ips.txt lists those
+// IPs (one per line; IPv4 CIDR like 203.0.113.0/28 also works; # comments).
+// Keep entries as narrow as you can - blocking a whole hosting provider's
+// range would also reject legitimate mail hosted there.
+const BLOCKED_MX_IPS = new Set();
+const BLOCKED_MX_CIDRS = []; // { base, mask }
+const BLOCKED_MX_IPS_FILE = path.join(__dirname, 'blocked-mx-ips.txt');
+function ipv4ToInt(ip) {
+    const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(ip);
+    if (!m) return null;
+    const o = m.slice(1).map(Number);
+    if (o.some(n => n > 255)) return null;
+    return ((o[0] << 24) >>> 0) + (o[1] << 16) + (o[2] << 8) + o[3];
+}
+(function loadBlockedMxIps() {
+    try {
+        fs.readFileSync(BLOCKED_MX_IPS_FILE, 'utf8').split(/\r?\n/).forEach(line => {
+            const v = line.replace(/#.*$/, '').trim().toLowerCase();
+            if (!v) return;
+            const slash = v.indexOf('/');
+            if (slash === -1) { BLOCKED_MX_IPS.add(v); return; }
+            const base = ipv4ToInt(v.slice(0, slash));
+            const bits = parseInt(v.slice(slash + 1), 10);
+            if (base === null || !(bits >= 8 && bits <= 32)) return; // ignore junk / absurdly wide ranges
+            const mask = bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0;
+            BLOCKED_MX_CIDRS.push({ base: (base & mask) >>> 0, mask });
+        });
+    } catch (e) { /* no file = no IP blocking */ }
+})();
+function isBlockedMxIp(ip) {
+    ip = String(ip).toLowerCase();
+    if (BLOCKED_MX_IPS.has(ip)) return true;
+    const n = ipv4ToInt(ip);
+    if (n === null) return false;
+    return BLOCKED_MX_CIDRS.some(c => ((n & c.mask) >>> 0) === c.base);
+}
+async function mxHostResolvesToBlockedIp(host) {
+    if (!BLOCKED_MX_IPS.size && !BLOCKED_MX_CIDRS.length) return false;
+    const ips = [];
+    try { ips.push(...await withTimeout(dnsPromises.resolve4(host), 3000)); } catch (e) {}
+    try { ips.push(...await withTimeout(dnsPromises.resolve6(host), 3000)); } catch (e) {}
+    return ips.some(isBlockedMxIp);
+}
+
+// Small cache so repeated attempts (and the same domain used by many signups)
+// don't hammer DNS. Entries live 10 minutes.
+const mxCheckCache = new Map();
+const MX_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function withTimeout(promise, ms) {
+    return Promise.race([promise, new Promise((_, rej) => setTimeout(() => rej(new Error('dns timeout')), ms))]);
+}
+
+// Returns null when the address is fine, otherwise a short user-facing reason.
+async function validateEmailForUse(email) {
+    const addr = String(email || '').trim().toLowerCase();
+    const at = addr.lastIndexOf('@');
+    if (at < 1) return 'That doesn\'t look like a valid email.';
+    const domain = addr.slice(at + 1);
+
+    if (isDisposableEmail(addr)) return 'Temporary/disposable email addresses can\'t be used.';
+    if (TRUSTED_EMAIL_DOMAINS.has(domain)) return null;
+
+    const cached = mxCheckCache.get(domain);
+    if (cached && cached.until > Date.now()) return cached.reason;
+
+    let reason = null;
+    try {
+        const mx = await withTimeout(dnsPromises.resolveMx(domain), 4000);
+        if (!mx || !mx.length) {
+            reason = 'That email domain can\'t receive mail. Please use a different address.';
+        } else if (mx.some(r => {
+            const h = String(r.exchange || '').toLowerCase().replace(/\.$/, '');
+            for (const b of BLOCKED_MX_HOSTS) { if (h === b || h.endsWith('.' + b)) return true; }
+            return false;
+        })) {
+            reason = 'Temporary/disposable email addresses can\'t be used.';
+        } else {
+            // Hostname looked fine; check what the mail servers actually resolve to.
+            const hosts = mx.map(r => String(r.exchange || '').toLowerCase().replace(/\.$/, '')).filter(Boolean);
+            const hits = await Promise.all(hosts.map(mxHostResolvesToBlockedIp));
+            if (hits.some(Boolean)) reason = 'Temporary/disposable email addresses can\'t be used.';
+        }
+    } catch (e) {
+        if (e && (e.code === 'ENOTFOUND' || e.code === 'ENODATA')) {
+            reason = 'That email domain can\'t receive mail. Please use a different address.';
+        } else {
+            // DNS hiccup/timeout: fail open so a resolver problem never blocks everyone.
+            console.warn('MX lookup failed for', domain, '-', e && e.message);
+            return null;
+        }
+    }
+    mxCheckCache.set(domain, { reason, until: Date.now() + MX_CACHE_TTL_MS });
+    return reason;
+}
+
+// Caps how many times an account can swap its email while still unverified,
+// so the "use a different email" form can't be used to hop between inboxes.
+const unverifiedEmailChanges = new Map(); // userId -> [timestamps]
+const MAX_UNVERIFIED_EMAIL_CHANGES = 3;
+const UNVERIFIED_EMAIL_CHANGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+function tooManyUnverifiedEmailChanges(userId) {
+    const now = Date.now();
+    const recent = (unverifiedEmailChanges.get(userId) || []).filter(t => now - t < UNVERIFIED_EMAIL_CHANGE_WINDOW_MS);
+    unverifiedEmailChanges.set(userId, recent);
+    return recent.length >= MAX_UNVERIFIED_EMAIL_CHANGES;
+}
+function recordUnverifiedEmailChange(userId) {
+    const arr = unverifiedEmailChanges.get(userId) || [];
+    arr.push(Date.now());
+    unverifiedEmailChanges.set(userId, arr);
+}
+
 // Collapses the usual "same inbox, different spelling" tricks so one mailbox
 // can't be turned into unlimited addresses: +tags are dropped everywhere and
 // Gmail's dots are ignored. Only used to COUNT accounts per mailbox - the
@@ -5697,6 +5955,11 @@ async function createAccount(req, { username, password, email, formNonce }) {
     // before the bcrypt hash so spammers can't burn CPU with them.
     const refusal = checkSignupLimits(ip, email, emailNorm);
     if (refusal) return { ok: false, code: 'signup_refused', refusal };
+    const emailProblem = await validateEmailForUse(email);
+    if (emailProblem) {
+        return { ok: false, code: 'signup_refused', refusal: { status: 400, title: 'Email not allowed',
+            heading: 'That email can\'t be used', message: emailProblem } };
+    }
 
     // One account per token. Synchronous, so parallel requests can't share one.
     if (!consumeFormNonce(formNonce)) return { ok: false, code: 'bad_form_token' };
@@ -6075,7 +6338,7 @@ app.get('/account/add-email', (req, res) => {
         </form>`));
 });
 
-app.post('/account/add-email', (req, res) => {
+app.post('/account/add-email', async (req, res) => {
     if (!req.session.pendingEmailUserId) return res.redirect('/');
     const userId = req.session.pendingEmailUserId;
     const email = (req.body.email || '').trim().toLowerCase();
@@ -6083,6 +6346,13 @@ app.post('/account/add-email', (req, res) => {
     if (!email || !EMAIL_REGEX.test(email)) {
         return res.status(400).send(renderMessagePage('Invalid Email', 'That doesn\'t look like a valid email',
             `<h3>Please double check the email address and try again.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
+    }
+
+    const addProblem = await validateEmailForUse(email);
+    if (addProblem) {
+        return res.status(400).send(renderMessagePage('Email Not Allowed', 'That email can\'t be used',
+            `<h3>${escapeHTML(addProblem)}</h3><br><br>
             <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/add-email';">Go back</button>`));
     }
 
@@ -6155,7 +6425,7 @@ app.post('/account/verify-email-required/resend', (req, res) => {
     });
 });
 
-app.post('/account/verify-email-required/change', (req, res) => {
+app.post('/account/verify-email-required/change', async (req, res) => {
     if (!req.session.pendingVerifyUserId) return res.redirect('/');
     const userId = req.session.pendingVerifyUserId;
     const username = req.session.pendingVerifyUsername;
@@ -6166,6 +6436,19 @@ app.post('/account/verify-email-required/change', (req, res) => {
             `<h3>Please double check the email address and try again.</h3><br><br>
             <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
     }
+
+    if (tooManyUnverifiedEmailChanges(userId)) {
+        return res.status(429).send(renderMessagePage('Too Many Changes', 'Please try again later',
+            `<h3>This account has changed its email too many times while unverified. Try again in 24 hours, or contact support.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
+    }
+    const changeProblem = await validateEmailForUse(email);
+    if (changeProblem) {
+        return res.status(400).send(renderMessagePage('Email Not Allowed', 'That email can\'t be used',
+            `<h3>${escapeHTML(changeProblem)}</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="window.location.href='/account/verify-email-required';">Go back</button>`));
+    }
+    recordUnverifiedEmailChange(userId);
 
     // Accounts are allowed to share an email address, so there's no
     // uniqueness check here - just swap it in and send a fresh link.
@@ -7066,7 +7349,7 @@ app.post('/edit/theme', (req, res) => {
 // to the CURRENT address on file (not the new one) - this proves whoever
 // is requesting the change still controls the existing account, the same
 // way password resets prove control via the existing email.
-app.post('/account/email/request-code', (req, res) => {
+app.post('/account/email/request-code', async (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const userId = req.session.userId;
     const newEmail = (req.body.new_email || '').trim().toLowerCase();
@@ -7074,6 +7357,8 @@ app.post('/account/email/request-code', (req, res) => {
     if (!newEmail || !EMAIL_REGEX.test(newEmail)) {
         return res.status(400).json({ error: 'That doesn\'t look like a valid email.' });
     }
+    const requestProblem = await validateEmailForUse(newEmail);
+    if (requestProblem) return res.status(400).json({ error: requestProblem });
 
     db.get(`SELECT username, email FROM User_Data WHERE id = ?`, [userId], (err, user) => {
         if (err) return res.status(500).json({ error: 'Something went wrong.' });
@@ -8039,10 +8324,12 @@ app.post('/feed/delete/:id', (req, res) => {
         if (post.username !== req.session.userUsername && !req.isAdmin) return res.status(403).end();
         const attachments = getAttachments(post);
         db.run(`DELETE FROM Reactions WHERE post_id = ?`, [postId]);
+        db.run(`DELETE FROM Notifications WHERE post_id = ?`, [postId]);
         db.run(`DELETE FROM Posts WHERE id = ?`, [postId], (err) => {
-            if (err) console.error('Delete error:', err.message);
-            else cleanupAttachmentFiles(attachments);
-            res.status(200).end();
+            if (err) { console.error('Delete error:', err.message); return res.status(200).end(); }
+            cleanupAttachmentFiles(attachments);
+            // Take the replies (and their files/reactions) down with the post.
+            deletePostDescendants([postId], () => res.status(200).end());
         });
     });
 });
@@ -11943,12 +12230,13 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
         function(err) {
             if (err) return res.status(500).json({ error: 'db error' });
             if (this.changes === 0) return res.status(404).json({ error: 'user not found' });
-            db.all(`SELECT file_path, file_name, files_json FROM Posts WHERE username = ?`, [target], (errPre, postRows) => {
+            db.all(`SELECT id, file_path, file_name, files_json FROM Posts WHERE username = ?`, [target], (errPre, postRows) => {
             const attachments = (postRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []);
             db.run(`DELETE FROM Reactions WHERE post_id IN (SELECT id FROM Posts WHERE username = ?)`, [target]);
             db.run(`DELETE FROM Posts WHERE username = ?`, [target], (err2) => {
                 if (err2) return res.status(500).json({ error: 'db error deleting posts' });
                 cleanupAttachmentFiles(attachments);
+                if (CASCADE_DELETE_REPLIES_ON_ACCOUNT_DELETE) deletePostDescendants((postRows || []).map(r => r.id));
                 // Push a deleted event to any open SSE streams for this user, and email them
                 db.get(`SELECT id, email FROM User_Data WHERE username = ?`, [target], (err3, row) => {
                     if (!err3 && row) {
@@ -12001,7 +12289,7 @@ function hardDeleteAccountRows(username, reason, callback) {
         // messages) BEFORE any row is deleted, so the files can be cleaned
         // up from disk once the rows referencing them are gone.
         db.all(`SELECT file_path, file_name, files_json FROM Messages WHERE from_user = ? OR to_user = ?`, [username, username], (errM, msgRows) => {
-        db.all(`SELECT file_path, file_name, files_json FROM Posts WHERE username = ?`, [username], (errP, postRows) => {
+        db.all(`SELECT id, file_path, file_name, files_json FROM Posts WHERE username = ?`, [username], (errP, postRows) => {
         db.all(`SELECT file_path, file_name, files_json FROM Group_Chat_Messages WHERE from_user = ?`, [username], (errG, gcRows) => {
             const attachments = []
                 .concat((msgRows || []).reduce((acc, r) => acc.concat(getAttachments(r)), []))
@@ -12023,6 +12311,7 @@ function hardDeleteAccountRows(username, reason, callback) {
             // to know which post_ids were theirs.
             db.run(`DELETE FROM Reactions WHERE post_id IN (SELECT id FROM Posts WHERE username = ?)`, [username]);
             db.run(`DELETE FROM Posts WHERE username = ?`, [username]);
+            if (CASCADE_DELETE_REPLIES_ON_ACCOUNT_DELETE) deletePostDescendants((postRows || []).map(r => r.id));
             db.run(`DELETE FROM Follows WHERE follower_username = ? OR following_username = ?`, [username, username]);
             db.run(`DELETE FROM Friend_Requests WHERE from_user = ? OR to_user = ?`, [username, username]);
             db.run(`DELETE FROM Friends WHERE user_a = ? OR user_b = ?`, [username, username]);
@@ -12740,6 +13029,34 @@ app.post('/admin/reports/:id/status', requireAdmin, (req, res) => {
 // action, but is its own endpoint so it can be retried/called independently.
 // Treats an already-gone message (e.g. the user deleted it themselves) as
 // success rather than an error.
+// One-off cleanup for replies orphaned BEFORE cascade deletion existed: any post
+// whose reply_to points at a post that no longer exists, plus everything under
+// it. Back up the database first. Run from the browser console while logged in
+// as an admin:
+//   fetch('/admin/purge-orphan-replies',{method:'POST'}).then(r=>r.json()).then(console.log)
+app.post('/admin/purge-orphan-replies', requireAdmin, (req, res) => {
+    db.all(`SELECT id, file_path, file_name, files_json FROM Posts WHERE reply_to IS NOT NULL AND reply_to NOT IN (SELECT id FROM Posts)`, [], (err, orphans) => {
+        if (err) return res.status(500).json({ error: 'db error' });
+        if (!orphans || !orphans.length) return res.json({ ok: true, deleted: 0 });
+        const ids = orphans.map(o => o.id);
+        const attachments = orphans.reduce((acc, r) => acc.concat(getAttachments(r)), []);
+        deletePostDescendants(ids, (e1, descCount) => {
+            if (e1) return res.status(500).json({ error: 'db error' });
+            runInIdChunks(`DELETE FROM Reactions WHERE post_id IN (%IDS%)`, ids, () => {
+                runInIdChunks(`DELETE FROM Notifications WHERE post_id IN (%IDS%)`, ids, () => {
+                    runInIdChunks(`DELETE FROM Posts WHERE id IN (%IDS%)`, ids, (e2, n) => {
+                        if (e2) return res.status(500).json({ error: 'db error' });
+                        cleanupAttachmentFiles(attachments);
+                        const total = (n || 0) + (descCount || 0);
+                        logAudit('orphan_replies_purged', req.session.userUsername, req.session.userUsername, `${total} post(s)`);
+                        res.json({ ok: true, deleted: total });
+                    });
+                });
+            });
+        });
+    });
+});
+
 app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(404).json({ error: 'Report not found.' });
@@ -12754,14 +13071,16 @@ app.post('/admin/reports/:id/delete-content', requireAdmin, (req, res) => {
             db.get(`SELECT file_path, file_name, files_json FROM Posts WHERE id = ?`, [source_id], (errPre, postRow) => {
                 const attachments = getAttachments(postRow);
                 db.run(`DELETE FROM Reactions WHERE post_id = ?`, [source_id]);
+                db.run(`DELETE FROM Notifications WHERE post_id = ?`, [source_id]);
                 db.run(`DELETE FROM Posts WHERE id = ?`, [source_id], function (err2) {
                     if (err2) return res.status(500).json({ error: 'db error' });
                     const deleted = this.changes > 0;
-                    if (deleted) {
-                        cleanupAttachmentFiles(attachments);
-                        logAudit('report_content_deleted', admin, reported_username, `post #${source_id}`);
-                    }
-                    res.json({ ok: true, deleted });
+                    if (!deleted) return res.json({ ok: true, deleted });
+                    cleanupAttachmentFiles(attachments);
+                    deletePostDescendants([source_id], (e, n) => {
+                        logAudit('report_content_deleted', admin, reported_username, `post #${source_id}` + (n ? ` (+${n} repl${n === 1 ? 'y' : 'ies'})` : ''));
+                        res.json({ ok: true, deleted });
+                    });
                 });
             });
         } else if (source_type === 'dm') {

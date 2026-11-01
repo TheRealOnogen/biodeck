@@ -1,0 +1,7 @@
+# One mail-server hostname per line. Any domain whose MX record points at (or under) these is rejected.
+# Disposable services rotate domains but reuse a few mail servers. Collect them like this:
+#   1. Open the temp-mail site in a browser a few times / refresh to get several different addresses.
+#   2. For each address's domain run:   dig +short MX thedomain.example
+#   3. Add the mail server hostnames that keep repeating (without the priority number or trailing dot).
+# Restart the server after editing. Example format (NOT real entries):
+# mx.example-disposable.net

@@ -1,0 +1,4 @@
+# IPs of disposable-mail servers (one per line, CIDR ok). Keep entries narrow.
+# Found via: dig +short MX <domain>  then  dig +short A <mx host>
+157.230.65.184 # temp-mail.org
+173.230.139.246 # tempail.com

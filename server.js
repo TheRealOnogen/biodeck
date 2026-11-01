@@ -3122,7 +3122,7 @@ db.serialize(() => {
             db.run(`CREATE TABLE IF NOT EXISTS Settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
-            )`, () => { loadRegistrationGateSetting(); loadRegistrationLockdown(); loadFullLockdown(); });
+            )`, () => { loadRegistrationGateSetting(); loadRegistrationLockdown(); loadFullLockdown(); loadReadOnlyMode(); });
             // Audit trail for admin-facing/account-lifecycle events (account
             // created/banned/unbanned/deleted, registration gate toggled, etc).
             // actor is who performed the action ('System' for self-service
@@ -5137,6 +5137,7 @@ function dxKickQueue() {
     (async () => {
         try {
             for (;;) {
+                if (readOnlyModeEnabled) break; // paused; setReadOnlyMode(false) kicks the queue again
                 const job = await dxGet(`SELECT * FROM Data_Export_Requests WHERE status = 'pending' ORDER BY id LIMIT 1`);
                 if (!job) break;
                 await dxRun(`UPDATE Data_Export_Requests SET status = 'processing' WHERE id = ?`, [job.id]);
@@ -5227,6 +5228,9 @@ async function dxProcessJob(job) {
 // the long random token in the URL is the authorisation. Not cached, not
 // indexed, and the token never leaks through the Referer header.
 app.get('/data-export/download/:id/:token', (req, res) => {
+    if (readOnlyModeEnabled) return res.status(403).send(renderMessagePage('Read-only mode', 'Downloads are paused',
+        `<h3>Biodeck is in read-only mode, so data exports can't be downloaded right now. Please try again later.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>`));
     const gone = () => res.status(404).send(renderMessagePage('Link expired', 'This download link is no longer valid',
         `<h3>Links expire after a while. You can request your data again.</h3><br><br>
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Go to homepage</button>`));
@@ -5286,6 +5290,9 @@ setInterval(dxCleanupExports, 60 * 60 * 1000).unref();
 app.use(checkIPBan);
 app.use(checkBan);
 app.use(checkEmailVerified);
+// Read-only mode (see "Read-only mode" above). Both are no-ops while it is off.
+app.use(readOnlyPageInjector);
+app.use(readOnlyWriteGuard);
 
 // SSE stream for per-user server-push events (ban notifications, etc.)
 // Only reachable by non-banned users because checkIPBan/checkBan run first.
@@ -5518,6 +5525,244 @@ function isStaffUser(user) {
     return !!(user && (user.IsAdmin || user.IsOwner || user.IsHeadAdmin));
 }
 
+// ----- Read-only mode (manual, Owner / Head Admin controlled) -----
+// While ON:
+//   - nobody can register (getRegistrationBlockPage + readOnlyWriteGuard),
+//   - nobody can request a data export, and queued exports are paused,
+//   - logging in still works, and everyone can still READ (feed, DMs, group
+//     chats, profiles...),
+//   - regular accounts cannot change ANYTHING: every POST/PUT/PATCH/DELETE is
+//     refused except the allow-list in READ_ONLY_USER_WRITES below (login,
+//     logout, read receipts),
+//   - Admin / Head Admin / Owner accounts can still chat and use the admin
+//     tools (otherwise nobody could turn this off again),
+//   - every HTML page gets a banner, and regular accounts also have the text
+//     fields stripped from the page (except on the login and register pages).
+// Stored in Settings so a restart doesn't lift it.
+let readOnlyModeEnabled = false;
+
+function loadReadOnlyMode() {
+    db.get(`SELECT value FROM Settings WHERE key = 'read_only_mode'`, (err, row) => {
+        if (!err && row) readOnlyModeEnabled = row.value === '1';
+    });
+}
+
+function setReadOnlyMode(enabled) {
+    readOnlyModeEnabled = !!enabled; // in-memory first so it applies to the very next request
+    db.run(`INSERT INTO Settings (key, value) VALUES ('read_only_mode', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [enabled ? '1' : '0'],
+        (err) => { if (err) console.error('Read-only mode save error:', err.message); });
+    if (!enabled) dxKickQueue(); // data exports that were queued while it was on can go out now
+}
+
+const READ_ONLY_MESSAGE = 'Biodeck is in read-only mode - no changes can be made right now.';
+
+function renderReadOnlyPage() {
+    return renderMessagePage('Read-only mode', 'Biodeck is in read-only mode',
+        `<h3>New accounts can't be created while Biodeck is in read-only mode. Please try again later.</h3><br><br>
+        <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to home</button>`);
+}
+
+// Blocked for EVERYONE (staff included) while read-only mode is on.
+const READ_ONLY_NEVER = [
+    /^\/register$/,
+    /^\/api\/v1\/auth\/register$/,
+    /^\/api\/v1\/auth\/register-challenge$/,
+    /^\/account\/data-export$/
+];
+// The only writes regular accounts may still make: signing in/out, read receipts, and
+// switching their own theme (a personal display setting, not site content).
+const READ_ONLY_USER_WRITES = [
+    /^\/edit\/theme$/,
+    /^\/login$/,
+    /^\/logout$/,
+    /^\/api\/v1\/auth\/(login|code-login|logout)$/,
+    /^\/account\/client-code$/,
+    /^\/messages\/[^/]+\/(mark-read|presence)$/,
+    /^\/api\/v1\/messages\/[^/]+\/mark-read$/,
+    /^\/notifications\/mark-read$/
+];
+
+function readOnlyNormPath(req) {
+    return ((req.path || '/').toLowerCase().replace(/\/+$/, '')) || '/';
+}
+
+function readOnlyReject(req, res) {
+    if (String(req.headers.accept || '').includes('text/html')) {
+        return res.status(403).send(renderMessagePage('Read-only mode', 'Biodeck is in read-only mode',
+            `<h3>No changes can be made right now. You can still log in and read your messages.</h3><br><br>
+            <button type="button" class="button" style="width: 150px" onclick="history.back();">Go back</button>`));
+    }
+    return res.status(403).json({ error: READ_ONLY_MESSAGE, code: 'read_only' });
+}
+
+// Server-side enforcement. Runs after checkBan, which is what sets req.isAdmin.
+function readOnlyWriteGuard(req, res, next) {
+    if (!readOnlyModeEnabled) return next();
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+    const p = readOnlyNormPath(req);
+    if (READ_ONLY_NEVER.some(re => re.test(p))) return readOnlyReject(req, res);
+    if (req.isAdmin) return next();
+    if (READ_ONLY_USER_WRITES.some(re => re.test(p))) return next();
+    return readOnlyReject(req, res);
+}
+
+// Adds the banner (and, for regular accounts, strips text fields) on full HTML
+// pages. Responses are buffered ONLY when they are text/html, and only full
+// documents (anything containing a <body> tag) are touched - HTML fragments
+// that the frontend fetches and splices into a page are passed through as-is.
+function readOnlyInjectHTML(html, req) {
+    const staff = !!req.isAdmin;
+    const p = readOnlyNormPath(req);
+    const keepFields = staff || p === '/' || p === '/login' || p === '/register';
+    const text = staff
+        ? 'Biodeck is in read-only mode: no changes can be made to anything. (Staff accounts can still chat and use the admin tools.)'
+        : 'Biodeck is in read-only mode: no changes can be made to anything. You can still log in and read your messages.';
+    const banner = `<div id="ro-banner" role="status" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:rgb(200,60,60);color:#fff;text-align:center;padding:10px 14px;font-size:0.9em;line-height:1.35;box-sizing:border-box;font-family:'Quicksand',sans-serif;font-weight:600;">${text}</div>`;
+    // Pushes the page down by the banner's height so nothing is hidden under it: the page itself
+    // gets top padding, and fixed / sticky elements pinned near the top (a top nav bar, toasts)
+    // are moved down by the same amount. Re-measured on resize, since the banner can wrap.
+    const shifter = `<script>(function(){
+var b=document.getElementById('ro-banner');if(!b)return;
+var H=0;
+function shift(el){
+  if(el.nodeType!==1||el===b||b.contains(el))return;
+  var cs=getComputedStyle(el),pos=cs.position;
+  if(pos!=='fixed'&&pos!=='sticky')return;
+  if(el.getAttribute('data-ro-top')===null){
+    var t=parseFloat(cs.top);
+    if(isNaN(t)||t>120)return;
+    el.setAttribute('data-ro-top',String(t));
+  }
+  el.style.setProperty('top',(parseFloat(el.getAttribute('data-ro-top'))+H)+'px','important');
+}
+function scan(root){
+  if(root.nodeType!==1)return;
+  shift(root);
+  var all=root.querySelectorAll('*');
+  for(var i=0;i<all.length;i++)shift(all[i]);
+}
+function fit(){
+  // A page can have its own scroll area (the body, or a box near the top of the page) that is
+  // as tall as the window. With the banner on top, the bottom of that area ends up off-screen and
+  // its last part can't be scrolled to. Shrink any such area so it ends at the window's bottom.
+  var vh=window.innerHeight;
+  var list=document.querySelectorAll('body,body>*,body>*>*,body>*>*>*');
+  var i,el;
+  for(i=0;i<list.length;i++){
+    el=list[i];
+    if(el.getAttribute('data-ro-fit')!==null){el.style.removeProperty('max-height');el.style.removeProperty('min-height');el.removeAttribute('data-ro-fit');}
+  }
+  var de=document.documentElement,bodyFit=false;
+  de.style.removeProperty('overflow-y');
+  for(i=0;i<list.length;i++){
+    el=list[i];
+    if(el===b||b.contains(el))continue;
+    var cs=getComputedStyle(el),oy=cs.overflowY;
+    if(oy!=='auto'&&oy!=='scroll')continue;
+    var r=el.getBoundingClientRect();
+    var top=cs.position==='fixed'?r.top:r.top+(window.pageYOffset||0);
+    if(r.height>=vh-H-2&&top+r.height>vh+1&&top<vh){
+      el.setAttribute('data-ro-fit','1');
+      el.style.setProperty('box-sizing','border-box','important');
+      // min-height must be cleared too: a theme's min-height:100vh beats max-height, which
+      // left the page taller than the window and produced a second (window) scrollbar.
+      el.style.setProperty('min-height','0','important');
+      el.style.setProperty('max-height',Math.max(120,Math.floor(vh-top))+'px','important');
+      if(el===document.body)bodyFit=true;
+    }
+  }
+  // When the body is the page's scroll area, the window itself must not also scroll.
+  if(bodyFit&&de.scrollHeight>vh+1)de.style.setProperty('overflow-y','hidden','important');
+}
+function measure(){
+  H=b.offsetHeight;
+  var d=document.documentElement;
+  d.style.setProperty('box-sizing','border-box','important');
+  d.style.setProperty('padding-top',H+'px','important');
+  d.style.setProperty('scroll-padding-top',(H+8)+'px');
+  fit();
+  var done=document.querySelectorAll('[data-ro-top]');
+  for(var i=0;i<done.length;i++)shift(done[i]);
+}
+function init(){try{measure();scan(document.body);}catch(e){}setTimeout(function(){try{measure();}catch(e){}},600);}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',init);else init();
+window.addEventListener('load',function(){try{measure();scan(document.body);}catch(e){}});
+window.addEventListener('resize',function(){try{measure();}catch(e){}});
+try{new MutationObserver(function(ms){
+  for(var i=0;i<ms.length;i++){var n=ms[i].addedNodes;for(var j=0;j<n.length;j++){try{scan(n[j]);}catch(e){}}}
+}).observe(document.body,{childList:true,subtree:true});}catch(e){}
+})();<\/script>`;
+    const stripper = keepFields ? '' : `<script>(function(){
+var SKIP={hidden:1,checkbox:1,radio:1,button:1,submit:1,reset:1,image:1,range:1,color:1};
+function strip(){
+  var els=document.querySelectorAll('textarea,input,[contenteditable=""],[contenteditable="true"]');
+  for(var i=0;i<els.length;i++){
+    var el=els[i];
+    if(el.tagName==='INPUT'&&SKIP[(el.getAttribute('type')||'text').toLowerCase()])continue;
+    var form=el.closest&&el.closest('form');
+    if(el.id){var ls=document.querySelectorAll('label[for="'+el.id.replace(/"/g,'')+'"]');for(var j=0;j<ls.length;j++)ls[j].remove();}
+    el.remove();
+    if(form){var bs=form.querySelectorAll('button[type=submit],input[type=submit]');for(var k=0;k<bs.length;k++)bs[k].remove();}
+  }
+}
+function run(){try{strip();}catch(e){}}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',run);else run();
+try{new MutationObserver(run).observe(document.documentElement,{childList:true,subtree:true});}catch(e){}
+})();<\/script>`;
+    let out = /<body[^>]*>/i.test(html)
+        ? html.replace(/<body[^>]*>/i, (m) => m + '\n' + banner)
+        : banner + html;
+    const idx = out.toLowerCase().lastIndexOf('</body>');
+    out = idx >= 0 ? out.slice(0, idx) + shifter + stripper + out.slice(idx) : out + shifter + stripper;
+    return out;
+}
+
+function readOnlyPageInjector(req, res, next) {
+    if (!readOnlyModeEnabled) return next();
+    // Make sure a browser can't answer with a cached copy of the page from before read-only mode.
+    if (String(req.headers.accept || '').includes('text/html')) {
+        delete req.headers['if-none-match'];
+        delete req.headers['if-modified-since'];
+    }
+    if (req.method === 'HEAD') return next();
+    const origWrite = res.write, origEnd = res.end;
+    const chunks = [];
+    let mode = null; // null = not decided yet, 'pass' or 'buffer'
+    const decide = () => {
+        if (mode) return mode;
+        const ct = String(res.getHeader('Content-Type') || '');
+        mode = (/text\/html/i.test(ct) && res.statusCode !== 304 && res.statusCode !== 204
+            && !res.getHeader('Content-Encoding') && !res.headersSent) ? 'buffer' : 'pass';
+        return mode;
+    };
+    res.write = function (chunk, enc, cb) {
+        if (decide() === 'pass') return origWrite.apply(res, arguments);
+        if (typeof enc === 'function') { cb = enc; enc = undefined; }
+        if (chunk != null) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), enc || 'utf8'));
+        if (typeof cb === 'function') process.nextTick(cb);
+        return true;
+    };
+    res.end = function (chunk, enc, cb) {
+        if (decide() === 'pass') return origEnd.apply(res, arguments);
+        if (typeof chunk === 'function') { cb = chunk; chunk = null; enc = null; }
+        else if (typeof enc === 'function') { cb = enc; enc = null; }
+        if (chunk != null) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), enc || 'utf8'));
+        res.write = origWrite; res.end = origEnd;
+        let body = Buffer.concat(chunks);
+        const html = body.toString('utf8');
+        if (/<body[\s>]/i.test(html)) {
+            body = Buffer.from(readOnlyInjectHTML(html, req), 'utf8');
+            res.removeHeader('ETag');
+            res.removeHeader('Last-Modified');
+            res.setHeader('Cache-Control', 'no-store');
+        }
+        res.setHeader('Content-Length', body.length);
+        return origEnd.call(res, body, cb);
+    };
+    next();
+}
+
 function renderFullLockdownPage() {
     return renderMessagePage('Temporarily unavailable', 'Logins and signups are paused',
         `<h3>Biodeck has temporarily paused new logins and registrations. If you're already signed in you can keep using the site as normal. Please try again later.</h3><br><br>
@@ -5527,6 +5772,7 @@ function renderFullLockdownPage() {
 // The page to show instead of the registration form/handler, or null when
 // registration is open. Full lockdown wins over the timed one.
 function getRegistrationBlockPage() {
+    if (readOnlyModeEnabled) return renderReadOnlyPage();
     if (fullLockdownEnabled) return renderFullLockdownPage();
     const left = getRegistrationLockdownLeftMs();
     return left > 0 ? renderLockdownPage(left) : null;
@@ -6792,6 +7038,16 @@ app.get('/edit', (req, res) => {
             <div id="data-export-result" style="margin-top:8px;font-size:0.85em;"></div>
             <div id="data-export-history" style="margin-top:8px;font-size:0.8em;opacity:0.75;"></div>
         </div>
+        <div class="dash-field" id="client-code-section">
+            <label>Terminal / client login <span style="opacity:0.4;">(log into a Biodeck client without a captcha)</span></label>
+            <p style="opacity:0.6;font-size:0.82em;margin:6px 0 0;">Generate a one-time code and type it into the client. It works <strong>once</strong>, only for <strong>this account</strong>, and expires in 10 minutes. Making a new code cancels the old one. <strong>Anyone who has the code can log in as you - never share it.</strong></p>
+            <button class="button" type="button" id="client-code-btn" onclick="generateClientCode()" style="width:auto;margin-top:8px;">Generate Code</button>
+            <div id="client-code-box" style="display:none;margin-top:10px;">
+                <div id="client-code-value" style="font-family:monospace;font-size:1.5em;letter-spacing:2px;user-select:all;word-break:break-all;"></div>
+                <div id="client-code-timer" style="font-size:0.85em;opacity:0.75;margin-top:4px;"></div>
+            </div>
+            <div id="client-code-result" style="margin-top:8px;font-size:0.85em;"></div>
+        </div>
         <div class="dash-links">
                 <button class="button" style="width:120px;" onclick="window.location.href='/standing';">Standing</button>
                 <button class="button" style="width:120px;" onclick="window.location.href='/feed';">Feed</button>
@@ -6922,6 +7178,38 @@ app.get('/edit', (req, res) => {
             document.getElementById('email-change-result').textContent = '';
         }
 
+        var clientCodeTimer = null;
+        async function generateClientCode() {
+            var btn = document.getElementById('client-code-btn');
+            var box = document.getElementById('client-code-box');
+            var val = document.getElementById('client-code-value');
+            var timer = document.getElementById('client-code-timer');
+            var res = document.getElementById('client-code-result');
+            btn.disabled = true; res.style.color = ''; res.textContent = '';
+            try {
+                var r = await fetch('/account/client-code', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+                var d = await r.json();
+                if (!r.ok) { res.style.color = 'var(--danger-light-color)'; res.textContent = d.error || 'Could not create a code.'; btn.disabled = false; return; }
+                val.textContent = d.code; box.style.display = 'block';
+                btn.textContent = 'Generate New Code';
+                var expiresAt = Date.now() + d.expiresInMs;
+                clearInterval(clientCodeTimer);
+                var tick = function () {
+                    var left = Math.max(0, Math.round((expiresAt - Date.now()) / 1000));
+                    if (left <= 0) {
+                        clearInterval(clientCodeTimer); box.style.display = 'none'; val.textContent = '';
+                        res.textContent = 'That code expired. Generate a new one if you still need it.';
+                        return;
+                    }
+                    timer.textContent = 'Expires in ' + Math.floor(left / 60) + ':' + String(left % 60).padStart(2, '0');
+                };
+                tick(); clientCodeTimer = setInterval(tick, 1000);
+            } catch (e) {
+                res.style.color = 'var(--danger-light-color)'; res.textContent = 'Network error.';
+            }
+            btn.disabled = false;
+        }
+
         var dxHasEmail = ${email ? 'true' : 'false'};
         var dxPollTimer = null;
 
@@ -7003,12 +7291,26 @@ app.get('/edit', (req, res) => {
 
             resultEl.style.color = ''; resultEl.textContent = 'Deleting...';
             try {
-                const r = await fetch('/account/delete-self', {
+                let r = await fetch('/account/delete-self', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ password })
                 });
-                const d = await r.json();
+                let d = await r.json();
+                if (!r.ok && d && d.code === 'archive_failed') {
+                    // No copy of the data could be saved. Offer to delete anyway, but only after two separate confirmations.
+                    resultEl.textContent = '';
+                    const cancelled = () => { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = 'Your account was NOT deleted.'; };
+                    if (!confirm('We could not save a copy of your data, so your account was NOT deleted.\\n\\nDo you want to delete it WITHOUT a saved copy? Your data will be gone for good and you will not be able to have it emailed to you afterwards.\\n\\n(Confirmation 1 of 2)')) return cancelled();
+                    if (!confirm('Final confirmation (2 of 2): permanently delete your account with NO saved copy? This cannot be undone.')) return cancelled();
+                    resultEl.style.color = ''; resultEl.textContent = 'Deleting...';
+                    r = await fetch('/account/delete-self', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ password, skipArchive: true, confirmations: 2 })
+                    });
+                    d = await r.json();
+                }
                 if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not delete account.'; return; }
                 resultEl.style.color = 'var(--accent-color)'; resultEl.textContent = 'Account deleted. Redirecting...';
                 setTimeout(() => window.location.href = d.redirect || '/', 1200);
@@ -7258,11 +7560,11 @@ app.post('/account/delete-self', (req, res) => {
             return res.status(500).json({ error: 'auth error' });
         }
         if (!match) return res.status(401).json({ error: 'incorrect password' });
-        hardDeleteAccount(username, 'You deleted your own account', (err2, archive) => {
+        hardDeleteAccountEx(username, 'You deleted your own account', { allowWithoutArchive: allowNoArchive(req) }, (err2, archive) => {
             if (err2) {
                 console.error('Self-delete error:', err2.message);
                 if (err2.message === 'archive failed') {
-                    return res.status(500).json({ error: 'could not save a copy of your data, so your account was NOT deleted. Please try again later.' });
+                    return res.status(500).json({ code: 'archive_failed', error: 'could not save a copy of your data, so your account was NOT deleted. You can try again later, or choose to delete it without a saved copy.' });
                 }
                 return res.status(500).json({ error: 'db error' });
             }
@@ -8153,6 +8455,109 @@ function recordAcceptedPost(req, content) {
         if (!entry || now - entry.ts >= CROSS_USER_DUPLICATE_WINDOW_MS) recentPostContent.set(hash, { users: new Set([userId]), ts: now });
         else entry.users.add(userId);
     }
+}
+
+// ----- DM / group chat send limits -----
+// Posts have their own flood guard above; DMs and group chats had nothing, so
+// one account could fill the database with 4,000-character messages as fast as
+// it could click. Per ACCOUNT (not per chat, so spreading spam over many DMs /
+// groups doesn't help), counted across DMs + group chats + edits together:
+//   - at most CHAT_BURST_MAX messages in CHAT_BURST_WINDOW seconds,
+//   - at most CHAT_MINUTE_CHARS characters of text per minute and
+//     CHAT_HOUR_CHARS per hour (accounts younger than NEW_ACCOUNT_AGE_MS get
+//     CHAT_NEW_ACCOUNT_FACTOR of those two),
+//   - the same long message can't be sent twice within CHAT_DUPLICATE_WINDOW.
+// Staff are exempt. Rejected requests are never stored and uploaded files are
+// deleted again. Env (optional): CHAT_BURST_MAX, CHAT_BURST_WINDOW_SECONDS,
+// CHAT_MINUTE_CHARS, CHAT_HOUR_CHARS, CHAT_NEW_ACCOUNT_FACTOR, CHAT_DUPLICATE_WINDOW_SECONDS.
+const CHAT_BURST_MAX = Math.max(1, Math.floor(envNum('CHAT_BURST_MAX', 10)));
+const CHAT_BURST_WINDOW_MS = Math.max(1, envNum('CHAT_BURST_WINDOW_SECONDS', 10)) * 1000;
+const CHAT_MINUTE_CHARS = Math.max(MAX_MSG_LENGTH, Math.floor(envNum('CHAT_MINUTE_CHARS', 16000)));
+const CHAT_HOUR_CHARS = Math.max(CHAT_MINUTE_CHARS, Math.floor(envNum('CHAT_HOUR_CHARS', 120000)));
+const CHAT_NEW_ACCOUNT_FACTOR = Math.min(1, Math.max(0.1, envNum('CHAT_NEW_ACCOUNT_FACTOR', 0.5)));
+const CHAT_DUPLICATE_WINDOW_MS = envNum('CHAT_DUPLICATE_WINDOW_SECONDS', 60) * 1000;
+const CHAT_DUPLICATE_MIN_CHARS = 50;
+const chatSendLog = new Map(); // userId -> [{ ts, chars, h }]
+
+setInterval(() => {
+    const now = Date.now();
+    chatSendLog.forEach((arr, k) => {
+        const kept = arr.filter(e => now - e.ts < 60 * 60 * 1000);
+        if (kept.length) chatSendLog.set(k, kept); else chatSendLog.delete(k);
+    });
+}, 5 * 60 * 1000).unref();
+
+// ms until `need` more characters would fit under `limit` for the given window (0 = fits now).
+function chatRetryForBudget(entries, windowMs, limit, need, now) {
+    const inWin = entries.filter(e => now - e.ts < windowMs);
+    const total = inWin.reduce((s, e) => s + e.chars, 0);
+    const excess = total + need - limit;
+    if (excess <= 0) return 0;
+    let freed = 0;
+    for (const e of inWin) {
+        freed += e.chars;
+        if (freed >= excess) return Math.max(1000, e.ts + windowMs - now);
+    }
+    return windowMs;
+}
+
+function chatIsNewAccount(userId, now) {
+    try {
+        const row = getStmt(`SELECT created_ts FROM Registration_IPs WHERE user_id = ? ORDER BY created_ts DESC LIMIT 1`).get(userId);
+        return !!row && (now - row.created_ts) < NEW_ACCOUNT_AGE_MS;
+    } catch (e) { return false; } // fail open
+}
+
+// Returns null (allowed) or { status, message, retryMs }. Does not record anything.
+function chatLimitVerdict(userId, chars, hash) {
+    const now = Date.now();
+    const log = chatSendLog.get(userId) || [];
+    const factor = chatIsNewAccount(userId, now) ? CHAT_NEW_ACCOUNT_FACTOR : 1;
+    const burst = log.filter(e => now - e.ts < CHAT_BURST_WINDOW_MS);
+    if (burst.length >= CHAT_BURST_MAX) {
+        const retryMs = Math.max(1000, burst[0].ts + CHAT_BURST_WINDOW_MS - now);
+        return { status: 429, retryMs, message: `You're sending messages too fast. Please wait ${formatDuration(retryMs)}.` };
+    }
+    const need = Math.max(1, chars);
+    const minuteWait = chatRetryForBudget(log, 60 * 1000, Math.floor(CHAT_MINUTE_CHARS * factor), need, now);
+    const hourWait = chatRetryForBudget(log, 60 * 60 * 1000, Math.floor(CHAT_HOUR_CHARS * factor), need, now);
+    const wait = Math.max(minuteWait, hourWait);
+    if (wait > 0) {
+        return { status: 429, retryMs: wait, message: `You've sent a lot of text in a short time. Please wait ${formatDuration(wait)} before sending more.` };
+    }
+    if (hash && log.some(e => e.h === hash && now - e.ts < CHAT_DUPLICATE_WINDOW_MS)) {
+        return { status: 422, retryMs: 0, message: 'You already sent that a moment ago.' };
+    }
+    return null;
+}
+
+// stage 'pre'  : runs BEFORE the upload middleware - refuses accounts that are
+//                already over a limit without writing their files to disk.
+// stage 'post' : runs once the body (req.body.content) is parsed - charges the
+//                real text length. opts.dedupe = false for edits.
+function chatSendGuard(stage, opts) {
+    const dedupe = !(opts && opts.dedupe === false);
+    return (req, res, next) => {
+        if (!req.session || !req.session.userId || req.isAdmin) return next();
+        const userId = req.session.userId;
+        const content = stage === 'post' ? String((req.body && req.body.content) || '').trim() : '';
+        let hash = null;
+        if (stage === 'post' && dedupe && content.length >= CHAT_DUPLICATE_MIN_CHARS) {
+            hash = crypto.createHash('sha1').update(normalizePostText(content)).digest('hex');
+        }
+        const verdict = chatLimitVerdict(userId, stage === 'post' ? content.length : 0, hash);
+        if (verdict) {
+            if (req.files && req.files.length) cleanupAttachmentFiles(req.files.map(f => ({ path: f.path, name: f.originalname, size: f.size })));
+            if (verdict.retryMs) res.set('Retry-After', String(Math.ceil(verdict.retryMs / 1000)));
+            return res.status(verdict.status).json({ error: verdict.message, code: 'chat_rate_limited', retryAfterMs: verdict.retryMs });
+        }
+        if (stage === 'post') {
+            const log = chatSendLog.get(userId) || [];
+            log.push({ ts: Date.now(), chars: content.length, h: hash });
+            chatSendLog.set(userId, log.slice(-500));
+        }
+        next();
+    };
 }
 
 	const rateLimit = require('express-rate-limit');
@@ -10537,7 +10942,7 @@ app.post('/messages/:username/presence', (req, res) => {
     res.status(204).end();
 });
 
-app.post('/messages/:username/send', requireVerifiedForUpload, attachmentGate('json'), (req, res, next) => {
+app.post('/messages/:username/send', requireVerifiedForUpload, chatSendGuard('pre'), attachmentGate('json'), (req, res, next) => {
     uploadDM.array('attachments', MAX_FILES_DM)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `A file is too large - the limit is ${MAX_ATTACHMENT_MB} MB per file.`, code: 'upload_limit' });
@@ -10547,7 +10952,7 @@ app.post('/messages/:username/send', requireVerifiedForUpload, attachmentGate('j
         }
         next();
     });
-}, processAttachments('json'), (req, res) => {
+}, processAttachments('json'), chatSendGuard('post'), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const other = req.params.username;
@@ -10623,7 +11028,7 @@ app.post('/messages/:username/delete/:id', (req, res) => {
     });
 });
 
-app.post('/messages/:username/edit/:id', (req, res) => {
+app.post('/messages/:username/edit/:id', chatSendGuard('post', { dedupe: false }), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const msgId = parseInt(req.params.id);
@@ -11121,6 +11526,18 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="full-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>
 
+    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+        <h2>Read-only Mode</h2>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, nobody can register or export their data, and regular accounts can log in and read but can't post, send, edit, delete or change anything (a banner is shown on every page and text fields are removed). Admin / Head Admin / Owner accounts can still chat and use the admin tools. It stays on until it is ended here.</p>
+        <p style="margin-top:10px;">Status: <span id="read-only-status">${readOnlyModeEnabled ? '<span style="color:var(--danger-color);font-weight:700;">ON</span>' : '<span style="color:var(--success-color);font-weight:700;">OFF</span>'}</span></p>
+        ${req.isHeadAdmin ? `
+        <div class="action-row">
+            <button class="button" onclick="toggleReadOnlyMode(true)" style="width:140px;">Turn ON</button>
+            <button class="button" onclick="toggleReadOnlyMode(false)" style="width:140px;">Turn OFF</button>
+        </div>
+        <div id="read-only-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
+    </div>
+
     <div class="panel">
         <h2>Ban / Unban User</h2>
         <label>Username</label>
@@ -11372,6 +11789,25 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
     }
 
+    async function toggleReadOnlyMode(enable) {
+        if (enable && !confirm('Turn ON read-only mode? Regular accounts will be able to log in and read, but nothing else. Nobody can register or export data. Staff can still chat.')) return;
+        const result = document.getElementById('read-only-result');
+        result.className = ''; result.textContent = 'Updating...';
+        try {
+            const r = await fetch('/admin/read-only-mode', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ enabled: enable })
+            });
+            const d = await r.json();
+            if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
+            document.getElementById('read-only-status').innerHTML = d.enabled
+                ? '<span style=\"color:var(--danger-color);font-weight:700;\">ON</span>'
+                : '<span style=\"color:var(--success-color);font-weight:700;\">OFF</span>';
+            result.className = 'ok'; result.textContent = 'Saved. Reload to see the banner.';
+        } catch (e) { result.className = 'err'; result.textContent = 'Network error.'; }
+    }
+
     async function toggleRegistrationLockdown(active) {
         const result = document.getElementById('reg-lockdown-result');
         result.className = ''; result.textContent = 'Updating...';
@@ -11591,6 +12027,20 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         }
     }
 
+    // Used by both delete buttons below. If the server could not save an archive of the account it
+    // refuses (code archive_failed); we then ask twice and resend with skipArchive.
+    async function postDeleteWithArchiveFallback(url, payload, username) {
+        let res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        let data = await res.json();
+        if (!res.ok && data && data.code === 'archive_failed') {
+            if (!confirm('A copy of the data for @' + username + ' could NOT be saved, so the account was NOT deleted.\\n\\nDelete it WITHOUT an archive? The data will be gone for good and can never be emailed to the user.\\n\\n(Confirmation 1 of 2)')) return { res, data };
+            if (!confirm('Final confirmation (2 of 2): delete @' + username + ' with NO archive? This cannot be undone.')) return { res, data };
+            res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({}, payload, { skipArchive: true, confirmations: 2 })) });
+            data = await res.json();
+        }
+        return { res, data };
+    }
+
     async function submitDeleteAccount() {
         const username = document.getElementById('delete-username').value.trim();
         const reason = document.getElementById('delete-reason').value.trim();
@@ -11601,12 +12051,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
         resultEl.className = ''; resultEl.textContent = 'Working…';
         try {
-            const res = await fetch('/admin/delete-account/' + encodeURIComponent(username), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ reason })
-            });
-            const data = await res.json();
+            const { res, data } = await postDeleteWithArchiveFallback('/admin/delete-account/' + encodeURIComponent(username), { reason }, username);
             if (!res.ok) {
                 resultEl.className = 'err';
                 resultEl.textContent = 'Error: ' + (data.error || res.status);
@@ -11634,12 +12079,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
         resultEl.className = ''; resultEl.textContent = 'Working…';
         try {
-            const res = await fetch('/admin/delete-account-permanent/' + encodeURIComponent(username), {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ reason })
-            });
-            const data = await res.json();
+            const { res, data } = await postDeleteWithArchiveFallback('/admin/delete-account-permanent/' + encodeURIComponent(username), { reason }, username);
             if (!res.ok) {
                 resultEl.className = 'err';
                 resultEl.textContent = 'Error: ' + (data.error || res.status);
@@ -12094,6 +12534,19 @@ app.post('/admin/full-lockdown', requireAdmin, requireHeadAdmin, (req, res) => {
     res.json({ ok: true, enabled: fullLockdownEnabled });
 });
 
+// Read-only mode (see "Read-only mode" near isStaffUser). Any admin can read it;
+// only Owners/Head Admins can change it.
+app.get('/admin/read-only-mode', requireAdmin, (req, res) => {
+    res.json({ enabled: readOnlyModeEnabled });
+});
+
+app.post('/admin/read-only-mode', requireAdmin, requireHeadAdmin, (req, res) => {
+    const enabled = !!(req.body && req.body.enabled);
+    setReadOnlyMode(enabled);
+    logAudit(enabled ? 'read_only_mode_enabled' : 'read_only_mode_disabled', req.session.userUsername, null, null);
+    res.json({ ok: true, enabled: readOnlyModeEnabled });
+});
+
 // Posting timeouts handed out by the post-flood guard.
 app.get('/admin/post-timeouts', requireAdmin, (req, res) => {
     db.all(`SELECT username, expires_ts, reason FROM Post_Timeouts WHERE expires_ts > ? ORDER BY expires_ts DESC`, [Date.now()], (err, rows) => {
@@ -12223,7 +12676,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
     db.get(`SELECT id FROM User_Data WHERE username = ?`, [target], (errU, targetRow) => {
     if (errU) return res.status(500).json({ error: 'db error' });
     if (!targetRow) return res.status(404).json({ error: 'user not found' });
-    dxArchiveAccount(targetRow.id, reason, 'admin_delete').then(() => {
+    dxArchiveAccountOrSkip(targetRow.id, target, reason, 'admin_delete', allowNoArchive(req), req.session.userUsername).then(() => {
     db.run(
         `UPDATE User_Data SET avatar_path = ?, Nickname = ?, bio = ?, IsDeleted = 1, DeleteReason = ? WHERE username = ?`,
         ['public/Default.png', 'Account Deleted', '', reason, target],
@@ -12252,7 +12705,7 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
     );
     }).catch((archiveErr) => {
         console.error('Could not archive account data, account was NOT deleted:', archiveErr && archiveErr.stack || archiveErr);
-        res.status(500).json({ error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
+        res.status(500).json({ code: 'archive_failed', error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
     });
     });
 });
@@ -12267,16 +12720,49 @@ app.post('/admin/delete-account/:username', requireAdmin, (req, res) => {
 // gets Error('archive failed'). On success the callback's second argument is
 // the Data_Archives row, which is how a deleted user can still request a copy.
 function hardDeleteAccount(username, reason, callback) {
+    hardDeleteAccountEx(username, reason, {}, callback);
+}
+
+// "Delete without an archive" is only for when the archive CAN'T be written
+// (full disk, ...). The archive is always attempted first; with
+// opts.allowWithoutArchive the delete continues if it fails (callback gets a
+// null archive), otherwise it is refused with Error('archive failed').
+function hardDeleteAccountEx(username, reason, opts, callback) {
+    const allowWithoutArchive = !!(opts && opts.allowWithoutArchive);
     db.get(`SELECT id FROM User_Data WHERE username = ?`, [username], (err, row) => {
         if (err) return callback(err);
         if (!row) return callback(new Error('user not found'));
+        let archived = false;
         dxArchiveAccount(row.id, reason, 'permanent_delete').then((archive) => {
+            archived = true;
             hardDeleteAccountRows(username, reason, (err2) => callback(err2, archive));
         }).catch((archiveErr) => {
-            console.error('Could not archive account data, account was NOT deleted:', archiveErr && archiveErr.stack || archiveErr);
-            callback(new Error('archive failed'));
+            if (archived) { console.error('Hard delete error after archiving:', archiveErr && archiveErr.stack || archiveErr); return; }
+            console.error('Could not archive account data:', archiveErr && archiveErr.stack || archiveErr);
+            if (!allowWithoutArchive) return callback(new Error('archive failed'));
+            logAudit('account_delete_archive_skipped', 'System', username, 'archive could not be written; deleted without a copy after two confirmations');
+            hardDeleteAccountRows(username, reason, (err2) => callback(err2, null));
         });
     });
+}
+
+// True when the request explicitly asks to delete even if no archive can be
+// saved. The client only sends this after the person confirmed twice.
+function allowNoArchive(req) {
+    return !!(req.body && req.body.skipArchive === true && Number(req.body.confirmations) >= 2);
+}
+
+// Soft-delete version: resolves to the archive row, or null when it could not
+// be written and skipping was explicitly allowed. Throws otherwise.
+async function dxArchiveAccountOrSkip(userId, username, reason, trigger, allowSkip, actor) {
+    try {
+        return await dxArchiveAccount(userId, reason, trigger);
+    } catch (e) {
+        if (!allowSkip) throw e;
+        console.error('Could not archive account data, continuing WITHOUT an archive (confirmed twice):', e && e.stack || e);
+        logAudit('account_delete_archive_skipped', actor || 'System', username, 'archive could not be written; deleted without a copy after two confirmations');
+        return null;
+    }
 }
 
 function hardDeleteAccountRows(username, reason, callback) {
@@ -12363,10 +12849,10 @@ app.post('/admin/delete-account-permanent/:username', requireAdmin, requireHeadA
     if (target === req.session.userUsername) return res.status(400).json({ error: 'cannot delete your own account here - use the dashboard' });
     const reason = ((req.body && req.body.reason) || '').trim().substring(0, 500);
     if (!reason) return res.status(400).json({ error: 'a reason is required to delete an account' });
-    hardDeleteAccount(target, reason, (err) => {
+    hardDeleteAccountEx(target, reason, { allowWithoutArchive: allowNoArchive(req) }, (err) => {
         if (err) {
             if (err.message === 'user not found') return res.status(404).json({ error: 'user not found' });
-            if (err.message === 'archive failed') return res.status(500).json({ error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
+            if (err.message === 'archive failed') return res.status(500).json({ code: 'archive_failed', error: 'could not archive the account data first, so the account was NOT deleted (check the server log and free disk space in data/)' });
             console.error('Hard delete error:', err.message);
             return res.status(500).json({ error: 'db error' });
         }
@@ -14082,7 +14568,7 @@ app.get('/groups/:id/stream', (req, res) => {
     });
 });
 
-app.post('/groups/:id/send', requireVerifiedForUpload, attachmentGate('json'), (req, res, next) => {
+app.post('/groups/:id/send', requireVerifiedForUpload, chatSendGuard('pre'), attachmentGate('json'), (req, res, next) => {
     uploadGC.array('attachments', MAX_FILES_GC)(req, res, (err) => {
         if (err) {
             if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `A file is too large - the limit is ${MAX_ATTACHMENT_MB} MB per file.`, code: 'upload_limit' });
@@ -14092,7 +14578,7 @@ app.post('/groups/:id/send', requireVerifiedForUpload, attachmentGate('json'), (
         }
         next();
     });
-}, processAttachments('json'), (req, res) => {
+}, processAttachments('json'), chatSendGuard('post'), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const groupId = parseInt(req.params.id);
@@ -14166,7 +14652,7 @@ app.post('/groups/:id/delete/:msgId', (req, res) => {
     });
 });
 
-app.post('/groups/:id/edit/:msgId', (req, res) => {
+app.post('/groups/:id/edit/:msgId', chatSendGuard('post', { dedupe: false }), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const groupId = parseInt(req.params.id);
@@ -14909,6 +15395,7 @@ app.get('/api/v1/auth/config', (req, res) => {
     res.json({
         authApiAvailable: API_AUTH_AVAILABLE,
         captchaRequired: CAPTCHA_ENABLED,
+        codeLogin: true, // captcha-free login for terminals: one-time code from the dashboard -> POST /api/v1/auth/code-login
         turnstileSiteKey: CAPTCHA_ENABLED ? TURNSTILE_SITE_KEY : null,
         captchaWidgetUrl: CAPTCHA_ENABLED ? `${APP_BASE_URL}/captcha-widget` : null,
         registrationOpen: !getRegistrationBlockPage(),
@@ -15074,6 +15561,113 @@ app.post('/api/v1/auth/logout', (req, res) => {
         res.json({ ok: true });
     });
 });
+
+// ----- One-time client login codes (terminal clients, no captcha) -----
+// The password login above needs a Turnstile token, which only a browser can
+// produce. Instead, a logged-in user generates a one-time code on the website
+// (Dashboard > Terminal / client login) and types it into the terminal client,
+// which redeems it at POST /api/v1/auth/code-login for a normal session cookie.
+// The captcha isn't bypassed - it already happened when the user logged in on the
+// website, and a code can only be created from an authenticated, email-verified
+// session. Properties: works ONCE, only for the account that created it, expires
+// in 10 minutes, one active code per account (a new one replaces the old), high
+// entropy (12 chars from a 31-char alphabet, ~59 bits), stored only as a SHA-256
+// hash in memory (a restart just invalidates outstanding codes), redemption shares
+// the login rate limiter, and the account checks (banned / deleted / lockdown /
+// unverified email) run again at redemption time. Creation and use are audited.
+const CLIENT_CODE_TTL_MS = 10 * 60 * 1000;
+const CLIENT_CODE_LENGTH = 12;
+const CLIENT_CODE_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789'; // no 0/O/1/I/L lookalikes
+const clientLoginCodes = new Map(); // sha256(code) -> { userId, username, expiresAt }
+const clientCodeByUser = new Map(); // userId -> sha256(code) of their one active code
+
+function sha256Hex(s) { return crypto.createHash('sha256').update(String(s)).digest('hex'); }
+function newClientCode() {
+    let c = '';
+    for (let i = 0; i < CLIENT_CODE_LENGTH; i++) c += CLIENT_CODE_ALPHABET[crypto.randomInt(CLIENT_CODE_ALPHABET.length)];
+    return c;
+}
+function formatClientCode(c) { return c.replace(/(.{4})(?=.)/g, '$1-'); }
+function normalizeClientCode(input) { return String(input || '').toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 32); }
+function dropClientCode(hash) {
+    const e = clientLoginCodes.get(hash);
+    if (e && clientCodeByUser.get(e.userId) === hash) clientCodeByUser.delete(e.userId);
+    clientLoginCodes.delete(hash);
+}
+function purgeClientCodes() {
+    const now = Date.now();
+    for (const [hash, e] of clientLoginCodes) if (now > e.expiresAt) dropClientCode(hash);
+}
+setInterval(purgeClientCodes, 60 * 1000).unref();
+
+// Dashboard button -> JSON { code, expiresInMs }. JSON-only (a cross-site form can't
+// send it, and no CORS headers are set), per-account rate limited.
+const clientCodeCreateLimiter = rateLimitForAuth({
+    windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => 'u' + (req.session && req.session.userId),
+    message: { error: 'You generated too many codes. Please wait a few minutes.', code: 'rate_limited' }
+});
+app.post('/account/client-code', requireJSONBody, clientCodeCreateLimiter, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in' });
+    purgeClientCodes();
+    const old = clientCodeByUser.get(req.session.userId);
+    if (old) dropClientCode(old); // a new code replaces the previous one
+    const code = newClientCode();
+    const hash = sha256Hex(code);
+    clientLoginCodes.set(hash, { userId: req.session.userId, username: req.session.userUsername, expiresAt: Date.now() + CLIENT_CODE_TTL_MS });
+    clientCodeByUser.set(req.session.userId, hash);
+    logAudit('client_code_created', req.session.userUsername, req.session.userUsername, `from ${getClientIP(req)}`);
+    res.json({ code: formatClientCode(code), expiresInMs: CLIENT_CODE_TTL_MS });
+});
+
+// Terminal client -> session cookie. Same account checks and cookie as POST /api/v1/auth/login.
+app.post('/api/v1/auth/code-login', requireJSONBody, authLimiter, (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    const invalid = () => res.status(401).json({ error: 'That code is invalid or has expired. Generate a new one on the website.', code: 'invalid_code' });
+    const raw = normalizeClientCode(req.body.code);
+    if (raw.length !== CLIENT_CODE_LENGTH) return invalid();
+    const hash = sha256Hex(raw);
+    const entry = clientLoginCodes.get(hash);
+    if (!entry) return invalid();
+    const expired = Date.now() > entry.expiresAt;
+    dropClientCode(hash); // single use: consumed even if the account checks below refuse it
+    if (expired) return invalid();
+    try {
+        const user = getStmt(`SELECT * FROM User_Data WHERE id = ?`).get(entry.userId);
+        if (!user || user.IsDeleted) {
+            return res.status(403).json({ error: 'This account has been deleted.', code: 'account_deleted', reason: (user && user.DeleteReason) || 'No reason provided' });
+        }
+        if (user.IsBanned && user.BanExpiresAt && new Date(user.BanExpiresAt).getTime() <= Date.now()) {
+            clearExpiredBan(user.id);
+            user.IsBanned = 0;
+        }
+        if (user.IsBanned) {
+            return res.status(403).json({ error: 'This account is banned.', code: 'account_banned', reason: user.BanReason || 'No reason provided', expiresAt: user.BanExpiresAt || null });
+        }
+        if (fullLockdownEnabled && !isStaffUser(user)) {
+            return res.status(503).json({ error: 'Logins are temporarily paused.', code: 'lockdown' });
+        }
+        if (!user.email || !user.email_verified) {
+            return res.status(403).json({ error: 'Verify your email address first, then try again.', code: 'email_verification_required' });
+        }
+        req.session.regenerate((regenErr) => {
+            if (regenErr) {
+                console.error('Session regenerate error:', regenErr.message);
+                return res.status(500).json({ error: 'Something went wrong.', code: 'internal' });
+            }
+            req.session.userId = user.id;
+            req.session.userUsername = user.username;
+            recordLoginIP(user.id, user.username, getClientIP(req), 'login');
+            logAudit('client_code_login', user.username, user.username, `from ${getClientIP(req)}`);
+            return res.json({ ok: true, user: { username: user.username, nickname: user.Nickname || null } });
+        });
+    } catch (e) {
+        console.error('Client code login error:', e);
+        return res.status(500).json({ error: 'Something went wrong.', code: 'internal' });
+    }
+});
+// ----- end client login codes -----
 
 // Malformed JSON anywhere under /api gets a JSON error, not Express's HTML page.
 app.use('/api', (err, req, res, next) => {

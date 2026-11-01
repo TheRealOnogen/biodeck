@@ -114,7 +114,32 @@ const storage = multer.diskStorage({
     },
     filename: (req, file, cb) => cb(null, safeUploadFilename(file.originalname))
 });
-const MAX_FILE_SIZE = 90 * 1024 * 1024;
+// ----- Attachment limits (all overridable in vars.env) -----
+//   MAX_ATTACHMENT_MB             largest single attachment (default 25; was 90)
+//   MAX_MESSAGE_ATTACHMENTS_MB    all attachments of ONE post/message together (default 50)
+//   UPLOAD_QUOTA_MB_PER_USER      attachments a user may have stored at once, across
+//                                 posts + DMs + group chats (default 512, 0 = off).
+//                                 Deleting a post/message frees its share again.
+//   UPLOAD_MB_PER_DAY             attachment upload volume per user per rolling 24h
+//                                 (default 200, 0 = off; resets if the server restarts)
+//   UPLOAD_MIN_FREE_DISK_MB       refuse new attachments while the disk has less than
+//                                 this free (default 1024, 0 = off)
+//   ATTACHMENT_CONVERT_IMAGES     1/0 - re-encode JPG/PNG/GIF/TIFF uploads as WebP
+//                                 (default 1)
+//   ATTACHMENT_IMAGE_MAX_DIM      downscale still images larger than this many px on
+//                                 their longest side (default 4096)
+//   ATTACHMENT_WEBP_QUALITY       1-100 (default 82)
+const envNum = (name, def) => { const v = parseFloat(process.env[name]); return Number.isFinite(v) && v >= 0 ? v : def; };
+const MB = 1024 * 1024;
+const MAX_ATTACHMENT_MB = Math.max(1, envNum('MAX_ATTACHMENT_MB', 25));
+const MAX_FILE_SIZE = MAX_ATTACHMENT_MB * MB;
+const MAX_MESSAGE_ATTACHMENTS_BYTES = Math.max(MAX_FILE_SIZE, envNum('MAX_MESSAGE_ATTACHMENTS_MB', 50) * MB);
+const UPLOAD_QUOTA_BYTES = envNum('UPLOAD_QUOTA_MB_PER_USER', 512) * MB;
+const UPLOAD_DAILY_BYTES = envNum('UPLOAD_MB_PER_DAY', 200) * MB;
+const UPLOAD_MIN_FREE_BYTES = envNum('UPLOAD_MIN_FREE_DISK_MB', 1024) * MB;
+const ATTACHMENT_CONVERT_IMAGES = !['0', 'false', 'no', 'off'].includes(String(process.env.ATTACHMENT_CONVERT_IMAGES || '1').toLowerCase());
+const ATTACHMENT_IMAGE_MAX_DIM = Math.max(256, Math.round(envNum('ATTACHMENT_IMAGE_MAX_DIM', 4096)));
+const ATTACHMENT_WEBP_QUALITY = Math.min(100, Math.max(1, Math.round(envNum('ATTACHMENT_WEBP_QUALITY', 82))));
 const MAX_MSG_LENGTH = 4000;
 const MAX_POST_LENGTH = 1000;
 const MAX_BIO_LENGTH = 1000;
@@ -143,6 +168,175 @@ const uploadDM = makeMultiUpload(MAX_FILES_DM);
 const uploadGC = makeMultiUpload(MAX_FILES_GC);
 
 const MSG_IMAGE_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
+
+// ----- Attachment spam protection + compression -----
+// Every route that takes attachments (/feed/post, DM send, group send) runs:
+//   attachmentGate(kind)  BEFORE multer - cheap refusals that cost no disk writes:
+//        disk almost full, request obviously too big (Content-Length), no quota left
+//   (multer, per-file size cap)
+//   processAttachments(kind)  AFTER multer, on the real file sizes:
+//        per-message total, per-user stored total, per-user 24h volume,
+//        then JPG/PNG/GIF/TIFF -> WebP
+// Content-Length can be missing or lie, so the post-multer checks are the ones
+// that actually enforce; the pre-checks just save work in the normal case.
+const fmtMB = (bytes) => (bytes / MB >= 10 ? Math.round(bytes / MB) : Math.round(bytes / MB * 10) / 10) + ' MB';
+
+// Feed posts are sent with fetch() and the page only shows an error for 422/429
+// (anything else counts as "posted"), so the feed always answers 422 (429 = slow
+// down). DMs / group chats show the JSON error for any non-2xx.
+function rejectUpload(kind, req, res, status, message) {
+    if (kind === 'feed') return sendPostRejection(req, res, status === 429 ? 429 : 422, message);
+    return res.status(status).json({ error: message, code: 'upload_limit' });
+}
+function removeUploadedFiles(files) {
+    (files || []).forEach(f => { if (f && f.path) fs.unlink(f.path, () => {}); });
+}
+
+// Attachment bytes this user currently has stored (posts + DMs + group chats),
+// summed from the {path,name,size} entries kept in files_json. Attachments
+// from before sizes were recorded count as 0.
+function getUserAttachmentBytes(username) {
+    try {
+        let total = 0;
+        for (const sql of [
+            `SELECT COALESCE(SUM(CAST(json_extract(j.value, '$.size') AS INTEGER)), 0) AS b FROM Posts t, json_each(t.files_json) j WHERE t.username = ? AND t.files_json IS NOT NULL`,
+            `SELECT COALESCE(SUM(CAST(json_extract(j.value, '$.size') AS INTEGER)), 0) AS b FROM Messages t, json_each(t.files_json) j WHERE t.from_user = ? AND t.files_json IS NOT NULL`,
+            `SELECT COALESCE(SUM(CAST(json_extract(j.value, '$.size') AS INTEGER)), 0) AS b FROM Group_Chat_Messages t, json_each(t.files_json) j WHERE t.from_user = ? AND t.files_json IS NOT NULL`
+        ]) {
+            const row = getStmt(sql).get(username);
+            total += (row && row.b) || 0;
+        }
+        return total;
+    } catch (e) {
+        console.error('Attachment quota lookup failed (allowing the upload):', e.message);
+        return 0;
+    }
+}
+
+// Rolling 24h upload volume per user (in memory).
+const recentUploads = new Map(); // userId -> [{ t, bytes }]
+function recentUploadBytes(userId) {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const list = (recentUploads.get(userId) || []).filter(e => e.t > cutoff);
+    if (list.length) recentUploads.set(userId, list); else recentUploads.delete(userId);
+    return list.reduce((a, e) => a + e.bytes, 0);
+}
+function noteUploadBytes(userId, bytes) {
+    const list = recentUploads.get(userId) || [];
+    list.push({ t: Date.now(), bytes });
+    recentUploads.set(userId, list);
+}
+setInterval(() => { for (const id of [...recentUploads.keys()]) recentUploadBytes(id); }, 60 * 60 * 1000).unref();
+
+async function freeDiskBytes() {
+    try {
+        const st = await fs.promises.statfs(uploadsDir);
+        return Number(st.bavail) * Number(st.bsize);
+    } catch (e) { return null; } // statfs unavailable (old Node) - skip the check
+}
+
+function attachmentGate(kind) {
+    return async (req, res, next) => {
+        try {
+            const len = parseInt(req.headers['content-length'] || '0', 10) || 0;
+            // Text-only messages are tiny; only check bigger requests, so a full
+            // disk never blocks plain chatting.
+            if (len > 64 * 1024 || !len) {
+                if (UPLOAD_MIN_FREE_BYTES > 0) {
+                    const free = await freeDiskBytes();
+                    if (free !== null && free < UPLOAD_MIN_FREE_BYTES) {
+                        console.warn(`Attachment refused: only ${fmtMB(free)} free disk (UPLOAD_MIN_FREE_DISK_MB).`);
+                        return rejectUpload(kind, req, res, 503, 'Uploads are temporarily unavailable. Please try again later.');
+                    }
+                }
+            }
+            if (len > MAX_MESSAGE_ATTACHMENTS_BYTES + 256 * 1024) {
+                return rejectUpload(kind, req, res, 413, `That is too much to upload at once - the limit is ${fmtMB(MAX_MESSAGE_ATTACHMENTS_BYTES)} per ${kind === 'feed' ? 'post' : 'message'} (${MAX_ATTACHMENT_MB} MB per file).`);
+            }
+            if (len > 64 * 1024 && UPLOAD_QUOTA_BYTES > 0 && req.session && req.session.userUsername) {
+                if (getUserAttachmentBytes(req.session.userUsername) + len > UPLOAD_QUOTA_BYTES) {
+                    return rejectUpload(kind, req, res, 413, `You've reached your attachment storage limit (${fmtMB(UPLOAD_QUOTA_BYTES)}). Delete some old posts or messages with attachments to free up space.`);
+                }
+            }
+        } catch (e) {
+            console.error('attachmentGate error:', e.message);
+        }
+        next();
+    };
+}
+
+// Re-encodes a JPG/PNG/GIF/TIFF as WebP (metadata such as GPS location is
+// dropped, photo rotation is applied first, still images are capped at
+// ATTACHMENT_IMAGE_MAX_DIM px, animated GIFs become animated WebP). Anything it
+// can't or shouldn't convert - not really an image, corrupt, too big to decode
+// safely, already smaller, server busy - stays exactly as uploaded. It never
+// makes an upload fail. Updates the multer file object in place.
+const CONVERTIBLE_ATTACHMENT_EXTS = ['.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff'];
+const CONVERTIBLE_ATTACHMENT_FORMATS = ['jpeg', 'png', 'gif', 'tiff'];
+const ATTACHMENT_MAX_INPUT_PIXELS = 100 * 1000 * 1000; // decompression-bomb guard
+const ATTACHMENT_MAX_CONCURRENT_JOBS = 3;
+let attachmentConvertJobs = 0;
+async function convertAttachmentToWebp(f) {
+    if (!ATTACHMENT_CONVERT_IMAGES) return;
+    const origName = f.originalname || '';
+    const ext = path.extname(origName).toLowerCase();
+    if (!CONVERTIBLE_ATTACHMENT_EXTS.includes(ext)) return;
+    if (attachmentConvertJobs >= ATTACHMENT_MAX_CONCURRENT_JOBS) return; // busy: keep the original
+    attachmentConvertJobs++;
+    const outPath = f.path.replace(/\.[^.\\/]+$/, '') + '.webp';
+    try {
+        const meta = await sharp(f.path, { limitInputPixels: ATTACHMENT_MAX_INPUT_PIXELS, animated: true }).metadata();
+        if (!CONVERTIBLE_ATTACHMENT_FORMATS.includes(meta.format)) return; // judged by contents, not the filename
+        const animated = (meta.pages || 1) > 1;
+        let img = sharp(f.path, { limitInputPixels: ATTACHMENT_MAX_INPUT_PIXELS, animated });
+        if (!animated) {
+            img = img.rotate().resize({ width: ATTACHMENT_IMAGE_MAX_DIM, height: ATTACHMENT_IMAGE_MAX_DIM, fit: 'inside', withoutEnlargement: true });
+        }
+        await img.webp({ quality: ATTACHMENT_WEBP_QUALITY, effort: 3 }).toFile(outPath);
+        const outSize = (await fs.promises.stat(outPath)).size;
+        if (outSize >= f.size) { // not worth it (e.g. a tiny palette PNG) - keep the original
+            await fs.promises.unlink(outPath).catch(() => {});
+            return;
+        }
+        await fs.promises.unlink(f.path).catch(() => {});
+        f.path = outPath;
+        f.filename = path.basename(outPath);
+        f.size = outSize;
+        f.mimetype = 'image/webp';
+        f.originalname = path.basename(origName, path.extname(origName)) + '.webp';
+    } catch (e) {
+        await fs.promises.unlink(outPath).catch(() => {}); // half-written output, if any
+    } finally {
+        attachmentConvertJobs--;
+    }
+}
+
+function processAttachments(kind) {
+    return async (req, res, next) => {
+        const files = req.files || [];
+        if (!files.length) return next();
+        const userId = req.session && req.session.userId;
+        const username = req.session && req.session.userUsername;
+        const refuse = (status, message) => { removeUploadedFiles(files); req.files = []; return rejectUpload(kind, req, res, status, message); };
+        try {
+            const total = files.reduce((a, f) => a + (f.size || 0), 0);
+            if (total > MAX_MESSAGE_ATTACHMENTS_BYTES) {
+                return refuse(413, `Too much in one ${kind === 'feed' ? 'post' : 'message'} - ${fmtMB(MAX_MESSAGE_ATTACHMENTS_BYTES)} total (${MAX_ATTACHMENT_MB} MB per file).`);
+            }
+            if (UPLOAD_QUOTA_BYTES > 0 && username && getUserAttachmentBytes(username) + total > UPLOAD_QUOTA_BYTES) {
+                return refuse(413, `You've reached your attachment storage limit (${fmtMB(UPLOAD_QUOTA_BYTES)}). Delete some old posts or messages with attachments to free up space.`);
+            }
+            if (UPLOAD_DAILY_BYTES > 0 && userId && recentUploadBytes(userId) + total > UPLOAD_DAILY_BYTES) {
+                return refuse(429, `You've uploaded a lot in the last 24 hours (limit ${fmtMB(UPLOAD_DAILY_BYTES)}). Please try again later.`);
+            }
+            if (userId) noteUploadBytes(userId, total);
+            await Promise.all(files.map(f => convertAttachmentToWebp(f)));
+        } catch (e) {
+            console.error('processAttachments error:', e.message);
+        }
+        next();
+    };
+}
 
 // ----- Avatar compression -----
 // Avatars are never stored as uploaded. The raw upload lands in a private
@@ -4071,7 +4265,15 @@ function requireVerifiedForUpload(req, res, next) {
 //   DATA_EXPORT_MAX_EMAIL_MB     attach the archive up to this size, otherwise
 //                                email a download link instead (default 15)
 //   DATA_EXPORT_LINK_TTL_HOURS   how long such a link works (default 168 = 7d)
-//   DATA_EXPORT_MAX_PER_DAY      requests per account per rolling 24h (default 3)
+//   DATA_EXPORT_COOLDOWN_DAYS    one successful request per account (and per email
+//                                address) per this many days (default 7)
+//   DATA_EXPORT_MAX_SIZE_MB      largest single archive we'll build (default 1024)
+//   DATA_EXPORT_MAX_TOTAL_MB     stop accepting requests while the exports folder
+//                                holds this much (default 2048)
+//   DATA_EXPORT_UNLIMITED        1 = turn BOTH size limits above off, so exports can
+//                                be any size (default 0). The weekly limit stays.
+//   DATA_EXPORT_MAX_PER_DAY      cap on ATTEMPTS per account per rolling 24h; only
+//                                matters for retries after failures (default 3)
 // ============================================================================
 const zlib = require('zlib');
 
@@ -4082,6 +4284,15 @@ fs.mkdirSync(DATA_EXPORTS_DIR, { recursive: true, mode: 0o700 });
 const DATA_EXPORT_MAX_EMAIL_BYTES = Math.max(0.001, parseFloat(process.env.DATA_EXPORT_MAX_EMAIL_MB || '15')) * 1024 * 1024;
 const DATA_EXPORT_LINK_TTL_MS = Math.max(0.01, parseFloat(process.env.DATA_EXPORT_LINK_TTL_HOURS || '168')) * 60 * 60 * 1000;
 const DATA_EXPORT_MAX_PER_DAY = Math.max(1, parseInt(process.env.DATA_EXPORT_MAX_PER_DAY || '3', 10) || 3);
+const DATA_EXPORT_COOLDOWN_DAYS = Math.max(0.001, parseFloat(process.env.DATA_EXPORT_COOLDOWN_DAYS || '7') || 7);
+const DATA_EXPORT_COOLDOWN_MS = DATA_EXPORT_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+const DATA_EXPORT_UNLIMITED = ['1', 'true', 'yes', 'on'].includes(String(process.env.DATA_EXPORT_UNLIMITED || '').toLowerCase());
+const DATA_EXPORT_MAX_TOTAL_BYTES = Math.max(1, parseFloat(process.env.DATA_EXPORT_MAX_TOTAL_MB || '2048') || 2048) * 1024 * 1024;
+const DATA_EXPORT_MAX_SIZE_BYTES = Math.max(1, parseFloat(process.env.DATA_EXPORT_MAX_SIZE_MB || '1024') || 1024) * 1024 * 1024;
+function dxTooLargeError(bytes) {
+    const mb = (b) => (b / (1024 * 1024)).toFixed(b >= 10 * 1024 * 1024 ? 0 : 1) + ' MB';
+    return new DxUserError(`Your data is ${mb(bytes)}, which is over the ${mb(DATA_EXPORT_MAX_SIZE_BYTES)} export limit. Try again with fewer categories selected (for example, leave out DMs), or contact support.`);
+}
 const DATA_EXPORT_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
 const DATA_EXPORT_COOKIE = 'dx_token';
 
@@ -4111,6 +4322,41 @@ function dxRun(sql, params) {
 
 // An error whose message is safe to show to the person who made the request.
 class DxUserError extends Error {}
+
+// ----- Weekly limit -----
+// One request per account per DATA_EXPORT_COOLDOWN_DAYS (7). A request counts
+// unless it FAILED (a failed export produced nothing, so it shouldn't cost the
+// user their week; the per-day attempt cap still stops retry loops). The limit
+// follows the account AND the email address, so a deleted account's archive
+// request can't be used to get a second export, nor can two accounts that share
+// an address. The window is a parameter, the SQL text stays fixed.
+function dxWindowParam() { return '-' + Math.ceil(DATA_EXPORT_COOLDOWN_MS / 1000) + ' seconds'; }
+
+// created_at of the newest counted request inside the window, or null.
+async function dxLastCountedRequest(subject, email) {
+    const row = await dxGet(`SELECT MAX(created_at) AS last FROM Data_Export_Requests
+        WHERE status != 'failed' AND created_at > datetime('now', ?)
+        AND ((subject_type = ? AND subject_id = ?) OR lower(email) = lower(?))`,
+        [dxWindowParam(), subject.type, subject.id, email || '']);
+    return row && row.last ? row.last : null;
+}
+function dxNextAllowedAt(lastCreatedAt) {
+    if (!lastCreatedAt) return null;
+    const t = new Date(dxIso(lastCreatedAt)).getTime();
+    return Number.isFinite(t) ? new Date(t + DATA_EXPORT_COOLDOWN_MS) : null;
+}
+
+// Total size of the exports folder, so a flood of accounts can't fill the disk
+// even if each one stays within its own limit.
+function dxExportsDirBytes() {
+    let total = 0;
+    try {
+        for (const name of fs.readdirSync(DATA_EXPORTS_DIR)) {
+            try { total += fs.statSync(path.join(DATA_EXPORTS_DIR, name)).size; } catch (e) {}
+        }
+    } catch (e) {}
+    return total;
+}
 
 function dxMaskEmail(email) {
     const s = String(email || '');
@@ -4377,6 +4623,13 @@ class DxAttachments {
     }
 
     async commit(writer) {
+        if (!DATA_EXPORT_UNLIMITED) {
+            // Refuse BEFORE building a huge archive (media is already compressed,
+            // so the files' own sizes are a good estimate of the result).
+            let total = 0;
+            for (const entry of this.entries.values()) { try { total += fs.statSync(entry.abs).size; } catch (e) {} }
+            if (total > DATA_EXPORT_MAX_SIZE_BYTES) throw dxTooLargeError(total);
+        }
         for (const entry of this.entries.values()) {
             try {
                 await writer.addFile(entry.archiveName, entry.abs);
@@ -4817,6 +5070,7 @@ async function dxProcessJob(job) {
             await dxFilterArchive(src, categories, dest, a);
         }
         const size = fs.statSync(dest).size;
+        if (!DATA_EXPORT_UNLIMITED && size > DATA_EXPORT_MAX_SIZE_BYTES) throw dxTooLargeError(size);
         if (!mailTransporter) throw new DxUserError('Email isn\'t set up on this server right now.');
         const from = process.env.SMTP_FROM || process.env.SMTP_USER;
         const downloadName = `biodeck-data-${job.username}-${new Date().toISOString().slice(0, 10)}.tar.gz`;
@@ -6407,7 +6661,7 @@ app.get('/edit', (req, res) => {
                     body: JSON.stringify({ categories: cats })
                 });
                 var d = await r.json();
-                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not send the request.'; btn.disabled = !dxHasEmail; return; }
+                if (!r.ok) { resultEl.style.color = 'var(--danger-light-color)'; resultEl.textContent = d.error || 'Could not send the request.'; btn.disabled = !dxHasEmail || r.status === 429; return; }
                 resultEl.style.color = 'var(--accent-color)';
                 resultEl.textContent = 'Request received - your data will be emailed to ' + d.sentTo + ' shortly.';
                 loadDataExportHistory();
@@ -6435,8 +6689,15 @@ app.get('/edit', (req, res) => {
                     if (q.status === 'pending' || q.status === 'processing') active = true;
                 });
                 clearTimeout(dxPollTimer);
+                var waiting = d.nextRequestAt && new Date(d.nextRequestAt).getTime() > Date.now();
+                if (waiting) {
+                    var note = document.createElement('div');
+                    note.style.marginTop = '6px';
+                    note.textContent = 'You can request your data once every ' + d.cooldownDays + ' days. Next request available ' + new Date(d.nextRequestAt).toLocaleString() + '.';
+                    el.appendChild(note);
+                }
                 if (active) { btn.disabled = true; dxPollTimer = setTimeout(loadDataExportHistory, 3000); }
-                else btn.disabled = !dxHasEmail;
+                else btn.disabled = !dxHasEmail || !!waiting;
             } catch (e) {}
         }
         loadDataExportHistory();
@@ -6612,11 +6873,38 @@ app.post('/account/data-export', async (req, res) => {
 
         const busy = await dxGet(`SELECT COUNT(*) AS c FROM Data_Export_Requests WHERE subject_type = ? AND subject_id = ? AND status IN ('pending', 'processing')`, [subject.type, subject.id]);
         if (busy.c > 0) return res.status(429).json({ error: 'A previous request is still being prepared. Please wait for it to arrive first.' });
-        const recent = await dxGet(`SELECT COUNT(*) AS c FROM Data_Export_Requests WHERE subject_type = ? AND subject_id = ? AND created_at > datetime('now', '-1 day')`, [subject.type, subject.id]);
-        if (recent.c >= DATA_EXPORT_MAX_PER_DAY) return res.status(429).json({ error: `You can request your data up to ${DATA_EXPORT_MAX_PER_DAY} times per day. Please try again later.` });
+        const refuseCooldown = (lastCreatedAt) => {
+            const next = dxNextAllowedAt(lastCreatedAt) || new Date(Date.now() + DATA_EXPORT_COOLDOWN_MS);
+            res.set('Retry-After', String(Math.max(1, Math.ceil((next.getTime() - Date.now()) / 1000))));
+            return res.status(429).json({
+                error: `You can request your data once every ${DATA_EXPORT_COOLDOWN_DAYS} days. You can request it again on ${next.toUTCString()}.`,
+                code: 'export_cooldown', nextRequestAt: next.toISOString()
+            });
+        };
+        const last = await dxLastCountedRequest(subject, email);
+        if (last) return refuseCooldown(last);
 
-        const ins = await dxRun(`INSERT INTO Data_Export_Requests (subject_type, subject_id, username, email, categories) VALUES (?, ?, ?, ?, ?)`,
-            [subject.type, subject.id, username, email, categories.join(',')]);
+        const recent = await dxGet(`SELECT COUNT(*) AS c FROM Data_Export_Requests WHERE subject_type = ? AND subject_id = ? AND created_at > datetime('now', '-1 day')`, [subject.type, subject.id]);
+        if (recent.c >= DATA_EXPORT_MAX_PER_DAY) return res.status(429).json({ error: `You can try to request your data up to ${DATA_EXPORT_MAX_PER_DAY} times per day. Please try again later.` });
+
+        if (!DATA_EXPORT_UNLIMITED && dxExportsDirBytes() >= DATA_EXPORT_MAX_TOTAL_BYTES) {
+            console.warn('Data export refused: exports folder is at its size cap (DATA_EXPORT_MAX_TOTAL_MB).');
+            return res.status(503).json({ error: 'Data exports are temporarily unavailable. Please try again later.', code: 'export_storage_full' });
+        }
+
+        // Check-and-insert in ONE statement. Several awaits sit between the
+        // checks above and here, so two simultaneous requests could both have
+        // passed them; SQLite runs this single statement atomically, so only one
+        // of them gets a row.
+        const ins = await dxRun(`INSERT INTO Data_Export_Requests (subject_type, subject_id, username, email, categories)
+            SELECT ?, ?, ?, ?, ?
+            WHERE NOT EXISTS (
+                SELECT 1 FROM Data_Export_Requests
+                WHERE status != 'failed' AND created_at > datetime('now', ?)
+                AND ((subject_type = ? AND subject_id = ?) OR lower(email) = lower(?))
+            )`,
+            [subject.type, subject.id, username, email, categories.join(','), dxWindowParam(), subject.type, subject.id, email]);
+        if (!ins.changes) return refuseCooldown(await dxLastCountedRequest(subject, email));
         logAudit('data_export_requested', username, username, categories.join(','));
         dxKickQueue();
         res.json({ ok: true, id: ins.lastID, sentTo: dxMaskEmail(email) });
@@ -6632,7 +6920,12 @@ app.get('/account/data-export/requests', async (req, res) => {
     try {
         const rows = await dxAll(`SELECT id, categories, status, delivery, error, created_at, completed_at FROM Data_Export_Requests
             WHERE subject_type = 'user' AND subject_id = ? ORDER BY id DESC LIMIT 5`, [req.session.userId]);
+        const me = await dxGet(`SELECT email FROM User_Data WHERE id = ?`, [req.session.userId]);
+        const last = await dxLastCountedRequest({ type: 'user', id: req.session.userId }, me && me.email);
+        const next = dxNextAllowedAt(last);
         res.json({
+            cooldownDays: DATA_EXPORT_COOLDOWN_DAYS,
+            nextRequestAt: next ? next.toISOString() : null,
             requests: rows.map(r => ({
                 id: r.id,
                 categories: r.categories.split(',').map(k => (DATA_EXPORT_CATEGORIES.find(c => c.key === k) || { label: k }).label),
@@ -7591,9 +7884,10 @@ const postRateLimiter = rateLimit({
         sendPostRejection(req, res, 429, "You're posting too fast. Please slow down.");
     }
 });
-app.post('/feed/post', postRateLimiter, requireVerifiedForUpload, postFloodGuard, (req, res, next) => {
+app.post('/feed/post', postRateLimiter, requireVerifiedForUpload, postFloodGuard, attachmentGate('feed'), (req, res, next) => {
     uploadFeed.array('attachments', MAX_FILES_FEED)(req, res, (err) => {
         if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') return sendPostRejection(req, res, 422, `A file is too large - the limit is ${MAX_ATTACHMENT_MB} MB per file.`);
             const backTo = req.body && req.body.reply_to ? `/post/${parseInt(req.body.reply_to)}` : '/feed';
             if (err.code === 'LIMIT_FILE_COUNT') return res.redirect(`${backTo}?posterror=files`);
             if (err.code === 'FILE_TYPE_BLOCKED') return res.redirect(`${backTo}?posterror=filetype`);
@@ -7601,7 +7895,7 @@ app.post('/feed/post', postRateLimiter, requireVerifiedForUpload, postFloodGuard
         }
         next();
     });
-}, (req, res) => {
+}, processAttachments('feed'), (req, res) => {
     if (!req.session.userId) return res.redirect('/');
 
     const { content, reply_to } = req.body;
@@ -9956,16 +10250,17 @@ app.post('/messages/:username/presence', (req, res) => {
     res.status(204).end();
 });
 
-app.post('/messages/:username/send', requireVerifiedForUpload, (req, res, next) => {
+app.post('/messages/:username/send', requireVerifiedForUpload, attachmentGate('json'), (req, res, next) => {
     uploadDM.array('attachments', MAX_FILES_DM)(req, res, (err) => {
         if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `A file is too large - the limit is ${MAX_ATTACHMENT_MB} MB per file.`, code: 'upload_limit' });
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_DM} per message.` });
             if (err.code === 'FILE_TYPE_BLOCKED') return res.status(400).json({ error: err.message });
             return res.status(400).json({ error: 'Upload failed.' });
         }
         next();
     });
-}, (req, res) => {
+}, processAttachments('json'), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const other = req.params.username;
@@ -13468,16 +13763,17 @@ app.get('/groups/:id/stream', (req, res) => {
     });
 });
 
-app.post('/groups/:id/send', requireVerifiedForUpload, (req, res, next) => {
+app.post('/groups/:id/send', requireVerifiedForUpload, attachmentGate('json'), (req, res, next) => {
     uploadGC.array('attachments', MAX_FILES_GC)(req, res, (err) => {
         if (err) {
+            if (err.code === 'LIMIT_FILE_SIZE') return res.status(413).json({ error: `A file is too large - the limit is ${MAX_ATTACHMENT_MB} MB per file.`, code: 'upload_limit' });
             if (err.code === 'LIMIT_FILE_COUNT') return res.status(400).json({ error: `Too many files - max ${MAX_FILES_GC} per message.` });
             if (err.code === 'FILE_TYPE_BLOCKED') return res.status(400).json({ error: err.message });
             return res.status(400).json({ error: 'Upload failed.' });
         }
         next();
     });
-}, (req, res) => {
+}, processAttachments('json'), (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
     const me = req.session.userUsername;
     const groupId = parseInt(req.params.id);

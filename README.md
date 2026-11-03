@@ -10,9 +10,14 @@ Biodeck is a twitter like social media website, but open source and just better
 - better-sqlite3
 - dotenv
 - nodemailer
+- bcrypt
+- multer
+- sharp
+- mailparser
 
 ## How it works
-- ``server.js``: Server
+- ``server.js``: Main server
+- ``src``: Modules
 - ``html files``: HTML files
 - ``vars.env``: Environment variables (for nodemailer, rename vars.env.public to vars.env and put your info in it)
 - ``activation-pings.txt``: Users that will be pinged on user creation (When registration gate is on)

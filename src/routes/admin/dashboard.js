@@ -14,6 +14,7 @@ const {
     LOCKDOWN_REG_MAX,
     LOCKDOWN_REG_WINDOW_MS,
     getRegistrationLockdownLeftMs,
+    isRegistrationLockdownIndefinite,
 } = require('../../site-state');
 const { formatDuration } = require('../../util');
 const siteState = require('../../site-state');
@@ -110,10 +111,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
 
     <div class="panel" style="border-color:rgba(255,255,255,0.2);">
         <h2>Registration Lockdown</h2>
-        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Starts automatically when ${LOCKDOWN_REG_MAX} accounts are created within ${LOCKDOWN_REG_WINDOW_MS / 1000} seconds. While active, <strong>nobody</strong> can register (even with the gate OFF) for ${LOCKDOWN_DURATION_MS / 3600000} hours or until it is ended here.</p>
-        <p style="margin-top:10px;">Status: <span id="reg-lockdown-status">${getRegistrationLockdownLeftMs() > 0 ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ends in about ' + escapeHTML(formatDuration(getRegistrationLockdownLeftMs())) : '<span style="color:var(--success-color);font-weight:700;">Not active</span>'}</span></p>
+        <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Starts automatically when ${LOCKDOWN_REG_MAX} accounts are created within ${LOCKDOWN_REG_WINDOW_MS / 1000} seconds. While active, <strong>nobody</strong> can register (even with the gate OFF) for ${LOCKDOWN_DURATION_MS / 3600000} hours (automatic start) or until it is ended here. A manual start has no time limit unless you enter hours.</p>
+        <p style="margin-top:10px;">Status: <span id="reg-lockdown-status">${getRegistrationLockdownLeftMs() > 0 ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ' + (isRegistrationLockdownIndefinite() ? 'until you end it' : 'ends in about ' + escapeHTML(formatDuration(getRegistrationLockdownLeftMs()))) : '<span style="color:var(--success-color);font-weight:700;">Not active</span>'}</span></p>
         ${req.isHeadAdmin ? `
         <div class="action-row">
+            <input id="reg-lockdown-hours" type="number" min="1" max="720" step="any" placeholder="Hours (empty = no limit)" style="width:190px;">
             <button class="button" onclick="toggleRegistrationLockdown(true)" style="width:140px;">Start lockdown</button>
             <button class="button" onclick="toggleRegistrationLockdown(false)" style="width:140px;">End lockdown</button>
         </div>
@@ -421,12 +423,12 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
             const r = await fetch('/admin/registration-lockdown', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ active: active })
+                body: JSON.stringify({ active: active, hours: document.getElementById('reg-lockdown-hours').value })
             });
             const d = await r.json();
             if (!r.ok) { result.className = 'err'; result.textContent = d.error || 'Error.'; return; }
             document.getElementById('reg-lockdown-status').innerHTML = d.active
-                ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ends in about ' + Math.ceil(d.leftMs / 60000) + ' minutes'
+                ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ' + (d.indefinite ? 'until you end it' : 'ends in about ' + Math.ceil(d.leftMs / 60000) + ' minutes')
                 : '<span style="color:var(--success-color);font-weight:700;">Not active</span>';
             result.className = 'ok'; result.textContent = 'Saved.';
             setTimeout(() => { result.textContent = ''; }, 1500);

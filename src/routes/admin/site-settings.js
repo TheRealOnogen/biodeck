@@ -5,7 +5,8 @@ const { db } = require('../../db/connection');
 const { logAudit } = require('../../moderation');
 const { postAttemptLog } = require('../../security/post-spam');
 const {
-    LOCKDOWN_DURATION_MS,
+    LOCKDOWN_INDEFINITE,
+    isRegistrationLockdownIndefinite,
     getRegistrationLockdownLeftMs,
     setFullLockdown,
     setReadOnlyMode,
@@ -33,16 +34,21 @@ app.post('/admin/registration-gate', requireAdmin, requireHeadAdmin, (req, res) 
 // LOCKDOWN_REG_WINDOW_MS.
 app.get('/admin/registration-lockdown', requireAdmin, (req, res) => {
     const leftMs = getRegistrationLockdownLeftMs();
-    res.json({ active: leftMs > 0, until: leftMs > 0 ? new Date(siteState.registrationLockdownUntil).toISOString() : null, leftMs });
+    const indefinite = leftMs > 0 && isRegistrationLockdownIndefinite();
+    res.json({ active: leftMs > 0, indefinite, until: leftMs > 0 && !indefinite ? new Date(siteState.registrationLockdownUntil).toISOString() : null, leftMs });
 });
 
 app.post('/admin/registration-lockdown', requireAdmin, requireHeadAdmin, (req, res) => {
     const active = !!(req.body && req.body.active);
-    setRegistrationLockdown(active ? Date.now() + LOCKDOWN_DURATION_MS : 0);
+    // Optional "hours": without it a manual lockdown stays on until it is ended.
+    const hours = parseFloat(req.body && req.body.hours);
+    const timed = Number.isFinite(hours) && hours > 0;
+    const hoursClamped = Math.min(hours, 24 * 30);
+    setRegistrationLockdown(active ? (timed ? Date.now() + hoursClamped * 3600000 : LOCKDOWN_INDEFINITE) : 0);
     logAudit(active ? 'registration_lockdown_started' : 'registration_lockdown_ended', req.session.userUsername, null,
-        active ? `manual, ${LOCKDOWN_DURATION_MS / 3600000}h` : 'ended manually');
+        active ? (timed ? `manual, ${hoursClamped}h` : 'manual, no time limit') : 'ended manually');
     const leftMs = getRegistrationLockdownLeftMs();
-    res.json({ ok: true, active: leftMs > 0, leftMs });
+    res.json({ ok: true, active: leftMs > 0, indefinite: leftMs > 0 && isRegistrationLockdownIndefinite(), leftMs });
 });
 
 // Full lockdown (register + login off, existing sessions unaffected, staff can still log in).

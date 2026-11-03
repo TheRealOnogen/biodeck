@@ -25,7 +25,9 @@ function setRegistrationGateEnabled(enabled, cb) {
 // 1. Registration lockdown
 const LOCKDOWN_REG_MAX = 10;
 const LOCKDOWN_REG_WINDOW_MS = 60 * 1000;
-const LOCKDOWN_DURATION_MS = 3 * 60 * 60 * 1000;
+const LOCKDOWN_DURATION_MS = 3 * 60 * 60 * 1000; // used by the automatic spike lockdown
+// Manual lockdowns have no end time unless one is given: "until" is set to the max Date value.
+const LOCKDOWN_INDEFINITE = 8.64e15;
 
 // Epoch ms the lockdown ends at (0 / in the past = not locked down).
 let registrationLockdownUntil = 0;
@@ -34,6 +36,10 @@ function loadRegistrationLockdown() {
     db.get(`SELECT value FROM Settings WHERE key = 'registration_lockdown_until'`, (err, row) => {
         if (!err && row) registrationLockdownUntil = parseInt(row.value, 10) || 0;
     });
+}
+
+function isRegistrationLockdownIndefinite() {
+    return registrationLockdownUntil >= LOCKDOWN_INDEFINITE;
 }
 
 function getRegistrationLockdownLeftMs() {
@@ -48,8 +54,9 @@ function setRegistrationLockdown(untilTs) {
 }
 
 function renderLockdownPage(leftMs) {
+    const when = isRegistrationLockdownIndefinite() ? 'later' : `in about ${escapeHTML(formatDuration(leftMs))}`;
     return renderMessagePage('Registration paused', 'Registration is temporarily disabled',
-        `<h3>We noticed an unusual spike in signups, so new registrations are paused for now. Please try again in about ${escapeHTML(formatDuration(leftMs))}.</h3><br><br>
+        `<h3>We noticed an unusual spike in signups, so new registrations are paused for now. Please try again ${when}.</h3><br><br>
         <button type="button" class="button" style="width: 150px" onclick="window.location.href='/';">Back to login</button>`);
 }
 
@@ -60,7 +67,7 @@ function registrationLockdownGuard(req, res, next) {
     const page = getRegistrationBlockPage();
     if (!page) return next();
     const left = getRegistrationLockdownLeftMs();
-    if (!fullLockdownEnabled && left) res.set('Retry-After', String(Math.ceil(left / 1000)));
+    if (!fullLockdownEnabled && left && !isRegistrationLockdownIndefinite()) res.set('Retry-After', String(Math.ceil(left / 1000)));
     return res.status(503).send(page);
 }
 
@@ -163,6 +170,8 @@ function checkRegistrationLockdownTrigger() {
 
 module.exports = {
     LOCKDOWN_DURATION_MS,
+    LOCKDOWN_INDEFINITE,
+    isRegistrationLockdownIndefinite,
     LOCKDOWN_REG_MAX,
     LOCKDOWN_REG_WINDOW_MS,
     READ_ONLY_MESSAGE,

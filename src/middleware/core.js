@@ -5,9 +5,23 @@ const fs = require('fs');
 const { app } = require('../app');
 const { db } = require('../db/connection');
 const { ROOT_DIR } = require('../paths');
+const { getClientIP } = require('../security/ip');
 const { sessionMiddleware } = require('../session');
 const { FALLBACK_THEME, getThemeByName, resolveThemeCSSPath } = require('../themes');
 const { serveUpload } = require('../uploads/access');
+
+// Logs every request once the response is sent: time, IP, method, URL, status, duration, user.
+// Query strings are cut off so tokens and codes in URLs never end up in the log.
+app.use((req, res, next) => {
+    const started = process.hrtime.bigint();
+    res.on('finish', () => {
+        const ms = Number(process.hrtime.bigint() - started) / 1e6;
+        const user = (req.session && req.session.userUsername) || '-';
+        const url = req.originalUrl.split('?')[0];
+        console.log(`[${new Date().toISOString()}] ${getClientIP(req)} ${req.method} ${url} ${res.statusCode} ${ms.toFixed(1)}ms user=${user}`);
+    });
+    next();
+});
 
 app.use(express.urlencoded({extended:true}))
 app.use(express.json())

@@ -115,9 +115,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <p style="margin-top:10px;">Status: <span id="reg-lockdown-status">${getRegistrationLockdownLeftMs() > 0 ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ' + (isRegistrationLockdownIndefinite() ? 'until you end it' : 'ends in about ' + escapeHTML(formatDuration(getRegistrationLockdownLeftMs()))) : '<span style="color:var(--success-color);font-weight:700;">Not active</span>'}</span></p>
         ${req.isHeadAdmin ? `
         <div class="action-row">
-            <input id="reg-lockdown-hours" type="number" min="1" max="720" step="any" placeholder="Hours (empty = no limit)" style="width:190px;">
-            <button class="button" onclick="toggleRegistrationLockdown(true)" style="width:140px;">Start lockdown</button>
-            <button class="button" onclick="toggleRegistrationLockdown(false)" style="width:140px;">End lockdown</button>
+            <input type="text" min="1" max="720" step="any" placeholder="Hours (empty = no limit)" id="reg-lockdown-hours" style="border-radius: 20px; height: 30px;"><br>
+        </div>
+        <div class="action-row">
+          <button class="button" onclick="toggleRegistrationLockdown(true)" style="width:140px;">Start lockdown</button>
+          <button class="button" onclick="toggleRegistrationLockdown(false)" style="width:140px;">End lockdown</button>
         </div>
         <div id="reg-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>

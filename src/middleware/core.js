@@ -5,6 +5,8 @@ const fs = require('fs');
 const { app } = require('../app');
 const { db } = require('../db/connection');
 const { ROOT_DIR } = require('../paths');
+const { getStmt } = require('../db/connection');
+const { sendToUser, broadcast } = require('../live/websocket');
 const { getClientIP } = require('../security/ip');
 const { sessionMiddleware } = require('../session');
 const { FALLBACK_THEME, getThemeByName, resolveThemeCSSPath } = require('../themes');
@@ -19,6 +21,19 @@ app.use((req, res, next) => {
         const user = (req.session && req.session.userUsername) || '-';
         const url = req.originalUrl.split('?')[0];
         console.log(`[${new Date().toISOString()}] ${getClientIP(req)} ${req.method} ${url} ${res.statusCode} ${ms.toFixed(1)}ms user=${user}`);
+    });
+    next();
+});
+
+// After a successful change, tell open pages over the WebSocket so they refresh.
+const FEED_CHANGE_PATH = /^\/(feed|post|admin|api\/v1\/post|account\/delete-self)(\/|$)/;
+app.use((req, res, next) => {
+    if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return next();
+    res.on('finish', () => {
+        if (res.statusCode >= 400) return;
+        const url = req.originalUrl.split('?')[0];
+        if (FEED_CHANGE_PATH.test(url)) broadcast('feed');
+        if (url.startsWith('/notifications/') && req.session) sendToUser(req.session.userUsername, 'notifications');
     });
     next();
 });
@@ -50,6 +65,28 @@ app.get('/uploads/:filename', (req, res) => serveUpload(req, res, false));
 const TRUST_PROXY_HOPS = Math.max(0, parseInt(process.env.TRUST_PROXY_HOPS || '1', 10) || 0);
 app.set('trust proxy', TRUST_PROXY_HOPS);
 app.use(sessionMiddleware);
+
+// Pages with Report buttons get the user's existing reports inline, so the browser never has to
+// ask /api/my-reports for them.
+app.use((req, res, next) => {
+    if (req.method !== 'GET' || !req.session || !req.session.userUsername) return next();
+    const send = res.send;
+    res.send = function (body) {
+        const marker = '<script>\nfunction reportContent(';
+        if (typeof body === 'string' && body.includes(marker)) {
+            try {
+                const rows = getStmt(`SELECT source_type, source_id FROM Reports WHERE reporter_username = ?`)
+                    .all(req.session.userUsername);
+                const json = JSON.stringify(rows.map(r => [r.source_type, r.source_id])).replace(/</g, '\\u003c');
+                body = body.replace(marker, () => `<script>window.__reported = ${json};</script>\n${marker}`);
+            } catch (e) {
+                console.error('Reported-state inject error:', e.message);
+            }
+        }
+        return send.call(this, body);
+    };
+    next();
+});
 
 // Basic hardening headers.
 app.use((req, res, next) => {

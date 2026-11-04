@@ -365,10 +365,13 @@ ${ATTACH_STYLE_BLOCK}
                 .catch(() => {});
         }
 
-        setInterval(pollFeed, 4000);
-        setInterval(pollDeletions, 5000);
-        setInterval(pollReplyCounts, 5000);
-        setInterval(pollEdits, 5000);
+        // Refresh when the server announces a change (WebSocket), or on a timer if it is down.
+        document.addEventListener('DOMContentLoaded', () => {
+            livePoll('feed', pollFeed, 4000);
+            livePoll('feed', pollDeletions, 5000);
+            livePoll('feed', pollReplyCounts, 5000);
+            livePoll('feed', pollEdits, 5000);
+        });
         document.addEventListener('visibilitychange', () => { if (!document.hidden) { pollFeed(); pollDeletions(); pollReplyCounts(); pollEdits(); } });
 
         let oldestPostId = ${oldestPostId};

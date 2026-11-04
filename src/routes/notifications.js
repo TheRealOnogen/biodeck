@@ -74,7 +74,7 @@ app.get('/notifications', (req, res) => {
             if (ts) el.textContent = new Date(ts).toLocaleString('en-GB');
         });
         let lastId = ${newestId};
-        setInterval(() => {
+        document.addEventListener('DOMContentLoaded', () => livePoll('notifications', () => {
             fetch('/notifications/poll?after=' + lastId)
                 .then(r => r.json())
                 .then(d => {
@@ -88,7 +88,7 @@ app.get('/notifications', (req, res) => {
                     }
                 })
                 .catch(() => {});
-        }, 4000);
+        }, 4000));
 
         document.getElementById('notif-items').addEventListener('click', e => {
             if (e.target.closest('a')) return;

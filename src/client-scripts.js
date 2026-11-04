@@ -79,7 +79,52 @@ const SOUND_SCRIPT = `<script>
 })();
 <\/script>`;
 
-const NOTIF_BADGE_SCRIPT = `<script>
+// Page side of the WebSocket: livePoll(type, fn, ms) runs fn when the server says "type" changed,
+// and falls back to plain polling every ms while the socket is down.
+const LIVE_SCRIPT = `<script>
+(function() {
+    var handlers = {};
+    var open = false;
+    var everOpen = false;
+    var delay = 1000;
+    function run(type) {
+        (handlers[type] || []).forEach(function(fn) { try { fn(); } catch (e) {} });
+    }
+    function runAll() { Object.keys(handlers).forEach(run); }
+    function connect() {
+        var ws;
+        try {
+            ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws');
+        } catch (e) { return; }
+        ws.onopen = function() {
+            open = true;
+            delay = 1000;
+            if (everOpen) runAll(); // catch up on anything missed while disconnected
+            everOpen = true;
+        };
+        ws.onmessage = function(e) {
+            var m;
+            try { m = JSON.parse(e.data); } catch (_) { return; }
+            if (m && m.t) run(m.t);
+        };
+        ws.onclose = function() {
+            open = false;
+            setTimeout(connect, delay);
+            delay = Math.min(delay * 2, 30000);
+        };
+        ws.onerror = function() { try { ws.close(); } catch (_) {} };
+    }
+    window.livePoll = function(type, fn, ms) {
+        (handlers[type] = handlers[type] || []).push(fn);
+        setInterval(function() { if (!open) fn(); }, ms);
+    };
+    // Slow safety refresh for changes the server cannot announce (background cleanups).
+    setInterval(function() { if (open && !document.hidden) runAll(); }, 60000);
+    connect();
+})();
+<\/script>`;
+
+const NOTIF_BADGE_SCRIPT = LIVE_SCRIPT + `<script>
 (function() {
     var lastNotifCount = null;
     var resync = false; // next poll only re-baselines the count, no sound
@@ -114,7 +159,7 @@ const NOTIF_BADGE_SCRIPT = `<script>
             .catch(function() {});
     }
     updateNotifBadges();
-    setInterval(updateNotifBadges, 8000);
+    livePoll('notifications', updateNotifBadges, 8000);
     // After the page wakes up, re-read the count silently instead of treating the
     // jump since the last poll as a brand-new notification.
     window.addEventListener('biodeck:wake', function() { resync = true; updateNotifBadges(); });
@@ -151,6 +196,7 @@ function reportContent(type, id, btn) {
             }
             return;
         }
+        if (reportedKeys) reportedKeys[type + ':' + id] = 1;
         if (btn) btn.textContent = 'Reported';
     }).catch(function() {
         alert('Network error.');
@@ -162,19 +208,37 @@ function reportContent(type, id, btn) {
         }
     });
 }
+// The already-reported list comes from the server inside the page (see middleware/core.js);
+// only if that is missing is it fetched, once. Later DOM changes just re-apply it.
+var reportedKeys = null;
+var reportedLoading = false;
+function markReportButtons() {
+    if (!reportedKeys) return;
+    document.querySelectorAll('.report-action').forEach(function(btn) {
+        if (btn.dataset.reported === '1') return;
+        if (!reportedKeys[btn.dataset.reportType + ':' + btn.dataset.reportId]) return;
+        btn.dataset.reported = '1';
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+        btn.textContent = 'Reported';
+    });
+}
 function applyReportedState() {
+    if (reportedKeys) return markReportButtons();
+    if (window.__reported) { // filled in by the server, so no request is needed
+        reportedKeys = {};
+        window.__reported.forEach(function(r) { reportedKeys[r[0] + ':' + r[1]] = 1; });
+        return markReportButtons();
+    }
+    if (reportedLoading) return;
+    reportedLoading = true;
     fetch('/api/my-reports').then(function(r) { return r.ok ? r.json() : null; }).then(function(data) {
+        reportedLoading = false;
         if (!data || !data.reports) return;
-        data.reports.forEach(function(r) {
-            document.querySelectorAll('.report-action[data-report-type="' + r.type + '"][data-report-id="' + r.id + '"]').forEach(function(btn) {
-                if (btn.dataset.reported === '1') return; // already applied - skip so we don't churn the DOM forever
-                btn.dataset.reported = '1';
-                btn.disabled = true;
-                btn.style.opacity = '0.5';
-                btn.textContent = 'Reported';
-            });
-        });
-    }).catch(function() {});
+        reportedKeys = {};
+        data.reports.forEach(function(r) { reportedKeys[r.type + ':' + r.id] = 1; });
+        markReportButtons();
+    }).catch(function() { reportedLoading = false; });
 }
 (function() {
     if (document.readyState === 'loading') {
@@ -189,7 +253,7 @@ function applyReportedState() {
     var reportStateDebounce;
     new MutationObserver(function() {
         clearTimeout(reportStateDebounce);
-        reportStateDebounce = setTimeout(applyReportedState, 150);
+        reportStateDebounce = setTimeout(applyReportedState, 150); // no network once the list is loaded
     }).observe(document.documentElement, { childList: true, subtree: true });
 })();
 <\/script>`;

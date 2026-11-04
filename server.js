@@ -60,7 +60,9 @@ require('./src/middleware/fallback');
 
 const { app } = require('./src/app');
 const { PORT } = require('./src/config');
+const { attachWebSocket } = require('./src/live/websocket');
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
     console.log(`Biodeck running on port ${PORT}`);
 });
+attachWebSocket(server);

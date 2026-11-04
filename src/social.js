@@ -1,6 +1,7 @@
 // Blocks, notifications, system DMs and @mentions.
 const { db, getStmt } = require('./db/connection');
 const { broadcastDMMessage, isViewingDMChat } = require('./live/events');
+const { sendToUser } = require('./live/websocket');
 const { MENTION_REGEX } = require('./render/markdown');
 
 // Blocking
@@ -22,7 +23,10 @@ function createNotification({ username, type, actor_username, post_id = null, me
     db.run(
         `INSERT INTO Notifications (username, type, actor_username, post_id, message_id, content_preview) VALUES (?, ?, ?, ?, ?, ?)`,
         [username, type, actor_username, post_id, message_id, content_preview],
-        (err) => { if (err) console.error('Notification insert error:', err.message); }
+        (err) => {
+            if (err) return console.error('Notification insert error:', err.message);
+            sendToUser(username, 'notifications');
+        }
     );
 }
 

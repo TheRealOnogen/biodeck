@@ -2,7 +2,7 @@
 const { requireAdmin } = require('../../admin/helpers');
 const { app } = require('../../app');
 const { deletePostDescendants, runInIdChunks } = require('../../cascade');
-const { db } = require('../../db/connection');
+const { db, getStmt } = require('../../db/connection');
 const { broadcastDMDelete, broadcastGCDelete } = require('../../live/events');
 const { logAudit } = require('../../moderation');
 const { renderAttachmentsHTML } = require('../../render/attachments');
@@ -15,15 +15,59 @@ const { cleanupAttachmentFiles, getAttachments } = require('../../uploads/files'
 // Reports (admin)
 // Standalone page, linked from the admin dashboard, listing every report filed via the "Report"
 // button on a feed post, DM.
-const REPORT_SOURCE_LABELS = { post: 'Post', dm: 'DM', gc: 'Group Chat' };
+const REPORT_SOURCE_LABELS = { post: 'Post', dm: 'DM', gc: 'Group Chat', dm_chat: 'Chat (DM)', gc_chat: 'Chat (group)' };
+const isChatReport = (type) => type === 'dm_chat' || type === 'gc_chat';
+const CHAT_TYPES_SQL = `('dm_chat', 'gc_chat')`;
 function reportSourceLink(r) {
+    if (r.source_type === 'dm_chat') return '<span style="opacity:0.6;">whole conversation</span>';
+    if (r.source_type === 'gc_chat') return `<span style="opacity:0.6;">group #${r.source_id}</span>`;
     if (r.source_type === 'post') return `<a href="/post/${r.source_id}" style="color:var(--text-color);">#${r.source_id}</a>`;
     if (r.source_type === 'gc') return `<span style="opacity:0.6;">msg #${r.source_id}</span>`;
     return `<span style="opacity:0.6;">msg #${r.source_id}</span>`;
 }
 
+// Read-only view of the messages stored when a whole chat was reported. There is deliberately no
+// composer and no link into the chat: admins only see what was snapshotted.
+function renderChatSnapshotHTML(report, liveGroup) {
+    let snap = null;
+    try { snap = JSON.parse(report.chat_snapshot || 'null'); } catch (e) { /* damaged snapshot */ }
+    if (!snap || !Array.isArray(snap.messages)) return '<p style="opacity:0.5;">No snapshot was stored for this report.</p>';
+
+    const isGC = snap.kind === 'gc';
+    const userLink = (u) => `<a href="/user/${escapeHTML(u)}" style="color:var(--text-color);">@${escapeHTML(u)}</a>`;
+    let access;
+    if (!isGC) access = 'Direct messages are private: admins cannot read or write in them, so this snapshot is all you can see.';
+    else if (!liveGroup) access = 'This group no longer exists.';
+    else if (liveGroup.is_public) access = 'This group is public, so you can join it from <a href="/discover" style="color:var(--text-color);">Discover</a> like any other user.';
+    else access = 'This group is private: admins cannot join it, so this snapshot is all you can see.';
+
+    const bubbles = snap.messages.map(m => {
+        const mine = m.from === report.reporter_username;
+        const meta = [`${userLink(m.from)}${mine ? ' (reporter)' : ''}`, escapeHTML(m.createdAt || '')];
+        if (m.edited) meta.push('edited');
+        if (m.replyTo) meta.push(`reply to #${Number(m.replyTo) || ''}`);
+        return `<div style="margin:0 0 10px ${mine ? '40px' : '0'};padding:8px 10px;border-radius:8px;background:rgba(255,255,255,${mine ? '0.10' : '0.05'});">
+            <div style="font-size:0.78em;opacity:0.6;margin-bottom:3px;">${meta.join(' · ')}</div>
+            <div style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(m.content) || '<span style="opacity:0.4;">(no text)</span>'}</div>
+            ${renderAttachmentsHTML(m.attachments || [], 300, '300px')}
+        </div>`;
+    }).join('');
+
+    return `<p style="font-size:0.9em;"><strong>${isGC ? 'Group' : 'Conversation'}:</strong> ${escapeHTML(snap.title || '')}</p>
+        <p style="font-size:0.9em;"><strong>Members:</strong> ${(snap.members || []).map(userLink).join(', ')}</p>
+        <p style="opacity:0.6;font-size:0.85em;">${access}</p>
+        <p style="opacity:0.5;font-size:0.8em;margin-bottom:4px;">Last ${snap.messages.length} message${snap.messages.length === 1 ? '' : 's'} at the time of the report (read-only):</p>
+        <div style="max-height:600px;overflow-y:auto;padding:6px 2px;">${bubbles || '<span style="opacity:0.4;">(no messages)</span>'}</div>`;
+}
+
 app.get('/admin/reports', requireAdmin, (req, res) => {
-    db.all(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at FROM Reports ORDER BY (status = 'open') DESC, id DESC`, [], (err, reports) => {
+    const tab = req.query.tab === 'chats' ? 'chats' : 'content';
+    const filter = tab === 'chats' ? `source_type IN ${CHAT_TYPES_SQL}` : `source_type NOT IN ${CHAT_TYPES_SQL}`;
+    const open = getStmt(`SELECT COALESCE(SUM(source_type IN ${CHAT_TYPES_SQL}), 0) AS chats,
+                                 COALESCE(SUM(source_type NOT IN ${CHAT_TYPES_SQL}), 0) AS content
+                          FROM Reports WHERE status = 'open'`).get();
+    const badge = (n) => n ? ` <span style="opacity:0.7;">(${n})</span>` : '';
+    db.all(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at FROM Reports WHERE ${filter} ORDER BY (status = 'open') DESC, id DESC`, [], (err, reports) => {
         if (err) return res.status(500).send('DB error');
         const rows = (reports || []).map(r => {
             const snippet = escapeHTML((r.content || '').trim().slice(0, 80)) + ((r.content || '').length > 80 ? '…' : '');
@@ -31,7 +75,7 @@ app.get('/admin/reports', requireAdmin, (req, res) => {
             return `<tr class="ticket-row" onclick="window.location.href='/admin/reports/${r.id}'">
             <td style="opacity:0.5;">#${r.id}</td>
             <td>${REPORT_SOURCE_LABELS[r.source_type] || r.source_type}</td>
-            <td><a href="/user/${escapeHTML(r.reported_username)}" onclick="event.stopPropagation();" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(r.reported_username)}</a></td>
+            <td>${r.source_type === 'gc_chat' ? '<span style="opacity:0.5;">(group)</span>' : `<a href="/user/${escapeHTML(r.reported_username)}" onclick="event.stopPropagation();" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(r.reported_username)}</a>`}</td>
             <td><a href="/user/${escapeHTML(r.reporter_username)}" onclick="event.stopPropagation();" style="color:var(--text-color);text-decoration:none;">@${escapeHTML(r.reporter_username)}</a></td>
             <td style="opacity:0.7;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${snippet || '<span style="opacity:0.4;">(no text)</span>'}${attachmentMarker}</td>
             <td>${r.status === 'open' ? '<span style="color:var(--warning-color, #d9a441);font-weight:700;">Open</span>' : '<span style="color:var(--success-color);font-weight:700;">Resolved</span>'}</td>
@@ -57,14 +101,20 @@ app.get('/admin/reports', requireAdmin, (req, res) => {
 ${renderSupportTopbar('Reports')}
 <div id="content">
     <h1>Reports</h1>
-    <p style="opacity:0.5;margin-top:4px;">Content reported by users from the feed, DMs, and group chats. Click a report to see the full snapshot.</p>
+    <p style="opacity:0.5;margin-top:4px;">${tab === 'chats'
+        ? 'Whole DMs and group chats reported by a member. You get a read-only snapshot of the last messages; you cannot join or write in the chat.'
+        : 'Posts and single DM / group chat messages reported by users. Click a report to see the full snapshot.'}</p>
+    <div style="display:flex;gap:8px;margin:12px 0;">
+        <a class="button" href="/admin/reports" style="width:auto;padding:6px 14px;text-decoration:none;${tab === 'content' ? '' : 'opacity:0.55;'}">Content${badge(open.content)}</a>
+        <a class="button" href="/admin/reports?tab=chats" style="width:auto;padding:6px 14px;text-decoration:none;${tab === 'chats' ? '' : 'opacity:0.55;'}">Chats${badge(open.chats)}</a>
+    </div>
 
     <div class="panel">
         <div class="table-scroll-wrap">
             <table>
                 <thead><tr><th>#</th><th>Source</th><th>Reported</th><th>Reporter</th><th>Content</th><th>Status</th><th>Filed</th></tr></thead>
                 <tbody>
-                    ${rows || '<tr><td colspan="7" style="opacity:0.4;">No reports.</td></tr>'}
+                    ${rows || '<tr><td colspan="7" style="opacity:0.4;">' + (tab === 'chats' ? 'No chat reports.' : 'No reports.') + '</td></tr>'}
                 </tbody>
             </table>
         </div>
@@ -80,7 +130,7 @@ app.get('/admin/reports/:id', requireAdmin, (req, res) => {
     const id = parseInt(req.params.id, 10);
     if (!Number.isInteger(id)) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
 
-    db.get(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, status, created_at, resolution_note FROM Reports WHERE id = ?`, [id], (err, report) => {
+    db.get(`SELECT id, reporter_username, reported_username, source_type, source_id, content, attachments_json, chat_snapshot, status, created_at, resolution_note FROM Reports WHERE id = ?`, [id], (err, report) => {
         if (err) return res.status(500).send('DB error');
         if (!report) return res.status(404).send(renderMessagePage('Not Found', 'Report not found', `<h3>That report doesn't exist.</h3><br><br><button type="button" class="button" style="width: 180px" onclick="window.location.href='/admin/reports';">Back to reports</button>`));
 
@@ -96,6 +146,11 @@ app.get('/admin/reports/:id', requireAdmin, (req, res) => {
         const statusLabel = report.status === 'open'
             ? '<span style="color:var(--warning-color, #d9a441);font-weight:700;">Open</span>'
             : '<span style="color:var(--success-color);font-weight:700;">Resolved</span>';
+
+        const isChat = isChatReport(report.source_type);
+        const liveGroup = report.source_type === 'gc_chat'
+            ? getStmt(`SELECT id, is_public FROM Group_Chats WHERE id = ?`).get(report.source_id) : null;
+        const chatSnapshotHTML = isChat ? renderChatSnapshotHTML(report, liveGroup) : '';
 
         res.send(`<!DOCTYPE html>
 <html lang="en" class="page-admin">
@@ -117,22 +172,22 @@ app.get('/admin/reports/:id', requireAdmin, (req, res) => {
 <body class="page-admin">
 ${renderSupportTopbar('Report #' + report.id)}
 <div id="content">
-    <p><a href="/admin/reports" style="color:var(--text-color);opacity:0.6;text-decoration:none;">< Back to reports</a></p>
+    <p><a href="/admin/reports${isChat ? '?tab=chats' : ''}" style="color:var(--text-color);opacity:0.6;text-decoration:none;">< Back to reports</a></p>
     ${bannerHTML}
     <input type="hidden" id="report-target-username" value="${escapeHTML(report.reported_username)}">
 
     <div class="panel">
         <h2>${REPORT_SOURCE_LABELS[report.source_type] || report.source_type} reported</h2>
         <p style="opacity:0.5;font-size:0.85em;margin-top:-6px;">Report #${report.id} · ${escapeHTML(report.created_at || '')}</p>
-        <p style="font-size:0.9em;"><strong>Reported account:</strong> <a href="/user/${escapeHTML(report.reported_username)}" style="color:var(--text-color);">@${escapeHTML(report.reported_username)}</a></p>
+        <p style="font-size:0.9em;"><strong>${report.source_type === 'gc_chat' ? 'Group created by' : 'Reported account'}:</strong> <a href="/user/${escapeHTML(report.reported_username)}" style="color:var(--text-color);">@${escapeHTML(report.reported_username)}</a></p>
         <p style="font-size:0.9em;"><strong>Reported by:</strong> <a href="/user/${escapeHTML(report.reporter_username)}" style="color:var(--text-color);">@${escapeHTML(report.reporter_username)}</a></p>
         <p style="font-size:0.9em;"><strong>Source:</strong> ${REPORT_SOURCE_LABELS[report.source_type] || report.source_type} ${reportSourceLink(report)}</p>
         <p style="font-size:0.9em;"><strong>Status:</strong> <span id="report-status-label">${statusLabel}</span></p>
         ${report.status === 'resolved' && report.resolution_note ? `<p style="font-size:0.9em;"><strong>Resolution note:</strong> <span style="white-space:pre-wrap;word-break:break-word;">${escapeHTML(report.resolution_note)}</span></p>` : ''}
         <hr style="border-color:rgba(255,255,255,0.15);margin:14px 0;">
-        <p style="opacity:0.5;font-size:0.8em;margin-bottom:4px;">Content at time of report:</p>
+        ${isChat ? chatSnapshotHTML : `<p style="opacity:0.5;font-size:0.8em;margin-bottom:4px;">Content at time of report:</p>
         <p style="white-space:pre-wrap;word-break:break-word;overflow-wrap:break-word;">${escapeHTML(report.content) || '<span style="opacity:0.4;">(no text)</span>'}</p>
-        ${attachmentsHTML}
+        ${attachmentsHTML}`}
         <form method="POST" action="/admin/reports/${report.id}/status" class="action-row" style="display:block;">
             ${report.status === 'open' ? `
             <label>Resolution note <span style="opacity:0.4;">(optional)</span></label>
@@ -143,7 +198,7 @@ ${renderSupportTopbar('Report #' + report.id)}
         </form>
     </div>
 
-    <div class="panel">
+    ${isChat ? `<p style="opacity:0.5;font-size:0.85em;">To act on someone in this chat, open their profile from the snapshot above.</p>` : `<div class="panel">
         <h2>Quick Actions <span style="opacity:0.5;font-weight:400;font-size:0.7em;">on @${escapeHTML(report.reported_username)}</span></h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Take action against the reported account without leaving this page. Each action also deletes the reported content. Ban/Delete also issue a permanent warning first (with the reason you give below and a copy of the reported content attached), so the user has something to see explaining what happened.</p>
 
@@ -178,7 +233,7 @@ ${renderSupportTopbar('Report #' + report.id)}
             <button type="button" class="button" style="width:auto;padding:8px 16px;" onclick="reportDeleteAccount()">Delete Account</button>
             <div id="delete-result" class="report-action-result"></div>
         </div>
-    </div>
+    </div>`}
 </div>
 ${SUPPORT_NAV_SCRIPT}
 <script>

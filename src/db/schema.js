@@ -357,6 +357,9 @@ db.serialize(() => {
             // Same resolution-note pattern as Support_Tickets.resolution_note - optional admin note
             // shown on the report detail page.
             db.run(`ALTER TABLE Reports ADD COLUMN resolution_note TEXT DEFAULT NULL`, () => {});
+            // Whole-chat reports (source_type dm_chat / gc_chat) keep the last messages of the chat as JSON,
+            // so admins can read them without being in the chat.
+            db.run(`ALTER TABLE Reports ADD COLUMN chat_snapshot TEXT DEFAULT NULL`, () => {});
             db.run(`CREATE INDEX IF NOT EXISTS idx_reports_status ON Reports(status)`);
             // Emoji reactions on a post - one row per (post, user, emoji), so a user can react to
             // the same post with several different emoji.

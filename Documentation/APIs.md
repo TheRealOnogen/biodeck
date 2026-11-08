@@ -194,6 +194,7 @@ Posts support optional file attachments (up to 5 per post, `multipart/form-data`
 | GET | `/feed/pinned-bar` | — | Raw HTML string (not JSON) of pinned posts |
 | GET | `/feed/reply-counts`, `/feed/poll`, etc. all require login | | 401 JSON `{ error }` otherwise |
 | POST | `/report` | body: `type: 'post'|'dm'|'gc', id` | **JSON.** `{ ok: true }` / `409 { error, alreadyReported: true }` on duplicate. Validates you actually had access to the content |
+| POST | `/report/chat` | body: `type: 'dm'|'gc', target` (`target` = the other user's username for a DM, the group id for a group chat) | **JSON.** `{ ok: true }` / `409 { error, alreadyReported: true }` while you already have an open report for that chat / `403` if you're not in the group / `404` if the chat has no messages. Reports the whole chat: the last 100 messages are stored as a snapshot that admins can read (read-only) under Reports > Chats. |
 | GET | `/api/my-reports` | — | **JSON, real data.** `{ reports: [{ type, id }, ...] }` — content you've already reported, for graying out report buttons |
 | POST | `/post/:id/react` | JSON body: `{ emoji }` | **Toggle** your reaction on a post: adds it if you haven't used that emoji on this post, removes it if you have. Returns **JSON (HTML fragment).** `{ ok: true, html }` — the freshly rendered reaction-chip row. See [Reactions](#reactions) for the rules |
 

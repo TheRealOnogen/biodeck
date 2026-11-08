@@ -722,6 +722,84 @@ app.post('/report', (req, res) => {
     }
 });
 
+// Reports a whole DM conversation or group chat. The last messages are stored with the report, so
+// admins can read them under Reports > Chats without being able to join or write in the chat.
+const CHAT_REPORT_MESSAGES = 100;
+const CHAT_REPORT_MAX_ATTACHMENTS = 60;
+const CHAT_REPORT_COLUMNS = 'id, from_user, content, file_path, file_name, files_json, reply_to, edited, created_at';
+
+app.post('/report/chat', (req, res) => {
+    if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });
+    const { type, target } = req.body || {};
+    const reporter = req.session.userUsername;
+    if (type !== 'dm' && type !== 'gc') return res.status(400).json({ error: 'Invalid report.' });
+
+    function fail(err) {
+        if (err) console.error('Chat report error:', err.message);
+        res.status(500).json({ error: 'Failed to submit report.' });
+    }
+
+    // Stores the report unless this reporter already has one open for the same chat.
+    function file({ reportedUsername, sourceId, title, members, isPublic, groupId, messages }) {
+        const sourceType = type + '_chat';
+        db.get(`SELECT id FROM Reports WHERE reporter_username = ? AND source_type = ? AND source_id = ? AND status = 'open'`,
+            [reporter, sourceType, sourceId], (err, existing) => {
+                if (err) return fail(err);
+                if (existing) return res.status(409).json({ error: 'You already reported this chat. An admin will look at it.', alreadyReported: true });
+                const attachments = [];
+                const snapshotMessages = messages.map(m => {
+                    const files = getAttachments(m);
+                    files.forEach(f => { if (attachments.length < CHAT_REPORT_MAX_ATTACHMENTS) attachments.push(f); });
+                    return { id: m.id, from: m.from_user, content: m.content || '', createdAt: m.created_at,
+                        edited: !!m.edited, replyTo: m.reply_to || null, attachments: files };
+                });
+                const snapshot = JSON.stringify({ kind: type, title, members, isPublic: !!isPublic, groupId: groupId || null, messages: snapshotMessages });
+                const summary = type === 'dm' ? `DM chat between @${reporter} and @${reportedUsername}` : `Group chat "${title}"`;
+                // attachments_json lets admins open the chat's files, same as for single-message reports.
+                db.run(`INSERT INTO Reports (reporter_username, reported_username, source_type, source_id, content, attachments_json, chat_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [reporter, reportedUsername, sourceType, sourceId, summary, attachments.length ? JSON.stringify(attachments) : null, snapshot], (err2) => {
+                        if (err2) return fail(err2);
+                        logAudit('chat_reported', reporter, reportedUsername, type === 'dm' ? `dm chat with @${reportedUsername}` : `group chat #${groupId}`);
+                        res.json({ ok: true });
+                    });
+            });
+    }
+
+    if (type === 'dm') {
+        const other = String(target || '');
+        if (other === reporter) return res.status(400).json({ error: "You can't report a chat with yourself." });
+        db.get(`SELECT id, username FROM User_Data WHERE username = ?`, [other], (err, user) => {
+            if (err) return fail(err);
+            if (!user) return res.status(404).json({ error: 'User not found.' });
+            db.all(`SELECT ${CHAT_REPORT_COLUMNS} FROM Messages WHERE (from_user = ? AND to_user = ?) OR (from_user = ? AND to_user = ?) ORDER BY id DESC LIMIT ?`,
+                [reporter, user.username, user.username, reporter, CHAT_REPORT_MESSAGES], (err2, rows) => {
+                    if (err2) return fail(err2);
+                    if (!rows || !rows.length) return res.status(404).json({ error: 'There are no messages in this chat.' });
+                    file({ reportedUsername: user.username, sourceId: user.id, title: `@${reporter} and @${user.username}`,
+                        members: [reporter, user.username], messages: rows.reverse() });
+                });
+        });
+    } else {
+        const groupId = parseInt(target, 10);
+        if (!Number.isInteger(groupId)) return res.status(400).json({ error: 'Invalid report.' });
+        db.get(`SELECT g.id, g.name, g.created_by, g.is_public FROM Group_Chats g
+                JOIN Group_Chat_Members m ON m.group_id = g.id AND m.username = ? WHERE g.id = ?`, [reporter, groupId], (err, group) => {
+            if (err) return fail(err);
+            if (!group) return res.status(403).json({ error: 'Not a member of that group chat.' });
+            db.all(`SELECT username FROM Group_Chat_Members WHERE group_id = ? ORDER BY id`, [groupId], (err2, memberRows) => {
+                if (err2) return fail(err2);
+                db.all(`SELECT ${CHAT_REPORT_COLUMNS} FROM Group_Chat_Messages WHERE group_id = ? ORDER BY id DESC LIMIT ?`,
+                    [groupId, CHAT_REPORT_MESSAGES], (err3, rows) => {
+                        if (err3) return fail(err3);
+                        if (!rows || !rows.length) return res.status(404).json({ error: 'There are no messages in this chat.' });
+                        file({ reportedUsername: group.created_by, sourceId: group.id, title: group.name,
+                            members: (memberRows || []).map(r => r.username), isPublic: group.is_public, groupId: group.id, messages: rows.reverse() });
+                    });
+            });
+        });
+    }
+});
+
 // Returns the logged-in user's own list of already-filed reports.
 app.get('/api/my-reports', (req, res) => {
     if (!req.session.userId) return res.status(401).json({ error: 'Not logged in.' });

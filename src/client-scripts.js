@@ -208,6 +208,20 @@ function reportContent(type, id, btn) {
         }
     });
 }
+function reportChat(type, target, el) {
+    var what = type === "dm" ? "this conversation" : "this group chat";
+    if (!confirm("Report " + what + "? Admins will be able to read the last 100 messages in it. Only report chats that break the rules.")) return;
+    fetch("/report/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ type: type, target: target })
+    }).then(function(r) { return r.json().then(function(data) { return { ok: r.ok, data: data }; }); })
+      .then(function(res) {
+        if (res.ok) alert("Thanks, the chat was reported. An admin will review it.");
+        else alert(res.data && res.data.error || "Could not submit the report.");
+    }).catch(function() { alert("Network error."); });
+}
+
 // The already-reported list comes from the server inside the page (see middleware/core.js);
 // only if that is missing is it fetched, once. Later DOM changes just re-apply it.
 var reportedKeys = null;

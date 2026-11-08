@@ -84,6 +84,7 @@ ${ATTACH_STYLE_BLOCK}
             <a href="/messages">DMs</a>
             <a href="/feed">Feed</a>
             <a href="/notifications" class="notif-nav-link">Notifications</a>
+            <a href="#" onclick="reportChat('gc', ${group.id}, this); return false;">Report chat</a>
             <a href="/logout">Logout</a>
             <button id="nav-hamburger" onclick="toggleNav()" aria-label="Menu">☰</button>
             <nav id="nav-dropdown">
@@ -92,7 +93,8 @@ ${ATTACH_STYLE_BLOCK}
                 <a href="/messages">DMs</a>
                 <a href="/feed">Feed</a>
                 <a href="/notifications" class="notif-nav-link">Notifications</a>
-                <a href="/logout">Logout</a>
+                <a href="#" onclick="reportChat('gc', ${group.id}, this); return false;">Report chat</a>
+            <a href="/logout">Logout</a>
             </nav>
         </div>
     </div>

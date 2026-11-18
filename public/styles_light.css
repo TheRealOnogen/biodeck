@@ -4,9 +4,9 @@
    inline style="" attributes and in JS (el.style.color = 'var(--name)'). */
 :root {
   --text-color: black;              /* default/primary text */
-  --text-dim-color: rgba(255, 255, 255, 0.8);
-  --text-muted-color: rgba(255, 255, 255, 0.5);
-  --text-dimmer-color: rgba(255, 255, 255, 0.6);
+  --text-dim-color: rgba(0, 0, 0, 0.8);
+  --text-muted-color: rgba(0, 0, 0, 0.5);
+  --text-dimmer-color: rgba(0, 0, 0, 0.6);
   --accent-color: rgb(0, 51, 255); /* links, "other" sender, developer badge */
   --danger-color: rgb(255, 80, 80); /* errors, delete, banned, over-limit */
   --danger-light-color: rgb(255, 120, 120);

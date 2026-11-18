@@ -28,5 +28,10 @@
   "name": "nostalgia_dark",
   "displayName": "Nostalgia Dark",
   "file": "styles_nostalgia_dark.css"
+  },
+  {
+    "name": "aiodeck",
+    "displayName": "AioDeck",
+    "file": "styles_aiodeck.css"
   }
 ]

@@ -97,7 +97,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <h1>Admin Dashboard</h1>
     <p style="opacity:0.5;margin-top:4px;">Logged in as <strong>${escapeHTML(req.session.userUsername)}</strong></p>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2>Registration Gate</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, new signups are created banned pending activation and admins get pinged (Activations group chat + DM) to manually activate them. When <strong>OFF</strong>, registration is fully open - new accounts are created active immediately, with no pings.</p>
         <p style="margin-top:10px;">Status: <span id="reg-gate-status">${siteState.registrationGateEnabled ? '<span style="color:var(--success-color);font-weight:700;">ON</span>' : '<span style="color:var(--danger-color);font-weight:700;">OFF</span>'}</span></p>
@@ -109,13 +109,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="reg-gate-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2>Registration Lockdown</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Starts automatically when ${LOCKDOWN_REG_MAX} accounts are created within ${LOCKDOWN_REG_WINDOW_MS / 1000} seconds. While active, <strong>nobody</strong> can register (even with the gate OFF) for ${LOCKDOWN_DURATION_MS / 3600000} hours (automatic start) or until it is ended here. A manual start has no time limit unless you enter hours.</p>
         <p style="margin-top:10px;">Status: <span id="reg-lockdown-status">${getRegistrationLockdownLeftMs() > 0 ? '<span style="color:var(--danger-color);font-weight:700;">ACTIVE</span> - ' + (isRegistrationLockdownIndefinite() ? 'until you end it' : 'ends in about ' + escapeHTML(formatDuration(getRegistrationLockdownLeftMs()))) : '<span style="color:var(--success-color);font-weight:700;">Not active</span>'}</span></p>
         ${req.isHeadAdmin ? `
         <div class="action-row">
-            <input type="text" min="1" max="720" step="any" placeholder="Hours (empty = no limit)" id="reg-lockdown-hours" style="border-radius: 20px; height: 30px;"><br>
+            <input type="text" min="1" max="720" step="any" placeholder="Hours (empty = no limit)" id="reg-lockdown-hours" style=" height: 30px;"><br>
         </div>
         <div class="action-row">
           <button class="button" onclick="toggleRegistrationLockdown(true)" style="width:140px;">Start lockdown</button>
@@ -124,7 +124,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="reg-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2>Full Lockdown</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, nobody can register <strong>or log in</strong> (including via the emailed verification link). People who are already logged in are not affected, and Admin / Head Admin / Owner accounts can still log in so this can be turned off. It stays on until it is ended here.</p>
         <p style="margin-top:10px;">Status: <span id="full-lockdown-status">${siteState.fullLockdownEnabled ? '<span style="color:var(--danger-color);font-weight:700;">ON</span>' : '<span style="color:var(--success-color);font-weight:700;">OFF</span>'}</span></p>
@@ -136,7 +136,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="full-lockdown-result"></div>` : `<p style="opacity:0.4;font-size:0.78em;margin-top:10px;">Only Owners and Head Admins can change this setting.</p>`}
     </div>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2>Read-only Mode</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">When <strong>ON</strong>, nobody can register or export their data, and regular accounts can log in and read but can't post, send, edit, delete or change anything (a banner is shown on every page and text fields are removed). Admin / Head Admin / Owner accounts can still chat and use the admin tools. It stays on until it is ended here.</p>
         <p style="margin-top:10px;">Status: <span id="read-only-status">${siteState.readOnlyModeEnabled ? '<span style="color:var(--danger-color);font-weight:700;">ON</span>' : '<span style="color:var(--success-color);font-weight:700;">OFF</span>'}</span></p>
@@ -151,11 +151,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <div class="panel">
         <h2>Ban / Unban User</h2>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="target-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="target-username" placeholder="e.g. testuser" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="ban-reason" placeholder="e.g. Spamming" maxlength="500">
+        <input style=" height: 30px;" type="text" id="ban-reason" placeholder="e.g. Spamming" maxlength="500">
         <label>Duration <span style="opacity:0.4;">(optional, ignored for unban - blank = permanent)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="ban-duration" placeholder="e.g. 45s, 30m, 6h, 3d, 2w, 1y" maxlength="20">
+        <input style=" height: 30px;" type="text" id="ban-duration" placeholder="e.g. 45s, 30m, 6h, 3d, 2w, 1y" maxlength="20">
         <label>Action</label>
         <select id="action">
             <option value="ban">Ban</option>
@@ -167,12 +167,12 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="result"></div>
     </div>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2 style="color:var(--text-dim-color);">IP Ban / Unban</h2>
         <label>IP Address</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="target-ip" placeholder="e.g. 192.168.1.1" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="target-ip" placeholder="e.g. 192.168.1.1" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required for ban, ignored for unban)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="ip-ban-reason" placeholder="e.g. Ban evasion" maxlength="500">
+        <input style=" height: 30px;" type="text" id="ip-ban-reason" placeholder="e.g. Ban evasion" maxlength="500">
         <label>Action</label>
         <select id="ip-action">
             <option value="ipban">IP Ban</option>
@@ -184,7 +184,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <div id="ip-result"></div>
     </div>
 
-    <div class="panel" style="rgba(255,255,255,0.2);">
+    <div class="panel">
         <h2 style="color:var(--text-dim-color);">Banned IPs</h2>
         <table>
             <thead><tr><th>IP Address</th><th>Reason</th><th>Banned By</th><th></th></tr></thead>
@@ -194,13 +194,13 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         </table>
     </div>
 
-    <div class="panel" style="border-color:rgba(255,255,255,0.2;">
+    <div class="panel">
         <h2 style="color:var(--text-dim-color);">Delete Account</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Does not remove the account from the database. Resets the avatar to the default, sets the display name to "Account Deleted", clears the bio, marks the account as deleted, and deletes all of its posts. The username is kept.</p>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="delete-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="delete-username" placeholder="e.g. testuser" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="delete-reason" placeholder="e.g. ToS violation" maxlength="500">
+        <input style=" height: 30px;" type="text" id="delete-reason" placeholder="e.g. ToS violation" maxlength="500">
         <div class="action-row">
             <button class="button" onclick="submitDeleteAccount()" style="width:160px;">Delete Account</button>
         </div>
@@ -210,9 +210,9 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <h3 style="color:var(--danger-strong-color);margin-bottom:4px;">Delete From Database</h3>
         <p style="opacity:0.6;font-size:0.8em;margin-top:-2px;">Permanently erases the account and everything tied to it - posts, DMs, group chat messages/memberships, follows, friends, friend requests, and notifications. This cannot be undone and the username becomes available again. Head Admin / Owner only.</p>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="hard-delete-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="hard-delete-username" placeholder="e.g. testuser" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="hard-delete-reason" placeholder="e.g. GDPR erasure request" maxlength="500">
+        <input style=" height: 30px;" type="text" id="hard-delete-reason" placeholder="e.g. GDPR erasure request" maxlength="500">
         <div class="action-row">
             <button class="button" onclick="submitHardDeleteAccount()" style="width:200px;">Delete From Database</button>
         </div>
@@ -224,20 +224,20 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <h2>Edit User Profile</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">View and fix up anyone's avatar, nickname, or bio - useful for removing an inappropriate pfp or bio without deleting the account.</p>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="profile-username" placeholder="e.g. testuser" autocomplete="off">
         <div class="action-row">
             <button class="button" onclick="loadProfile()" style="width:140px;">Load</button>
         </div>
         <div id="profile-avatar-preview" style="margin:10px 0;display:flex;align-items:center;gap:12px;"></div>
         <label>Nickname</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-nickname" placeholder="(none)" maxlength="32">
+        <input style=" height: 30px;" type="text" id="profile-nickname" placeholder="(none)" maxlength="32">
         <label>Bio</label>
         <textarea id="profile-bio" maxlength="1000" style="width:100%;min-height:80px;border-radius:12px;padding:8px;box-sizing:border-box;"></textarea>
         <div class="action-row">
             <button class="button" onclick="saveProfileText()" style="width:140px;">Save Text</button>
         </div>
         <label style="margin-top:14px;">Email</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="profile-email" placeholder="(none)" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="profile-email" placeholder="(none)" autocomplete="off">
         <div class="action-row">
             <button class="button" onclick="saveProfileEmail()" style="width:140px;">Save Email</button>
         </div>
@@ -253,7 +253,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <div class="panel">
         <h2>Manage Badges</h2>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="badge-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="badge-username" placeholder="e.g. testuser" autocomplete="off">
         <label style="margin-top:14px;">Badges</label>
         <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;">
             ${req.isOwner ? `<label style="display:flex;align-items:center;gap:6px;margin:0;text-transform:none;font-size:0.95em;opacity:1;"><input type="checkbox" id="badge-headadmin" style="width:auto;"> Head Admin</label>` : ''}
@@ -276,11 +276,11 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
         <h2>Issue Warning</h2>
         <p style="opacity:0.5;font-size:0.8em;margin-top:-6px;">Warnings affect account standing: <strong>0</strong> = All good, <strong>1-9</strong> = Be careful, <strong>10-19</strong> = At risk, <strong>20+</strong> = Severely at risk. Once a warning expires it stops counting toward standing but stays in the user's warnings list. Leave the expiration blank to have it never expire.</p>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="warn-username" placeholder="e.g. testuser" autocomplete="off">
         <label>Reason <span style="opacity:0.4;">(required)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-reason" placeholder="e.g. Harassment in DMs" maxlength="500">
+        <input style=" height: 30px;" type="text" id="warn-reason" placeholder="e.g. Harassment in DMs" maxlength="500">
         <label>Expires In <span style="opacity:0.4;">(optional, e.g. 45s, 30m, 6h, 3d, 2w, 1y - blank = never expires)</span></label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="warn-duration" placeholder="e.g. 2w" maxlength="20">
+        <input style=" height: 30px;" type="text" id="warn-duration" placeholder="e.g. 2w" maxlength="20">
         <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:0.85em;opacity:0.85;margin-top:8px;">
             <input type="checkbox" id="warn-mute" style="width:auto;height:auto;">
             Mute user (blocks DMs, group chat, and feed posts/replies) until this warning expires
@@ -294,7 +294,7 @@ app.get('/admin/dashboard', requireAdmin, (req, res) => {
     <div class="panel">
         <h2>View / Manage Warnings</h2>
         <label>Username</label>
-        <input style="border-radius: 20px; height: 30px;" type="text" id="warnings-lookup-username" placeholder="e.g. testuser" autocomplete="off">
+        <input style=" height: 30px;" type="text" id="warnings-lookup-username" placeholder="e.g. testuser" autocomplete="off">
         <div class="action-row">
             <button class="button" onclick="loadWarnings()" style="width:140px;">Load</button>
         </div>

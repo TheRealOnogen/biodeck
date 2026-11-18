@@ -76,7 +76,7 @@ ${ATTACH_STYLE_BLOCK}
         <div id="feed-topbar">
             <div id="feed-topbar-left">Logged in as <strong>${req.session.userUsername}</strong></div>
             <div id="feed-search-bar">
-                <input type="text" class="box" style="height: 25px; border-radius: 20px; text-align: left;" id="feed-search-input" placeholder="Search posts…" autocomplete="off">
+                <input type="text" class="box" style="height: 25px; text-align: left;" id="feed-search-input" placeholder="Search posts…" autocomplete="off">
                 <button id="feed-search-clear" title="Clear search" style="display:none;">✕</button>
             </div>
             <div id="feed-topbar-right" style="position:relative;display:flex;align-items:center;">
